@@ -52,13 +52,19 @@ def _fwd_dispatch(
     # K we get on Ampere/Ada); for input=fp16 the published Mojo stdlib at the
     # version we pin (mojo-compiler 1.0.0b1) only ships m16n8k8, so the multi-stage
     # gemm fails to instantiate. We could route fp16 through a hand-rolled m16n8k8
-    # gemm but that defeats the point of using `multistage_mma`. So this entry
-    # point is bf16-only for now; an fp16 path lands once Mojo gains m16n8k16 fp16
-    # in the public stdlib (it's already in MAX's `tensor_core.get_mma_shape`).
+    # gemm but that defeats the point of using `multistage_mma`. A native fp16
+    # kernel path lands once Mojo gains m16n8k16 fp16 in the public stdlib (it's
+    # already in MAX's `tensor_core.get_mma_shape`); until then, fp16 inputs are
+    # handled at the API boundary by `flash_attn_func` (cast q/k/v to bf16, run
+    # the bf16 kernel, cast out back to fp16). bf16 has 7-bit mantissa vs fp16's
+    # 10-bit so accuracy is slightly worse than a true fp16 path, but bf16's
+    # wider 8-bit exponent absorbs the dynamic range of softmax inputs fine.
     if q.dtype != torch.bfloat16:
         raise NotImplementedError(
-            "flash_attn_mojo current kernel supports bf16 only "
-            f"(got {q.dtype}). See `_fn.py` for the why."
+            "flash_attn_mojo._fwd_dispatch: kernel supports bf16 only "
+            f"(got {q.dtype}). fp16 is handled by casting at the API "
+            "boundary in flash_attn_func; if you hit this directly you "
+            "bypassed that cast."
         )
     if q.shape[-1] not in (32, 64, 128):
         raise NotImplementedError(
@@ -267,6 +273,14 @@ def flash_attn_func(
     """Multi-head scaled-dot-product attention with Flash Attention's
     block-tiled algorithm.
 
+    fp16 vs bf16: the Mojo kernel is bf16-only today (mojo-compiler 1.0.0b1
+    only ships m16n8k16 for bf16; fp16 m16n8k16 is in MAX but not yet in
+    the public stdlib). fp16 inputs are supported at the API boundary by
+    casting q/k/v (and alibi_slopes) to bf16, running the bf16 kernel,
+    then casting the output back to fp16. Accuracy is slightly worse than
+    a true fp16 path (bf16 has 7-bit mantissa vs fp16's 10), but bf16's
+    wider 8-bit exponent absorbs softmax dynamic range fine.
+
     q, k, v: (batch, seqlen, nheads, headdim). Note: nheads_kv may differ
         from nheads_q (multi-query/grouped-query attention) — k and v
         share the same nheads_kv.
@@ -298,10 +312,26 @@ def flash_attn_func(
             softcap=softcap,
             alibi_slopes=alibi_slopes,
         )
+    # fp16 → bf16 cast-at-API path. See the docstring for the rationale.
+    # The kernel itself is bf16-only at the version of mojo we pin. We
+    # cast q/k/v (and alibi slopes if present) to bf16, run the kernel,
+    # then cast the output back to fp16. LSE stays fp32 (kernel output).
+    fp16_in = q.dtype == torch.float16
+    if fp16_in:
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
+        # alibi_slopes is normalised to fp32 inside _fwd_dispatch, so no
+        # cast is needed here.
     result = _FlashAttnFn.apply(
         q, k, v, dropout_p, softmax_scale, causal, window_size,
         softcap, alibi_slopes, deterministic, return_attn_probs,
     )
+    if fp16_in:
+        if isinstance(result, tuple):
+            out, lse, rng_state = result
+            return out.to(torch.float16), lse, rng_state
+        return result.to(torch.float16)
     return result
 
 

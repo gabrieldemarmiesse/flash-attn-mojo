@@ -728,3 +728,53 @@ def test_kvcache_decode_not_supported():
         flash_attn_mojo.flash_attn_with_kvcache(
             q, k_cache, v_cache, cache_seqlens=cache_seqlens,
         )
+
+
+@pytest.mark.parametrize("D", [32, 64, 128])
+def test_fp16_inputs_basic(D):
+    """fp16 q/k/v: API-boundary cast to bf16, run kernel, cast back.
+
+    Compares to upstream fp16 flash-attn when available; otherwise falls
+    back to fp32 SDPA reference. Tol is loosened vs bf16 to absorb the
+    extra bf16↔fp16 round-trip error.
+    """
+    B, L, H = 2, 128, 4
+    torch.manual_seed(0)
+    q = torch.randn(B, L, H, D, dtype=torch.float16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.float16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.float16, device="cuda")
+
+    out_mojo = flash_attn_mojo.flash_attn_func(q, k, v, causal=False)
+    assert out_mojo.dtype == torch.float16
+    assert out_mojo.shape == q.shape
+
+    try:
+        from flash_attn import flash_attn_func as upstream_fwd
+        out_ref = upstream_fwd(q, k, v, causal=False)
+    except ImportError:
+        out_ref = _sdpa_ref(q, k, v, causal=False)
+
+    diff = _max_abs(out_mojo, out_ref)
+    assert diff < 5e-2, f"fp16 D={D}: max |diff|={diff:.3e}"
+
+
+@pytest.mark.parametrize("D", [32, 64, 128])
+def test_fp16_causal(D):
+    """Same as `test_fp16_inputs_basic` but causal=True."""
+    B, L, H = 2, 128, 4
+    torch.manual_seed(0)
+    q = torch.randn(B, L, H, D, dtype=torch.float16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.float16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.float16, device="cuda")
+
+    out_mojo = flash_attn_mojo.flash_attn_func(q, k, v, causal=True)
+    assert out_mojo.dtype == torch.float16
+
+    try:
+        from flash_attn import flash_attn_func as upstream_fwd
+        out_ref = upstream_fwd(q, k, v, causal=True)
+    except ImportError:
+        out_ref = _sdpa_ref(q, k, v, causal=True)
+
+    diff = _max_abs(out_mojo, out_ref)
+    assert diff < 5e-2, f"fp16 causal D={D}: max |diff|={diff:.3e}"
