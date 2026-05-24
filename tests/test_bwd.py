@@ -91,6 +91,21 @@ def test_backward_head_dims(D):
     assert _max_abs(v.grad, dv_ref) < tol
 
 
+@pytest.mark.parametrize("causal", [False, True])
+def test_bwd_head_dim_32_correctness(causal):
+    """Native bwd MVP at head_dim=32 — exercises the smaller-D kernel
+    variant (smem footprint ~64 KiB, ELTS_PER_THREAD=16)."""
+    B, L, H, D = 2, 128, 4, 32
+    q, k, v = _make_qkv(B, L, H, D)
+    out = flash_attn_mojo.flash_attn_func(q, k, v, causal=causal)
+    dout = torch.randn_like(out)
+    out.backward(dout)
+    dq_ref, dk_ref, dv_ref = _sdpa_grads(q, k, v, dout, causal=causal)
+    assert _max_abs(q.grad, dq_ref) < 5e-2
+    assert _max_abs(k.grad, dk_ref) < 5e-2
+    assert _max_abs(v.grad, dv_ref) < 5e-2
+
+
 def test_backward_matches_upstream():
     """Cross-validate against upstream flash-attn 2 directly."""
     try:
