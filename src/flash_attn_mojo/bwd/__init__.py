@@ -95,6 +95,7 @@ def native_bwd_main(
     dv: torch.Tensor,
     dqaccum: torch.Tensor,
     softmax_scale: float,
+    causal: bool = False,
 ) -> None:
     """JIT-compile (if needed) and dispatch the main bwd kernel.
 
@@ -162,6 +163,7 @@ def native_bwd_main(
             torch.cuda.current_stream().cuda_stream,
             _DTYPE_CODE[q.dtype],
             head_dim,
+            1 if causal else 0,
             1,  # use_external_stream
         )
     )

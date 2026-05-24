@@ -37,17 +37,19 @@ def call_bwd_main(args: tuple) -> None:
 def _config_from_args(args: tuple) -> tuple:
     dtype_code = args[39]
     head_dim = args[40]
-    use_external_stream = bool(args[41])
-    return (dtype_code, head_dim, use_external_stream)
+    causal = bool(args[41])
+    use_external_stream = bool(args[42])
+    return (dtype_code, head_dim, causal, use_external_stream)
 
 
 def _mod_name(config: tuple) -> str:
-    (dt, hd, ues) = config
-    return f"{_DTYPE_NAME[dt]}_hd{hd}_extstr{int(ues)}"
+    (dt, hd, causal, ues) = config
+    causal_tag = "causal" if causal else "noncausal"
+    return f"{_DTYPE_NAME[dt]}_hd{hd}_{causal_tag}_extstr{int(ues)}"
 
 
 def _defines(config: tuple) -> dict[str, str]:
-    (dt, hd, ues) = config
+    (dt, hd, causal, ues) = config
 
     def b(x: bool) -> str:
         return "true" if x else "false"
@@ -55,6 +57,7 @@ def _defines(config: tuple) -> dict[str, str]:
     return {
         "DTYPE": _DTYPE_DEFINE[dt],
         "HEAD_DIM": str(hd),
+        "CAUSAL": b(causal),
         "USE_EXTERNAL_STREAM": b(ues),
     }
 

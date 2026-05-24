@@ -19,6 +19,7 @@ from common import kBwdNThreads, kBwdBlockM, kBwdBlockN
 def launch_bwd[
     dtype: DType,
     head_dim: Int,
+    causal: Bool,
     use_external_stream: Bool,
 ](
     batch_int: Int,
@@ -86,8 +87,8 @@ def launch_bwd[
     )
 
     var compiled = ctx.compile_function[
-        bwd_kernel[dtype, head_dim],
-        bwd_kernel[dtype, head_dim],
+        bwd_kernel[dtype, head_dim, causal],
+        bwd_kernel[dtype, head_dim, causal],
     ](func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(UInt32(smem_bytes)))
 
     var q_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](

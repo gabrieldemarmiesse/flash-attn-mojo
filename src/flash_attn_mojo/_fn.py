@@ -225,8 +225,9 @@ def _bwd_dispatch_native_mvp(
     out: torch.Tensor,
     lse: torch.Tensor,
     softmax_scale: float,
+    causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Native MVP backward: bf16 / head_dim=64 / non-causal / no MQA.
+    """Native MVP backward: bf16 / head_dim=64 / optional causal / no MQA.
 
     Allocates delta, dqaccum, dk, dv. Calls native_bwd_preprocess to
     fill delta + zero dqaccum. Calls native_bwd_main to fill dk, dv
@@ -274,6 +275,7 @@ def _bwd_dispatch_native_mvp(
     dv = torch.empty_like(v_k)
     native_bwd_main(
         q_k, k_k, v_k, dout_k, lse_c, delta, dk, dv, dqaccum, softmax_scale,
+        causal=causal,
     )
 
     # dq: (B, L, H, D) in q_k's dtype. The convert_dq kernel reads
@@ -336,7 +338,6 @@ def _bwd_dispatch(
         dout.is_cuda
         and q.dtype in (torch.bfloat16, torch.float16)
         and q.shape[-1] == 64
-        and not causal
         and q.shape[2] == k.shape[2]  # no MQA
         and softcap == 0.0
         and alibi_slopes is None
@@ -346,7 +347,7 @@ def _bwd_dispatch(
     )
     if _in_mvp_envelope:
         return _bwd_dispatch_native_mvp(
-            dout, q, k, v, out, lse, softmax_scale,
+            dout, q, k, v, out, lse, softmax_scale, causal,
         )
 
     if dropout_p > 0.0:

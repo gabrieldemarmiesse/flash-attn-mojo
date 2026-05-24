@@ -75,6 +75,7 @@ from common import kBwdNThreads, kBwdBlockM, kBwdBlockN
 def bwd_kernel[
     dtype: DType,
     head_dim: Int,
+    causal: Bool,
 ](
     seq_len: Int,
     nheads: Int,
@@ -178,6 +179,13 @@ def bwd_kernel[
 
     # ---- Outer loop over q_blocks.
     var num_q_blocks: Int = (seq_len + BM - 1) // BM
+    # Causal block-skip lower bound: Q blocks with q_row < kv_row_base are
+    # entirely above the diagonal vs this KV block → P = 0 everywhere →
+    # contribute nothing to dK/dV/dQ. Skip them.
+    var qb_start: Int = 0
+    @parameter
+    if causal:
+        qb_start = (n_block * BN) // BM
     var q_base_off: Int = batch * q_b_stride + head_idx * q_h_stride
     var do_base_off: Int = batch * do_b_stride + head_idx * do_h_stride
     var lse_base_off: Int = batch * lse_b_stride + head_idx * lse_h_stride
@@ -188,7 +196,7 @@ def bwd_kernel[
 
     var scale_f: Float32 = softmax_scale
 
-    for qb in range(num_q_blocks):
+    for qb in range(qb_start, num_q_blocks):
         var q_row_base: Int = qb * BM
 
         # ---- Load Q, dO into smem.
@@ -252,7 +260,12 @@ def bwd_kernel[
             var g_col: Int = kv_row_base + n
             var s: Float32 = s_smem[m * BN + n] * scale_f - lse_smem[m]
             var p: Float32
-            if g_row >= seq_len or g_col >= seq_len:
+            var masked: Bool = g_row >= seq_len or g_col >= seq_len
+            @parameter
+            if causal:
+                if g_row < g_col:
+                    masked = True
+            if masked:
                 p = Float32(0)
             else:
                 p = exp(s)

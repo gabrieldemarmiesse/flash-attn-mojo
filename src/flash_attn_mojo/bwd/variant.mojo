@@ -15,6 +15,7 @@ from _ctx import acquire_ctx_handle
 
 comptime DTYPE: DType = get_defined_dtype["DTYPE", DType.bfloat16]()
 comptime HEAD_DIM: Int = get_defined_int["HEAD_DIM"]()
+comptime CAUSAL: Bool = get_defined_bool["CAUSAL"]()
 comptime USE_EXTERNAL_STREAM: Bool = get_defined_bool["USE_EXTERNAL_STREAM"]()
 
 
@@ -69,15 +70,15 @@ def bwd_main_variant(
     var dqa_h_stride: Int = Int(py=args[36])
     var dqa_l_stride: Int = Int(py=args[37])
     var stream_handle_addr: Int = Int(py=args[38])
-    # args[39..41] are comptime defines (dtype, head_dim, use_ext_stream);
-    # ctx_handle is appended by `call_bwd_main` as the 43rd positional
-    # (index 42).
-    var ctx_handle_addr: Int = Int(py=args[42])
+    # args[39..42] are comptime defines (dtype, head_dim, causal,
+    # use_ext_stream); ctx_handle is appended by `call_bwd_main` as the
+    # 44th positional (index 43).
+    var ctx_handle_addr: Int = Int(py=args[43])
 
     if batch_int == 0 or seqlen_int == 0 or nheads_int == 0:
         return PythonObject(None)
 
-    launch_bwd[DTYPE, HEAD_DIM, USE_EXTERNAL_STREAM](
+    launch_bwd[DTYPE, HEAD_DIM, CAUSAL, USE_EXTERNAL_STREAM](
         batch_int,
         seqlen_int,
         nheads_int,
