@@ -82,6 +82,85 @@ def test_causal_matches_upstream_flash_attn(L):
     )
 
 
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(8, 1), (8, 2), (8, 4), (8, 8)])
+@pytest.mark.parametrize("L", [128, 512])
+def test_mqa_gqa_correctness(nheads_q, nheads_kv, L):
+    """MQA/GQA: mojo with nheads_kv < nheads_q must match SDPA-with-
+    repeat_interleave and (when available) upstream flash-attn."""
+    B, D = 2, 64
+    torch.manual_seed(0)
+    q = torch.randn(B, L, nheads_q, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(B, L, nheads_kv, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, L, nheads_kv, D, dtype=torch.bfloat16, device="cuda")
+
+    # Pure-PyTorch fp32 ref with k/v repeat-interleaved to nheads_q.
+    group = nheads_q // nheads_kv
+    k_rep = k.repeat_interleave(group, dim=2)
+    v_rep = v.repeat_interleave(group, dim=2)
+    out_ref = _sdpa_ref(q, k_rep, v_rep, causal=False)
+
+    out_mojo = flash_attn_mojo.flash_attn_func(q, k, v, causal=False)
+    diff = _max_abs(out_mojo, out_ref)
+    assert diff < 5e-2, (
+        f"MQA/GQA mojo vs SDPA: nheads=({nheads_q},{nheads_kv}) L={L} "
+        f"max |diff|={diff:.3e}"
+    )
+
+    try:
+        from flash_attn import flash_attn_func as upstream_fwd
+    except ImportError:
+        return
+    out_up = upstream_fwd(q, k, v, causal=False)
+    diff_up = _max_abs(out_mojo, out_up)
+    assert diff_up < 5e-2, (
+        f"MQA/GQA mojo vs upstream: nheads=({nheads_q},{nheads_kv}) L={L} "
+        f"max |diff|={diff_up:.3e}"
+    )
+
+
+@pytest.mark.parametrize("softcap", [10.0, 30.0, 50.0])
+@pytest.mark.parametrize("L", [128, 512])
+@pytest.mark.parametrize("causal", [False, True])
+def test_softcap_correctness(softcap, L, causal):
+    """Softcap: mojo must agree with upstream flash-attn (the only ref
+    that supports softcap directly)."""
+    try:
+        from flash_attn import flash_attn_func as upstream_fwd
+    except ImportError:
+        pytest.skip("upstream flash-attn not available")
+    B, H, D = 2, 1, 64
+    torch.manual_seed(0)
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+
+    out_mojo = flash_attn_mojo.flash_attn_func(
+        q, k, v, causal=causal, softcap=softcap
+    )
+    out_up = upstream_fwd(q, k, v, causal=causal, softcap=softcap)
+    diff = _max_abs(out_mojo, out_up)
+    assert diff < 5e-2, (
+        f"softcap mojo vs upstream: softcap={softcap} L={L} causal={causal} "
+        f"max |diff|={diff:.3e}"
+    )
+
+
+def test_softcap_zero_unchanged():
+    """softcap=0 must produce the exact same output as the default
+    (regression: don't perturb the no-softcap fast path)."""
+    B, L, H, D = 2, 128, 1, 64
+    torch.manual_seed(0)
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+
+    out_default = flash_attn_mojo.flash_attn_func(q, k, v, causal=False)
+    out_zero = flash_attn_mojo.flash_attn_func(
+        q, k, v, causal=False, softcap=0.0
+    )
+    assert torch.equal(out_default, out_zero)
+
+
 @pytest.mark.parametrize("L", [16, 32, 64, 128, 512])
 def test_noncausal_regression(L):
     """Non-causal path must still match SDPA (regression for the

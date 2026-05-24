@@ -14,6 +14,8 @@ def native_fwd(
     out: torch.Tensor,
     softmax_scale: float,
     causal: bool = False,
+    nheads_kv: int | None = None,
+    softcap: float = 0.0,
 ) -> None:
     """JIT-compile (if needed) and dispatch a single GPU forward call.
 
@@ -26,6 +28,8 @@ def native_fwd(
     from flash_attn_mojo.fwd._jit import call_fwd
 
     batch, seqlen, nheads, head_dim = q.shape
+    if nheads_kv is None:
+        nheads_kv = k.shape[2]
 
     call_fwd(
         (
@@ -50,6 +54,8 @@ def native_fwd(
             out.stride(1),
             out.stride(2),
             torch.cuda.current_stream().cuda_stream,
+            int(nheads_kv),
+            float(softcap),
             _DTYPE_CODE[q.dtype],
             head_dim,
             1 if causal else 0,

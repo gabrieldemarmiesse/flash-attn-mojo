@@ -67,15 +67,21 @@ def _fwd_dispatch(
         )
     if dropout_p != 0.0:
         raise NotImplementedError("flash_attn_mojo: dropout not yet implemented.")
-    if softcap != 0.0:
-        raise NotImplementedError("flash_attn_mojo: softcap not yet implemented.")
     if window_size != _NO_WINDOW:
         raise NotImplementedError("flash_attn_mojo: window_size not yet implemented.")
     if alibi_slopes is not None:
         raise NotImplementedError("flash_attn_mojo: alibi_slopes not yet implemented.")
-    if q.shape[2] != k.shape[2]:
-        raise NotImplementedError(
-            "flash_attn_mojo: MQA/GQA (nheads_q != nheads_kv) not yet implemented."
+    nheads_q = q.shape[2]
+    nheads_kv = k.shape[2]
+    if nheads_q % nheads_kv != 0:
+        raise ValueError(
+            f"flash_attn_mojo: nheads_q ({nheads_q}) must be a multiple of "
+            f"nheads_kv ({nheads_kv}) for MQA/GQA."
+        )
+    if v.shape[2] != nheads_kv:
+        raise ValueError(
+            f"flash_attn_mojo: k.shape[2] ({nheads_kv}) must match "
+            f"v.shape[2] ({v.shape[2]})."
         )
 
     if softmax_scale is None:
@@ -89,7 +95,7 @@ def _fwd_dispatch(
         q.shape[0], q.shape[2], q.shape[1], dtype=torch.float32, device=q.device
     )
 
-    native_fwd(q, k, v, out, softmax_scale, causal)
+    native_fwd(q, k, v, out, softmax_scale, causal, nheads_kv, softcap)
     return out, lse
 
 

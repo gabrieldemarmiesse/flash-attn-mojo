@@ -49,6 +49,8 @@ def launch_fwd[
     o_b_stride: Int,
     o_l_stride: Int,
     o_h_stride: Int,
+    nheads_kv_int: Int,
+    softcap: Float32,
     stream_handle_addr: Int,
     ctx_handle_addr: Int,
 ) raises:
@@ -126,11 +128,15 @@ def launch_fwd[
         var pb_stride: Int = nheads_int * padded_seqlen * head_dim
 
         var total_elts: Int = batch_int * nheads_int * padded_seqlen * head_dim
+        var total_elts_kv: Int = batch_int * nheads_kv_int * padded_seqlen * head_dim
 
         var q_buf = ctx.enqueue_create_buffer[dtype](total_elts)
-        var k_buf = ctx.enqueue_create_buffer[dtype](total_elts)
-        var v_buf = ctx.enqueue_create_buffer[dtype](total_elts)
+        var k_buf = ctx.enqueue_create_buffer[dtype](total_elts_kv)
+        var v_buf = ctx.enqueue_create_buffer[dtype](total_elts_kv)
         var o_buf = ctx.enqueue_create_buffer[dtype](total_elts)
+
+        var kv_ph_stride: Int = padded_seqlen * head_dim
+        var kv_pb_stride: Int = nheads_kv_int * padded_seqlen * head_dim
 
         # Zero K/V so padded keys produce zero scores; the kernel's
         # actual_seq_len-based masking sets those P slots to -inf, so the
@@ -151,7 +157,8 @@ def launch_fwd[
         )
 
         # Copy per-(batch, head) plane: seqlen_int * head_dim contiguous
-        # elements from user ptr to padded buffer ptr.
+        # elements from user ptr to padded buffer ptr. Q uses nheads_q;
+        # K/V use nheads_kv (MQA/GQA).
         for b in range(batch_int):
             for h in range(nheads_int):
                 var src_off: Int = b * q_b_stride + h * q_h_stride
@@ -161,15 +168,17 @@ def launch_fwd[
                     q_src + src_off,
                     seqlen_int * head_dim,
                 )
+            for h in range(nheads_kv_int):
+                var dst_off_kv: Int = b * kv_pb_stride + h * kv_ph_stride
                 var src_off_k: Int = b * k_b_stride + h * k_h_stride
                 ctx.enqueue_copy(
-                    k_buf.unsafe_ptr() + dst_off,
+                    k_buf.unsafe_ptr() + dst_off_kv,
                     k_src + src_off_k,
                     seqlen_int * head_dim,
                 )
                 var src_off_v: Int = b * v_b_stride + h * v_h_stride
                 ctx.enqueue_copy(
-                    v_buf.unsafe_ptr() + dst_off,
+                    v_buf.unsafe_ptr() + dst_off_kv,
                     v_src + src_off_v,
                     seqlen_int * head_dim,
                 )
@@ -181,12 +190,12 @@ def launch_fwd[
         k_q_b = pb_stride
         k_q_l = pl_stride
         k_q_h = ph_stride
-        k_k_b = pb_stride
+        k_k_b = kv_pb_stride
         k_k_l = pl_stride
-        k_k_h = ph_stride
-        k_v_b = pb_stride
+        k_k_h = kv_ph_stride
+        k_v_b = kv_pb_stride
         k_v_l = pl_stride
-        k_v_h = ph_stride
+        k_v_h = kv_ph_stride
         k_o_b = pb_stride
         k_o_l = pl_stride
         k_o_h = ph_stride
@@ -232,6 +241,8 @@ def launch_fwd[
             k_o_b,
             k_o_l,
             k_o_h,
+            nheads_kv_int,
+            softcap,
             grid_dim=grid,
             block_dim=(kNThreads,),
             shared_mem_bytes=smem_bytes,
@@ -259,6 +270,8 @@ def launch_fwd[
             k_o_b,
             k_o_l,
             k_o_h,
+            nheads_kv_int,
+            softcap,
             grid_dim=grid,
             block_dim=(kNThreads,),
             shared_mem_bytes=smem_bytes,

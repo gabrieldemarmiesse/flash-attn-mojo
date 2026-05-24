@@ -41,7 +41,7 @@ same size). Total: ~24 KiB.
 """
 
 from std.collections import OptionalReg
-from std.math import recip, exp
+from std.math import recip, exp, tanh
 from std.math.constants import log2e
 from std.sys import align_of, simd_width_of, size_of
 from std.algorithm.functional import tile_and_unswitch, unswitch
@@ -117,6 +117,8 @@ def fwd_kernel[
     o_b_stride: Int,
     o_l_stride: Int,
     o_h_stride: Int,
+    nheads_kv: Int,
+    softcap: Float32,
 ):
     comptime accum_type = get_accum_type[dtype]()
     comptime simd_size: Int = simd_width_of[dtype]()
@@ -151,6 +153,11 @@ def fwd_kernel[
     var q_tile_idx: UInt32 = UInt32(block_idx.x)
     var head_idx: UInt32 = UInt32(block_idx.y)
     var batch: UInt32 = UInt32(block_idx.z)
+    # MQA/GQA: Q-head i attends to K/V-head i // group_size, where
+    # group_size = nheads_q // nheads_kv. When nheads_kv == nheads_q
+    # this reduces to identity (group_size == 1).
+    var group_size: Int = nheads // nheads_kv
+    var kv_head_idx: Int = Int(head_idx) // group_size
 
     # ---- Dynamic smem layout: Q, K, V back-to-back.
     comptime alignment = align_of[SIMD[dtype, simd_size]]()
@@ -338,9 +345,29 @@ def fwd_kernel[
     var scale_log2e: Scalar[accum_type] = (
         softmax_scale.cast[accum_type]() * log2e
     )
+    # Softcap (Gemma 2 / Grok): when > 0, replace scores s with
+    # softcap * tanh(s * softmax_scale / softcap). The downstream
+    # softmax uses exp2, so we still need to fold log2e in after the
+    # tanh by scaling the post-tanh value by log2e (and `softcap`
+    # itself absorbs into that constant). When softcap == 0 we keep
+    # the fast `p_reg *= scale_log2e` path unchanged.
+    var has_softcap: Bool = softcap != Float32(0)
+    var softcap_acc: Scalar[accum_type] = softcap.cast[accum_type]()
+    var softcap_inv_scaled: Scalar[accum_type] = (
+        (softmax_scale / softcap).cast[accum_type]() if has_softcap
+        else Scalar[accum_type](0)
+    )
+    var softcap_log2e: Scalar[accum_type] = softcap_acc * log2e
 
     # ---- KV loop body (one (BN-tall) tile per iteration).
-    @__copy_capture(seq_len, actual_seq_len, scale_log2e)
+    @__copy_capture(
+        seq_len,
+        actual_seq_len,
+        scale_log2e,
+        has_softcap,
+        softcap_inv_scaled,
+        softcap_log2e,
+    )
     @always_inline
     @parameter
     def loop_over_kv[
@@ -352,7 +379,7 @@ def fwd_kernel[
         var kv_tile_num_rows: Int = min(tile_size, end - kv_tile_start_row)
 
         var k_base_off: Int = (
-            Int(batch) * k_b_stride + Int(head_idx) * k_h_stride
+            Int(batch) * k_b_stride + kv_head_idx * k_h_stride
         )
         var k_row_off: Int = kv_tile_start_row * k_l_stride
         var k_runtime_layout = RuntimeLayout[
@@ -377,7 +404,7 @@ def fwd_kernel[
         var k_gmem_iter = k_gmem_block.tiled_iterator[BN, BK, axis=1](0, 0)
 
         var v_base_off: Int = (
-            Int(batch) * v_b_stride + Int(head_idx) * v_h_stride
+            Int(batch) * v_b_stride + kv_head_idx * v_h_stride
         )
         var v_row_off: Int = kv_tile_start_row * v_l_stride
         var v_runtime_layout = RuntimeLayout[
@@ -491,7 +518,27 @@ def fwd_kernel[
                 )
 
                 comptime for i in range(2):
-                    p_reg_vec2[mma_id, i] = p_reg_vec2[mma_id, i] * scale_log2e
+                    if has_softcap:
+                        # scores' = softcap * tanh(scores * softmax_scale / softcap)
+                        # then multiply by log2e (folded into softcap_log2e).
+                        # tanh(x) = 1 - 2/(exp(2x)+1). softcap bounds the
+                        # input so overflow at large |x| is not a concern.
+                        # Cast through fp32 explicitly so exp's
+                        # is_floating_point constraint is statically
+                        # satisfied (accum_type's float-ness flows from a
+                        # `def` and isn't comptime-proven on this path).
+                        var s32 = p_reg_vec2[mma_id, i].cast[DType.float32]() * (
+                            softcap_inv_scaled.cast[DType.float32]()
+                        )
+                        var e2 = exp(s32 + s32)
+                        var one = Scalar[DType.float32](1)
+                        var two = Scalar[DType.float32](2)
+                        var t = one - two / (e2 + one)
+                        p_reg_vec2[mma_id, i] = (
+                            t * softcap_log2e.cast[DType.float32]()
+                        ).cast[accum_type]()
+                    else:
+                        p_reg_vec2[mma_id, i] = p_reg_vec2[mma_id, i] * scale_log2e
 
                     # Per-row query index for this score frag slot.
                     var q_idx: Int = (
