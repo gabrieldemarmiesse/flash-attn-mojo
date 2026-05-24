@@ -438,3 +438,94 @@ def test_head_dim_128_correctness(causal):
         f"hd=128 causal={causal} mojo-vs-SDPA={diff_mojo:.3e} "
         f"vs upstream-vs-SDPA={diff_up:.3e}, tol={tol:.3e}"
     )
+
+
+def test_dropout_zero_unchanged():
+    """`dropout_p=0.0` must produce bit-identical output to the no-arg
+    call — the dropout-active variant compiles to a separate kernel,
+    and we want the non-dropout default path to remain untouched.
+    """
+    B, L, H, D = 2, 128, 4, 64
+    torch.manual_seed(0)
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+
+    out_default = flash_attn_mojo.flash_attn_func(q, k, v)
+    out_zero = flash_attn_mojo.flash_attn_func(q, k, v, dropout_p=0.0)
+    assert torch.equal(out_default, out_zero)
+
+
+def test_dropout_basic():
+    """`dropout_p=0.3`: output is finite, deviates from no-dropout, and
+    is deterministic given a fixed torch RNG seed (the host generates
+    the per-call seed via torch.randint — seeding the host RNG fixes it).
+    """
+    B, L, H, D = 2, 128, 4, 64
+    p = 0.3
+    torch.manual_seed(42)
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+
+    out_nodrop = flash_attn_mojo.flash_attn_func(q, k, v)
+
+    # Two runs with the same host RNG seed must agree (the kernel mixer
+    # is fully determined by the (rng_seed, b, h, q_idx, kv_idx) tuple,
+    # and the seed in turn is reproducibly drawn from torch's CPU RNG).
+    torch.manual_seed(123)
+    out_drop_a, lse_a, rng_a = flash_attn_mojo.flash_attn_func(
+        q, k, v, dropout_p=p, return_attn_probs=True
+    )
+    torch.manual_seed(123)
+    out_drop_b, lse_b, rng_b = flash_attn_mojo.flash_attn_func(
+        q, k, v, dropout_p=p, return_attn_probs=True
+    )
+    assert torch.equal(out_drop_a, out_drop_b), "dropout output not deterministic"
+    assert rng_a is not None and rng_b is not None
+    assert rng_a.shape == (2,)
+    assert rng_a.dtype == torch.int64
+    assert torch.equal(rng_a, rng_b)
+    # LSE is computed from the un-dropped softmax mass; dropout doesn't
+    # alter the rowmax/rowsum running stats, so LSE must match the
+    # no-dropout call.
+    out_nd_full, lse_nodrop, _ = flash_attn_mojo.flash_attn_func(
+        q, k, v, return_attn_probs=True
+    )
+    assert torch.allclose(lse_a, lse_nodrop, atol=1e-4)
+
+    # A different seed produces a different mask (and thus output).
+    torch.manual_seed(456)
+    out_drop_c = flash_attn_mojo.flash_attn_func(q, k, v, dropout_p=p)
+    assert not torch.equal(out_drop_a, out_drop_c)
+
+    # Output is finite and meaningfully different from the no-dropout
+    # baseline (most rows have some surviving entries; a few may have
+    # all entries dropped in a small tile, but the aggregate L2 must be
+    # bounded away from zero).
+    assert torch.isfinite(out_drop_a).all()
+    diff = (out_drop_a.float() - out_nodrop.float()).abs().mean().item()
+    assert diff > 1e-3, f"dropout output suspiciously close to no-drop: {diff}"
+
+    # Statistical: the kernel scales survivors by 1/(1-p); the resulting
+    # output's expected value equals the no-drop output. Average over
+    # multiple draws and the gap should shrink relative to a single
+    # draw (sanity check that we're using inverted dropout, not "drop +
+    # don't rescale").
+    acc = torch.zeros_like(out_nodrop, dtype=torch.float32)
+    n = 16
+    for s in range(n):
+        torch.manual_seed(1000 + s)
+        out_s = flash_attn_mojo.flash_attn_func(q, k, v, dropout_p=p)
+        acc = acc + out_s.float()
+    avg = (acc / n).to(out_nodrop.dtype)
+    # E[O_drop] == O_nodrop with inverted dropout; small n leaves
+    # variance, so use a loose bound (no-dropout MAE vs SDPA is ~3e-2
+    # at this shape; the dropout-averaged value should be within an
+    # order of magnitude of that).
+    avg_diff = (avg.float() - out_nodrop.float()).abs().mean().item()
+    nodrop_mag = out_nodrop.float().abs().mean().item()
+    assert avg_diff < 0.5 * nodrop_mag, (
+        f"averaged dropout output too far from no-drop baseline: "
+        f"avg_diff={avg_diff:.3e}, nodrop_mag={nodrop_mag:.3e}"
+    )

@@ -96,6 +96,7 @@ def fwd_kernel[
     dtype: DType,
     head_dim: Int,
     causal: Bool,
+    has_dropout: Bool,
 ](
     seq_len: Int,
     actual_seq_len: Int,
@@ -127,6 +128,9 @@ def fwd_kernel[
     alibi_ptr: UnsafePointer[Float32, ImmutAnyOrigin],
     alibi_b_stride: Int,
     alibi_h_stride: Int,
+    dropout_p: Float32,
+    rng_seed: UInt64,
+    rng_offset: UInt64,
 ):
     comptime accum_type = get_accum_type[dtype]()
     comptime simd_size: Int = simd_width_of[dtype]()
@@ -405,6 +409,25 @@ def fwd_kernel[
         var slope_f32: Float32 = (alibi_ptr + alibi_off)[0]
         alibi_slope_log2e = slope_f32.cast[accum_type]() * log2e
 
+    # ---- Dropout: precompute the inverse keep-prob scale and the
+    # uint32 threshold used to mask P entries. Folded into a runtime
+    # gate `dropout_active` so the no-dropout path (p == 0) stays free
+    # even when the variant is compiled with HAS_DROPOUT=true (which
+    # only happens when the caller actually requested dropout).
+    var keep_scale: Scalar[accum_type] = Scalar[accum_type](1)
+    var drop_threshold_u32: UInt32 = UInt32(0)
+    @parameter
+    if has_dropout:
+        var p32: Float32 = dropout_p
+        keep_scale = (Float32(1) / (Float32(1) - p32)).cast[accum_type]()
+        # Compare a uniform u32 against `p * 2^32`. We clamp the
+        # float to < 2^32 so the cast is well-defined for p ≈ 1
+        # (Python rejects p >= 1).
+        var thr_f: Float32 = p32 * Float32(4294967296.0)
+        if thr_f > Float32(4294967040.0):
+            thr_f = Float32(4294967040.0)
+        drop_threshold_u32 = UInt32(thr_f)
+
     # ---- KV loop body (one (BN-tall) tile per iteration).
     @__copy_capture(
         seq_len,
@@ -419,6 +442,10 @@ def fwd_kernel[
         has_alibi,
         alibi_slope_log2e,
         neg_sentinel,
+        keep_scale,
+        drop_threshold_u32,
+        rng_seed,
+        rng_offset,
     )
     @always_inline
     @parameter
@@ -708,6 +735,75 @@ def fwd_kernel[
             rowmax,
             rowsum,
         )
+
+        # ---- Dropout on P (post-softmax, pre P·V MMA).
+        # Each P element at logical (b, h, q_idx, kv_idx) is independently
+        # masked with probability `dropout_p`; survivors are scaled by
+        # `1 / (1 - p)`. The PRNG is a fixed-key splitmix-style mixer of
+        # `(seed ^ offset, b, h, q_idx, kv_idx)` — adequate for fwd-only
+        # since we don't have a backward to reverse it. Bits are emitted
+        # one uint32 per element. `rowsum` is intentionally left alone:
+        # the final 1/rowsum normalisation divides by the full softmax
+        # mass, and per upstream FA semantics the keep_scale on survivors
+        # cancels into the standard inverted-dropout formula.
+        @parameter
+        if has_dropout:
+            var seed_mix: UInt64 = rng_seed ^ rng_offset
+            var bh_mix: UInt64 = (
+                UInt64(batch) * UInt64(2654435761)
+                + UInt64(head_idx) * UInt64(40503)
+            )
+            var rng_key: UInt32 = (
+                UInt32(seed_mix & UInt64(0xFFFFFFFF))
+                ^ UInt32(seed_mix >> UInt64(32))
+                ^ UInt32(bh_mix & UInt64(0xFFFFFFFF))
+                ^ UInt32(bh_mix >> UInt64(32))
+            )
+            comptime for m_mma in range(num_m_mmas):
+                comptime for n_mma in range(num_n_mmas):
+                    comptime mma_id_d = n_mma * num_m_mmas + m_mma
+                    var mma_col_base_d: UInt32 = (
+                        UInt32(warp_x) * UInt32(WN)
+                        + UInt32(n_mma * MMA_N)
+                    )
+                    var col_off_d: UInt32 = (
+                        lane * UInt32(p_frag_simdwidth) % UInt32(MMA_N)
+                    )
+                    comptime for i in range(2):
+                        var q_idx_d: Int = (
+                            q_tile_row_base
+                            + Int(m_mma) * Int(MMA_M)
+                            + Int(lane_row0)
+                            + (8 if i == 1 else 0)
+                        )
+                        var kv_base: Int = (
+                            kv_tile_start_row
+                            + Int(mma_col_base_d + col_off_d)
+                        )
+                        comptime for j in range(p_frag_simdwidth):
+                            var kv_idx: Int = kv_base + j
+                            # Splitmix32-style mixer: cheap, good enough
+                            # entropy per bit for dropout. Combine
+                            # rng_key, q_idx, kv_idx into a single u32
+                            # and scramble.
+                            var u: UInt32 = (
+                                rng_key
+                                ^ UInt32(q_idx_d) * UInt32(0x9E3779B1)
+                                ^ UInt32(kv_idx) * UInt32(0x85EBCA77)
+                            )
+                            u = u ^ (u >> UInt32(16))
+                            u = u * UInt32(0x7FEB352D)
+                            u = u ^ (u >> UInt32(15))
+                            u = u * UInt32(0x846CA68B)
+                            u = u ^ (u >> UInt32(16))
+                            if u < drop_threshold_u32:
+                                p_reg_vec2[mma_id_d, i][j] = (
+                                    Scalar[accum_type](0)
+                                )
+                            else:
+                                p_reg_vec2[mma_id_d, i][j] = (
+                                    p_reg_vec2[mma_id_d, i][j] * keep_scale
+                                )
 
         # V's smem tile is (BK, BN). Use the same one-vec-per-row async
         # copy layout as Q and K (see comment above q's layout). With the

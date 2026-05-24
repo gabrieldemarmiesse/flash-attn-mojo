@@ -22,6 +22,9 @@ def native_fwd(
     alibi_addr: int = 0,
     alibi_b_stride: int = 0,
     alibi_h_stride: int = 0,
+    dropout_p: float = 0.0,
+    rng_seed: int = 0,
+    rng_offset: int = 0,
 ) -> None:
     """JIT-compile (if needed) and dispatch a single GPU forward call.
 
@@ -82,9 +85,13 @@ def native_fwd(
             int(alibi_addr),
             int(alibi_b_stride),
             int(alibi_h_stride),
+            float(dropout_p),
+            int(rng_seed),
+            int(rng_offset),
             _DTYPE_CODE[q.dtype],
             head_dim,
             1 if causal else 0,
             1,  # use_external_stream: CUDA path wraps torch's stream
+            1 if (dropout_p > 0.0) else 0,  # has_dropout (comptime gate)
         )
     )

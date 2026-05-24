@@ -87,11 +87,17 @@ def test_cuda_kernel_matches_reference():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
 def test_cuda_outside_envelope_rejects_clearly():
-    """Anything outside the current minimal envelope (dropout,
-    head_dim != 64, etc.) must error cleanly with NotImplementedError."""
+    """Anything outside the current minimal envelope (fp16,
+    head_dim != {32,64,128}, invalid dropout_p, etc.) must error
+    cleanly."""
     B, L, H, D = 1, 4, 2, 64
-    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
-    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(NotImplementedError, match="dropout"):
-        flash_attn_mojo.flash_attn_func(q, k, v, dropout_p=0.1)
+    q = torch.randn(B, L, H, D, dtype=torch.float16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.float16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.float16, device="cuda")
+    with pytest.raises(NotImplementedError, match="bf16"):
+        flash_attn_mojo.flash_attn_func(q, k, v)
+    q_bf = q.to(torch.bfloat16)
+    k_bf = k.to(torch.bfloat16)
+    v_bf = v.to(torch.bfloat16)
+    with pytest.raises(ValueError, match="dropout_p"):
+        flash_attn_mojo.flash_attn_func(q_bf, k_bf, v_bf, dropout_p=1.5)

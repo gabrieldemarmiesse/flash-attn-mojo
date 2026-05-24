@@ -28,6 +28,7 @@ def launch_fwd[
     head_dim: Int,
     causal: Bool,
     use_external_stream: Bool,
+    has_dropout: Bool,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -59,6 +60,9 @@ def launch_fwd[
     alibi_addr: Int,
     alibi_b_stride: Int,
     alibi_h_stride: Int,
+    dropout_p: Float32,
+    rng_seed: UInt64,
+    rng_offset: UInt64,
     stream_handle_addr: Int,
     ctx_handle_addr: Int,
 ) raises:
@@ -94,8 +98,8 @@ def launch_fwd[
     )
 
     var compiled = ctx.compile_function[
-        fwd_kernel[dtype, head_dim, causal],
-        fwd_kernel[dtype, head_dim, causal],
+        fwd_kernel[dtype, head_dim, causal, has_dropout],
+        fwd_kernel[dtype, head_dim, causal, has_dropout],
     ](func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(smem_bytes))
 
     var padded_seqlen: Int = ceildiv(seqlen_int, Int(BN)) * Int(BN)
@@ -267,6 +271,9 @@ def launch_fwd[
             alibi_ptr,
             alibi_b_stride,
             alibi_h_stride,
+            dropout_p,
+            rng_seed,
+            rng_offset,
             grid_dim=grid,
             block_dim=(kNThreads,),
             shared_mem_bytes=smem_bytes,
@@ -304,6 +311,9 @@ def launch_fwd[
             alibi_ptr,
             alibi_b_stride,
             alibi_h_stride,
+            dropout_p,
+            rng_seed,
+            rng_offset,
             grid_dim=grid,
             block_dim=(kNThreads,),
             shared_mem_bytes=smem_bytes,

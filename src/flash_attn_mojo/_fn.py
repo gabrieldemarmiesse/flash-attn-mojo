@@ -35,8 +35,8 @@ def _fwd_dispatch(
     softcap: float,
     alibi_slopes: torch.Tensor | None,
     deterministic: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Forward dispatch. Returns (out, lse).
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Forward dispatch. Returns (out, lse, rng_state).
 
     Current kernel limitations (the simplest viable initial impl):
     only fp16, only head_dim=64, no causal, no dropout, no alibi,
@@ -65,8 +65,10 @@ def _fwd_dispatch(
             f"flash_attn_mojo current kernel supports head_dim in "
             f"(32, 64, 128) (got {q.shape[-1]})."
         )
-    if dropout_p != 0.0:
-        raise NotImplementedError("flash_attn_mojo: dropout not yet implemented.")
+    if not (0.0 <= dropout_p < 1.0):
+        raise ValueError(
+            f"flash_attn_mojo: dropout_p must be in [0, 1), got {dropout_p}."
+        )
     nheads_q = q.shape[2]
     nheads_kv = k.shape[2]
     if nheads_q % nheads_kv != 0:
@@ -130,16 +132,39 @@ def _fwd_dispatch(
         alibi_addr = 0
         alibi_b_stride = 0
         alibi_h_stride = 0
+    # Dropout RNG state. Upstream returns a (seed, offset) uint64 pair as
+    # the third element of the `return_attn_probs=True` tuple so the
+    # backward can regenerate the mask. We don't have a backward yet, but
+    # we still produce a valid pair when dropout is active so the
+    # contract holds for future use.
+    if dropout_p > 0.0:
+        rng_state = torch.empty(2, dtype=torch.int64, device=q.device)
+        # Cheap, non-cryptographic seed: a single host-side draw. Good
+        # enough for fwd-only training (the kernel uses a fixed-key
+        # mixer to expand into per-element bits).
+        seed = int(
+            torch.randint(0, 2**62, (1,), dtype=torch.int64).item()
+        )
+        offset = 0
+        rng_state[0] = seed
+        rng_state[1] = offset
+    else:
+        rng_state = None
+        seed = 0
+        offset = 0
     native_fwd(
         q, k, v, out, softmax_scale, causal, nheads_kv, softcap, lse,
         window_left=int(window_left), window_right=int(window_right),
         alibi_addr=int(alibi_addr),
         alibi_b_stride=int(alibi_b_stride),
         alibi_h_stride=int(alibi_h_stride),
+        dropout_p=float(dropout_p),
+        rng_seed=int(seed),
+        rng_offset=int(offset),
     )
     # Keep alibi_slopes_buf alive through the call.
     del alibi_slopes_buf
-    return out, lse
+    return out, lse, rng_state
 
 
 def _bwd_dispatch(
@@ -189,7 +214,7 @@ class _FlashAttnFn(torch.autograd.Function):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** -0.5
-        out, lse = _fwd_dispatch(
+        out, lse, rng_state = _fwd_dispatch(
             q, k, v, dropout_p, softmax_scale, causal, window_size,
             softcap, alibi_slopes, deterministic,
         )
@@ -202,9 +227,9 @@ class _FlashAttnFn(torch.autograd.Function):
         ctx.deterministic = deterministic
         if return_attn_probs:
             # Upstream also exposes the softmax denominator and (with
-            # dropout) the RNG mask. We return `lse` and `None` for the
-            # RNG slot until dropout is implemented.
-            return out, lse, None
+            # dropout) the RNG state. `rng_state` is a 2-element uint64
+            # tensor (seed, offset) when dropout is active, None otherwise.
+            return out, lse, rng_state
         return out
 
     @staticmethod

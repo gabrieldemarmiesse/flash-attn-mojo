@@ -37,30 +37,34 @@ def call_fwd(args: tuple) -> None:
 
 def _config_from_args(args: tuple) -> tuple:
     # See `fwd/__init__.py::native_fwd` for the runtime tuple layout.
-    # Indices 21..30 are runtime args (nheads_kv, softcap, lse_addr,
+    # Indices 21..33 are runtime args (nheads_kv, softcap, lse_addr,
     # lse_b_stride, lse_h_stride, window_left, window_right,
-    # alibi_addr, alibi_b_stride, alibi_h_stride). Indices 31..34 are
-    # the compile-time gating fields (dtype, head_dim, causal,
-    # use_external_stream). softcap, lse_*, window_*, and alibi_* are
-    # runtime-only (no template specialisation), so they're deliberately
-    # excluded from the cache key.
-    dtype_code = args[31]
-    head_dim = args[32]
-    causal = bool(args[33])
-    use_external_stream = bool(args[34])
-    return (dtype_code, head_dim, causal, use_external_stream)
+    # alibi_addr, alibi_b_stride, alibi_h_stride, dropout_p, rng_seed,
+    # rng_offset). Indices 34..38 are the compile-time gating fields
+    # (dtype, head_dim, causal, use_external_stream, has_dropout).
+    # softcap, lse_*, window_*, alibi_*, dropout_p, rng_* are
+    # runtime-only (no template specialisation) — excluded from the
+    # cache key. `has_dropout` is the only dropout-related compile-time
+    # gate so the no-dropout fast path keeps zero RNG overhead.
+    dtype_code = args[34]
+    head_dim = args[35]
+    causal = bool(args[36])
+    use_external_stream = bool(args[37])
+    has_dropout = bool(args[38])
+    return (dtype_code, head_dim, causal, use_external_stream, has_dropout)
 
 
 def _mod_name(config: tuple) -> str:
     """Readable, deterministic identifier for a config."""
-    (dt, hd, causal, ues) = config
+    (dt, hd, causal, ues, drop) = config
     causal_tag = "causal" if causal else "noncausal"
-    return f"{_DTYPE_NAME[dt]}_hd{hd}_{causal_tag}_extstr{int(ues)}"
+    drop_tag = "drop" if drop else "nodrop"
+    return f"{_DTYPE_NAME[dt]}_hd{hd}_{causal_tag}_extstr{int(ues)}_{drop_tag}"
 
 
 def _defines(config: tuple) -> dict[str, str]:
     """Materialise the config as `-D KEY=VALUE` pairs for `mojo build`."""
-    (dt, hd, causal, ues) = config
+    (dt, hd, causal, ues, drop) = config
 
     def b(x: bool) -> str:
         return "true" if x else "false"
@@ -70,6 +74,7 @@ def _defines(config: tuple) -> dict[str, str]:
         "HEAD_DIM": str(hd),
         "CAUSAL": b(causal),
         "USE_EXTERNAL_STREAM": b(ues),
+        "HAS_DROPOUT": b(drop),
     }
 
 

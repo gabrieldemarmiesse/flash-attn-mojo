@@ -19,6 +19,7 @@ comptime DTYPE: DType = get_defined_dtype["DTYPE", DType.float16]()
 comptime HEAD_DIM: Int = get_defined_int["HEAD_DIM"]()
 comptime CAUSAL: Bool = get_defined_bool["CAUSAL"]()
 comptime USE_EXTERNAL_STREAM: Bool = get_defined_bool["USE_EXTERNAL_STREAM"]()
+comptime HAS_DROPOUT: Bool = get_defined_bool["HAS_DROPOUT"]()
 
 
 def flash_attn_fwd_acquire_ctx(
@@ -64,11 +65,14 @@ def flash_attn_fwd_variant(
     var alibi_addr: Int = Int(py=args[28])
     var alibi_b_stride: Int = Int(py=args[29])
     var alibi_h_stride: Int = Int(py=args[30])
-    # args[31..34] (dtype, head_dim, causal, use_external_stream) are
-    # all comptime defines — read at module level via get_defined_*, so
-    # they're skipped here. ctx_handle is appended by `call_fwd` as
-    # the 36th positional (index 35).
-    var ctx_handle_addr: Int = Int(py=args[35])
+    var dropout_p: Float32 = Float32(py=args[31])
+    var rng_seed: UInt64 = UInt64(py=args[32])
+    var rng_offset: UInt64 = UInt64(py=args[33])
+    # args[34..38] (dtype, head_dim, causal, use_external_stream,
+    # has_dropout) are all comptime defines — read at module level via
+    # get_defined_*, so they're skipped here. ctx_handle is appended
+    # by `call_fwd` as the 40th positional (index 39).
+    var ctx_handle_addr: Int = Int(py=args[39])
 
     if batch_int == 0 or seqlen_int == 0 or nheads_int == 0:
         return PythonObject(None)
@@ -78,6 +82,7 @@ def flash_attn_fwd_variant(
         HEAD_DIM,
         CAUSAL,
         USE_EXTERNAL_STREAM,
+        HAS_DROPOUT,
     ](
         batch_int,
         seqlen_int,
@@ -109,6 +114,9 @@ def flash_attn_fwd_variant(
         alibi_addr,
         alibi_b_stride,
         alibi_h_stride,
+        dropout_p,
+        rng_seed,
+        rng_offset,
         stream_handle_addr,
         ctx_handle_addr,
     )
