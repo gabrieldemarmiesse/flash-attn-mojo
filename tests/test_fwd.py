@@ -270,3 +270,26 @@ def test_kvpacked_matches_unpacked(causal):
         f"kvpacked vs unpacked (causal={causal}) differ: "
         f"max |diff|={_max_abs(out_packed, out_unpacked):.3e}"
     )
+
+
+@pytest.mark.parametrize("L", [17, 47, 100])
+@pytest.mark.parametrize("H", [4, 8])
+@pytest.mark.parametrize("causal", [False, True])
+def test_unaligned_seqlen_multihead(L, H, causal):
+    """Unaligned-seqlen pad path must handle non-contig L stride.
+
+    With H > 1 a (B, L, H, D) contiguous tensor has L stride = H*D, not
+    D. Combined with L not aligned to kBlockN=64, this exercises the
+    strided-row copy in the pad-and-copy path.
+    """
+    B, D = 2, 64
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+
+    out_mojo = flash_attn_mojo.flash_attn_func(q, k, v, causal=causal)
+    out_ref = _sdpa_ref(q, k, v, causal=causal)
+    diff = _max_abs(out_mojo, out_ref)
+    assert diff < 5e-2, (
+        f"L={L} H={H} causal={causal} vs SDPA: max |diff|={diff:.3e}"
+    )

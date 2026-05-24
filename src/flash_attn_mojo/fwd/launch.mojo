@@ -111,19 +111,6 @@ def launch_fwd[
     var k_o_l: Int = o_l_stride
     var k_o_h: Int = o_h_stride
 
-    # Padding requires the user tensors to be contiguous along the
-    # (L, D) inner dims so each per-(batch, head) plane can be moved
-    # as one packed (seqlen × head_dim) blob. Higher-batch/head
-    # callers with non-contiguous strides aren't on our hot path
-    # (torch's default is contiguous); fail loud if assumed otherwise.
-    if needs_pad:
-        if q_l_stride != head_dim or k_l_stride != head_dim or v_l_stride != head_dim or o_l_stride != head_dim:
-            raise Error(
-                "flash_attn_mojo fwd: unaligned seqlen requires contiguous"
-                " (L, D) inner strides on Q/K/V/O for the pad-and-copy fast"
-                " path. Got non-head_dim l_stride."
-            )
-
     if needs_pad:
         # padded per-(b,h) plane stride
         var pl_stride: Int = head_dim
@@ -159,32 +146,42 @@ def launch_fwd[
             unsafe_from_address=v_addr
         )
 
-        # Copy per-(batch, head) plane: seqlen_int * head_dim contiguous
-        # elements from user ptr to padded buffer ptr. Q uses nheads_q;
-        # K/V use nheads_kv (MQA/GQA).
+        # Copy per-(batch, head) plane row-by-row: each plane is
+        # seqlen_int rows of head_dim contiguous elements. The user's L
+        # stride may not equal head_dim (e.g. (B, L, H, D) torch tensors
+        # with H>1 have L stride = H*D), so we cannot use a single bulk
+        # copy per plane. The padded destination is fully contiguous
+        # along (L, D) by construction (pl_stride == head_dim). Q uses
+        # nheads_q; K/V use nheads_kv (MQA/GQA). DeviceContext has no
+        # 2D-strided copy helper, so this is one enqueue_copy per row —
+        # acceptable for the unaligned-seqlen slow path.
         for b in range(batch_int):
             for h in range(nheads_int):
-                var src_off: Int = b * q_b_stride + h * q_h_stride
-                var dst_off: Int = b * pb_stride + h * ph_stride
-                ctx.enqueue_copy(
-                    q_buf.unsafe_ptr() + dst_off,
-                    q_src + src_off,
-                    seqlen_int * head_dim,
-                )
+                var src_q_base = q_src + b * q_b_stride + h * q_h_stride
+                var dst_q_base = q_buf.unsafe_ptr() + b * pb_stride + h * ph_stride
+                for r in range(seqlen_int):
+                    ctx.enqueue_copy(
+                        dst_q_base + r * pl_stride,
+                        src_q_base + r * q_l_stride,
+                        head_dim,
+                    )
             for h in range(nheads_kv_int):
-                var dst_off_kv: Int = b * kv_pb_stride + h * kv_ph_stride
-                var src_off_k: Int = b * k_b_stride + h * k_h_stride
-                ctx.enqueue_copy(
-                    k_buf.unsafe_ptr() + dst_off_kv,
-                    k_src + src_off_k,
-                    seqlen_int * head_dim,
-                )
-                var src_off_v: Int = b * v_b_stride + h * v_h_stride
-                ctx.enqueue_copy(
-                    v_buf.unsafe_ptr() + dst_off_kv,
-                    v_src + src_off_v,
-                    seqlen_int * head_dim,
-                )
+                var src_k_base = k_src + b * k_b_stride + h * k_h_stride
+                var src_v_base = v_src + b * v_b_stride + h * v_h_stride
+                var dst_kv_base_off: Int = b * kv_pb_stride + h * kv_ph_stride
+                var dst_k_base = k_buf.unsafe_ptr() + dst_kv_base_off
+                var dst_v_base = v_buf.unsafe_ptr() + dst_kv_base_off
+                for r in range(seqlen_int):
+                    ctx.enqueue_copy(
+                        dst_k_base + r * pl_stride,
+                        src_k_base + r * k_l_stride,
+                        head_dim,
+                    )
+                    ctx.enqueue_copy(
+                        dst_v_base + r * pl_stride,
+                        src_v_base + r * v_l_stride,
+                        head_dim,
+                    )
 
         k_q_addr = Int(q_buf.unsafe_ptr())
         k_k_addr = Int(k_buf.unsafe_ptr())
@@ -289,10 +286,12 @@ def launch_fwd[
             shared_mem_bytes=smem_bytes,
         )
 
-    # Copy O back from the padded buffer into the user's tensor.
+    # Copy O back from the padded buffer into the user's tensor,
+    # row-by-row to honour the user's (possibly non-head_dim) L stride.
     if needs_pad:
         var pb_stride: Int = nheads_int * padded_seqlen * head_dim
         var ph_stride: Int = padded_seqlen * head_dim
+        var pl_stride: Int = head_dim
         var o_dst = UnsafePointer[Scalar[dtype], MutAnyOrigin](
             unsafe_from_address=o_addr
         )
@@ -301,13 +300,14 @@ def launch_fwd[
         )
         for b in range(batch_int):
             for h in range(nheads_int):
-                var dst_off: Int = b * o_b_stride + h * o_h_stride
-                var src_off: Int = b * pb_stride + h * ph_stride
-                ctx.enqueue_copy(
-                    o_dst + dst_off,
-                    o_padded_ptr + src_off,
-                    seqlen_int * head_dim,
-                )
+                var dst_base = o_dst + b * o_b_stride + h * o_h_stride
+                var src_base = o_padded_ptr + b * pb_stride + h * ph_stride
+                for r in range(seqlen_int):
+                    ctx.enqueue_copy(
+                        dst_base + r * o_l_stride,
+                        src_base + r * pl_stride,
+                        head_dim,
+                    )
 
     comptime if not use_external_stream:
         ctx.synchronize()
