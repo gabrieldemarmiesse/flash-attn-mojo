@@ -56,6 +56,9 @@ def launch_fwd[
     lse_h_stride: Int,
     window_left: Int,
     window_right: Int,
+    alibi_addr: Int,
+    alibi_b_stride: Int,
+    alibi_h_stride: Int,
     stream_handle_addr: Int,
     ctx_handle_addr: Int,
 ) raises:
@@ -219,6 +222,9 @@ def launch_fwd[
     var lse_ptr = UnsafePointer[Float32, MutAnyOrigin](
         unsafe_from_address=lse_addr
     )
+    var alibi_ptr = UnsafePointer[Float32, ImmutAnyOrigin](
+        unsafe_from_address=alibi_addr
+    )
 
     var grid = (ceildiv(kernel_seqlen, Int(kBlockM)), nheads_int, batch_int)
 
@@ -253,6 +259,9 @@ def launch_fwd[
             lse_h_stride,
             window_left,
             window_right,
+            alibi_ptr,
+            alibi_b_stride,
+            alibi_h_stride,
             grid_dim=grid,
             block_dim=(kNThreads,),
             shared_mem_bytes=smem_bytes,
@@ -287,6 +296,9 @@ def launch_fwd[
             lse_h_stride,
             window_left,
             window_right,
+            alibi_ptr,
+            alibi_b_stride,
+            alibi_h_stride,
             grid_dim=grid,
             block_dim=(kNThreads,),
             shared_mem_bytes=smem_bytes,

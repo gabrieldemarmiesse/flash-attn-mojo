@@ -323,3 +323,66 @@ def test_unaligned_seqlen_multihead(L, H, causal):
     assert diff < 5e-2, (
         f"L={L} H={H} causal={causal} vs SDPA: max |diff|={diff:.3e}"
     )
+
+
+@pytest.mark.parametrize("slopes_shape", ["per_head", "per_batch_head"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_alibi_correctness(slopes_shape, causal):
+    """ALiBi: mojo with alibi_slopes must match upstream flash-attn's
+    alibi output within bf16 tol.
+
+    Composition: alibi is added post-softmax-scale (and post-softcap)
+    and pre-mask, in natural-log domain. The kernel folds `log2e` into
+    the slope at the top so the per-element add lands in the same
+    log2 domain as the rest of the inner loop.
+    """
+    try:
+        from flash_attn import flash_attn_func as upstream_fwd
+    except ImportError:
+        pytest.skip("upstream flash-attn not available")
+    B, L, H, D = 2, 256, 4, 64
+    torch.manual_seed(0)
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+
+    # Typical ALiBi slope pattern (negative, geometric decay per head).
+    base = -(2.0 ** (torch.arange(1, H + 1, dtype=torch.float32) / H))
+    if slopes_shape == "per_head":
+        slopes = base.to("cuda")
+    else:
+        # (B, H): per-batch variation so the batch stride actually
+        # matters in the kernel's load.
+        slopes = (
+            base.unsqueeze(0).expand(B, H).contiguous()
+            * torch.tensor([1.0, 0.7], dtype=torch.float32).unsqueeze(1)
+        ).to("cuda")
+
+    out_mojo = flash_attn_mojo.flash_attn_func(
+        q, k, v, causal=causal, alibi_slopes=slopes
+    )
+    out_up = upstream_fwd(q, k, v, causal=causal, alibi_slopes=slopes)
+    diff = _max_abs(out_mojo, out_up)
+    assert diff < 5e-2, (
+        f"alibi mojo vs upstream: slopes_shape={slopes_shape} causal={causal} "
+        f"max |diff|={diff:.3e}"
+    )
+
+
+def test_no_alibi_regression():
+    """alibi_slopes=None must produce the exact same output as the
+    default (regression: don't perturb the no-alibi fast path)."""
+    B, L, H, D = 2, 256, 4, 64
+    torch.manual_seed(0)
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+
+    out_default = flash_attn_mojo.flash_attn_func(q, k, v, causal=False)
+    out_none = flash_attn_mojo.flash_attn_func(
+        q, k, v, causal=False, alibi_slopes=None
+    )
+    assert torch.equal(out_default, out_none), (
+        "alibi_slopes=None must match the default (no-alibi) fast path "
+        "bitwise"
+    )

@@ -124,6 +124,9 @@ def fwd_kernel[
     lse_h_stride: Int,
     window_left: Int,
     window_right: Int,
+    alibi_ptr: UnsafePointer[Float32, ImmutAnyOrigin],
+    alibi_b_stride: Int,
+    alibi_h_stride: Int,
 ):
     comptime accum_type = get_accum_type[dtype]()
     comptime simd_size: Int = simd_width_of[dtype]()
@@ -382,6 +385,23 @@ def fwd_kernel[
     # at zero.
     var has_window: Bool = window_left != -1 or window_right != -1
 
+    # ALiBi: `alibi_ptr` is null (addr==0) when the caller passes
+    # `alibi_slopes=None` — the no-alibi fast path stays zero-overhead
+    # behind this runtime gate. When non-null, load this block's slope
+    # once at the top (one fp32 load per block) and bake `log2e` into
+    # it so the per-element add lands in the log2 domain the rest of
+    # the inner loop operates in.
+    var has_alibi: Bool = (
+        Int(alibi_ptr) != 0
+    )
+    var alibi_slope_log2e: Scalar[accum_type] = Scalar[accum_type](0)
+    if has_alibi:
+        var alibi_off: Int = (
+            Int(batch) * alibi_b_stride + Int(head_idx) * alibi_h_stride
+        )
+        var slope_f32: Float32 = (alibi_ptr + alibi_off)[0]
+        alibi_slope_log2e = slope_f32.cast[accum_type]() * log2e
+
     # ---- KV loop body (one (BN-tall) tile per iteration).
     @__copy_capture(
         seq_len,
@@ -393,6 +413,8 @@ def fwd_kernel[
         has_window,
         window_left,
         window_right,
+        has_alibi,
+        alibi_slope_log2e,
         neg_sentinel,
     )
     @always_inline
@@ -574,6 +596,42 @@ def fwd_kernel[
                         + Int(lane_row0)
                         + (8 if i == 1 else 0)
                     )
+
+                    # ALiBi: matches upstream FA2 `apply_alibi` exactly.
+                    # Causal:    scores += slope * col_idx
+                    #            (per-row constant -slope*q absorbed by
+                    #            softmax, equivalent to slope*(k-q)).
+                    # Non-causal: scores -= slope * |row - col|
+                    #            (with seqlen_k == seqlen_q here).
+                    # `alibi_slope_log2e` has `log2e` baked in so the add
+                    # lands in the log2 domain the rest of the inner loop
+                    # operates in. Runtime-gated behind `has_alibi` so the
+                    # no-alibi fast path is zero-overhead.
+                    if has_alibi:
+                        var score_col_a: Int = (
+                            kv_tile_start_row
+                            + Int(mma_col_base + col_off)
+                        )
+
+                        @parameter
+                        if causal:
+                            comptime for j in range(p_frag_simdwidth):
+                                var col_j: Int = score_col_a + j
+                                p_reg_vec2[mma_id, i][j] = (
+                                    p_reg_vec2[mma_id, i][j]
+                                    + alibi_slope_log2e
+                                    * Scalar[accum_type](col_j)
+                                )
+                        else:
+                            comptime for j in range(p_frag_simdwidth):
+                                var delta: Int = score_col_a + j - q_idx
+                                if delta < 0:
+                                    delta = -delta
+                                p_reg_vec2[mma_id, i][j] = (
+                                    p_reg_vec2[mma_id, i][j]
+                                    - alibi_slope_log2e
+                                    * Scalar[accum_type](delta)
+                                )
 
                     # Per-element OOB mask: set score for any key >=
                     # actual_seq_len to -inf so its softmax weight is zero.

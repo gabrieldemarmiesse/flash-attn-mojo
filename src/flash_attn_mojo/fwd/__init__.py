@@ -19,6 +19,9 @@ def native_fwd(
     lse: torch.Tensor | None = None,
     window_left: int = -1,
     window_right: int = -1,
+    alibi_addr: int = 0,
+    alibi_b_stride: int = 0,
+    alibi_h_stride: int = 0,
 ) -> None:
     """JIT-compile (if needed) and dispatch a single GPU forward call.
 
@@ -76,6 +79,9 @@ def native_fwd(
             int(lse_h_stride),
             int(window_left),
             int(window_right),
+            int(alibi_addr),
+            int(alibi_b_stride),
+            int(alibi_h_stride),
             _DTYPE_CODE[q.dtype],
             head_dim,
             1 if causal else 0,

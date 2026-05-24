@@ -67,8 +67,6 @@ def _fwd_dispatch(
         )
     if dropout_p != 0.0:
         raise NotImplementedError("flash_attn_mojo: dropout not yet implemented.")
-    if alibi_slopes is not None:
-        raise NotImplementedError("flash_attn_mojo: alibi_slopes not yet implemented.")
     nheads_q = q.shape[2]
     nheads_kv = k.shape[2]
     if nheads_q % nheads_kv != 0:
@@ -93,10 +91,54 @@ def _fwd_dispatch(
     )
 
     window_left, window_right = window_size
+    # ALiBi: normalise slopes to fp32 contiguous. None ⇒ pass null ptr +
+    # zero strides (the kernel runtime-checks for ptr == 0). 1D
+    # (nheads,) ⇒ broadcast across batch with alibi_b_stride = 0. 2D
+    # (batch, nheads) ⇒ both strides nonzero.
+    alibi_slopes_buf: torch.Tensor | None = None
+    if alibi_slopes is not None:
+        slopes = alibi_slopes
+        if slopes.dtype != torch.float32:
+            slopes = slopes.to(torch.float32)
+        if not slopes.is_contiguous():
+            slopes = slopes.contiguous()
+        if slopes.dim() == 1:
+            if slopes.shape[0] != nheads_q:
+                raise ValueError(
+                    f"flash_attn_mojo: alibi_slopes shape (nheads,) expected "
+                    f"({nheads_q},), got {tuple(slopes.shape)}."
+                )
+            alibi_b_stride = 0
+            alibi_h_stride = slopes.stride(0)
+        elif slopes.dim() == 2:
+            if slopes.shape[0] != q.shape[0] or slopes.shape[1] != nheads_q:
+                raise ValueError(
+                    f"flash_attn_mojo: alibi_slopes shape (batch, nheads) "
+                    f"expected ({q.shape[0]}, {nheads_q}), got "
+                    f"{tuple(slopes.shape)}."
+                )
+            alibi_b_stride = slopes.stride(0)
+            alibi_h_stride = slopes.stride(1)
+        else:
+            raise ValueError(
+                f"flash_attn_mojo: alibi_slopes must be 1D or 2D, got "
+                f"{slopes.dim()}D."
+            )
+        alibi_slopes_buf = slopes
+        alibi_addr = slopes.data_ptr()
+    else:
+        alibi_addr = 0
+        alibi_b_stride = 0
+        alibi_h_stride = 0
     native_fwd(
         q, k, v, out, softmax_scale, causal, nheads_kv, softcap, lse,
         window_left=int(window_left), window_right=int(window_right),
+        alibi_addr=int(alibi_addr),
+        alibi_b_stride=int(alibi_b_stride),
+        alibi_h_stride=int(alibi_h_stride),
     )
+    # Keep alibi_slopes_buf alive through the call.
+    del alibi_slopes_buf
     return out, lse
 
 
