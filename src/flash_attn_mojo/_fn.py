@@ -234,11 +234,135 @@ def _bwd_dispatch(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Backward dispatch. Returns (dq, dk, dv).
 
-    TODO: replace with the Mojo kernel once `bwd/` is implemented.
+    TEMPORARY pure-PyTorch implementation. Computes dq/dk/dv from the
+    saved (q, k, v, out, lse) and the incoming dout by recomputing the
+    attention matrix P from the saved LSE (flash-attn's standard bwd
+    trick — using the saved LSE keeps the rounding identical to the
+    fwd). All arithmetic runs in fp32; outputs are cast back to q/k/v's
+    dtype. Correct but slow — the whole attention matrix is
+    materialised in fp32.
+
+    The fast Mojo GPU kernel lands in a subsequent commit; this exists
+    so `loss.backward()` actually fills in q.grad / k.grad / v.grad
+    end-to-end today, and serves as the correctness oracle for the
+    eventual GPU bwd.
+
+    Layout matches `_fwd_dispatch`: q/k/v/out/dout are
+    (B, L, H, D); lse is (B, H, L) fp32. Composition of softcap,
+    alibi, window, causal exactly mirrors the fwd reference's order
+    so the saved LSE matches the recomputed pre-softmax scores.
     """
-    raise NotImplementedError(
-        "flash_attn_mojo: GPU backward kernel not yet implemented."
-    )
+    if dropout_p > 0.0:
+        # Faithfully replaying upstream's dropout RNG in PyTorch is
+        # nontrivial (kernel-side Philox seed/offset over the (B,H,L_q,L_k)
+        # tile grid). Out of scope for this commit; the eventual GPU
+        # bwd will handle it natively.
+        raise NotImplementedError(
+            "flash_attn_mojo backward: dropout_p > 0 is not supported by the "
+            "temporary pytorch-fallback backward. Train with dropout_p=0 for "
+            "now; the GPU bwd kernel (subsequent commit) will support dropout."
+        )
+
+    B, Lq, Hq, D = q.shape
+    Lk = k.shape[1]
+    Hkv = k.shape[2]
+
+    # (B, L, H, D) -> (B, H, L, D), fp32.
+    qt = q.transpose(1, 2).float()
+    kt = k.transpose(1, 2).float()
+    vt = v.transpose(1, 2).float()
+    out_t = out.transpose(1, 2).float()
+    dout_t = dout.transpose(1, 2).float()
+
+    # MQA/GQA: expand kv heads to match q heads.
+    repeat = 1
+    if Hkv != Hq:
+        if Hq % Hkv != 0:
+            raise ValueError(
+                f"nheads_q ({Hq}) must be a multiple of nheads_kv ({Hkv})."
+            )
+        repeat = Hq // Hkv
+        kt = kt.repeat_interleave(repeat, dim=1)
+        vt = vt.repeat_interleave(repeat, dim=1)
+
+    # Pre-softcap scores: qt @ kt^T * softmax_scale. (B, Hq, Lq, Lk)
+    scores_raw = torch.matmul(qt, kt.transpose(-2, -1)) * softmax_scale
+
+    if softcap > 0:
+        scores = softcap * torch.tanh(scores_raw / softcap)
+    else:
+        scores = scores_raw
+
+    # ALiBi bias (matches reference.py: -slope * |i - j|, additive).
+    if alibi_slopes is not None:
+        slopes = alibi_slopes.float()
+        i = torch.arange(Lq, device=scores.device).view(1, 1, -1, 1)
+        j = torch.arange(Lk, device=scores.device).view(1, 1, 1, -1)
+        if slopes.dim() == 1:
+            slopes_v = slopes.view(1, -1, 1, 1)
+        else:
+            slopes_v = slopes.view(B, -1, 1, 1)
+        scores = scores + -slopes_v * (i - j).abs().to(scores.dtype)
+
+    # Sliding-window mask.
+    if window_size != _NO_WINDOW:
+        left, right = window_size
+        i = torch.arange(Lq, device=scores.device).view(-1, 1)
+        j = torch.arange(Lk, device=scores.device).view(1, -1)
+        in_window = (
+            ((j >= i - left) | (left < 0))
+            & ((j <= i + right) | (right < 0))
+        )
+        scores = scores.masked_fill(~in_window, float("-inf"))
+
+    # Causal mask.
+    if causal:
+        mask = torch.ones(Lq, Lk, dtype=torch.bool, device=scores.device).triu(
+            Lk - Lq + 1
+        )
+        scores = scores.masked_fill(mask, float("-inf"))
+
+    # Recompute P from saved LSE: P = exp(scores - lse).
+    # Rows fully masked to -inf would give NaNs (-inf - (-inf)); guard
+    # by treating those positions as zero post-exp.
+    p = torch.exp(scores - lse.unsqueeze(-1))
+    p = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # dV = P^T @ dO
+    dvt = torch.matmul(p.transpose(-2, -1), dout_t)  # (B, Hq, Lk, D)
+    # dP = dO @ V^T
+    dpt = torch.matmul(dout_t, vt.transpose(-2, -1))  # (B, Hq, Lq, Lk)
+    # dS_post = P * (dP - rowsum(dO * O))
+    delta = (dout_t * out_t).sum(dim=-1, keepdim=True)  # (B, Hq, Lq, 1)
+    ds_post = p * (dpt - delta)  # gradient wrt post-softcap/post-alibi scores
+
+    # Alibi is purely additive, so d/d(scores_pre_alibi) = d/d(scores_post).
+    # Mask positions (causal/window) have p == 0, so ds_post is already 0
+    # there — no extra handling needed.
+
+    # Backprop through softcap: d(softcap*tanh(x/softcap))/dx = 1 - tanh(x/softcap)^2
+    # We have `scores` (post-softcap, pre-alibi/mask) = softcap * tanh(...),
+    # so the local derivative is 1 - (scores_post_softcap / softcap)^2.
+    if softcap > 0:
+        scores_post_softcap = softcap * torch.tanh(scores_raw / softcap)
+        ds_raw = ds_post * (1.0 - (scores_post_softcap / softcap) ** 2)
+    else:
+        ds_raw = ds_post
+
+    # dQ = dS_raw @ K * softmax_scale; dK = dS_raw^T @ Q * softmax_scale.
+    dqt = torch.matmul(ds_raw, kt) * softmax_scale  # (B, Hq, Lq, D)
+    dkt = torch.matmul(ds_raw.transpose(-2, -1), qt) * softmax_scale  # (B, Hq, Lk, D)
+
+    # Fold MQA/GQA: sum dk/dv across the q-head groups back to Hkv.
+    if repeat != 1:
+        dkt = dkt.view(B, Hkv, repeat, Lk, D).sum(dim=2)
+        dvt = dvt.view(B, Hkv, repeat, Lk, D).sum(dim=2)
+
+    # (B, H, L, D) -> (B, L, H, D), cast to input dtype.
+    dq = dqt.transpose(1, 2).to(q.dtype).contiguous()
+    dk = dkt.transpose(1, 2).to(k.dtype).contiguous()
+    dv = dvt.transpose(1, 2).to(v.dtype).contiguous()
+    return dq, dk, dv
 
 
 class _FlashAttnFn(torch.autograd.Function):
