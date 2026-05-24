@@ -352,6 +352,77 @@ def test_backward_window(window, causal):
     assert _max_abs(v.grad, vf.grad.to(v.dtype)) < 5e-2
 
 
+def _make_varlen_qkv(seqlens, H, D, dtype=torch.bfloat16, Hkv=None, seed=0):
+    """Pack per-batch (L_b, H, D) tensors into a varlen (total, H, D) layout.
+    Returns (q, k, v, cu_seqlens, per_batch_unpacked_qkv) where each unpacked
+    qkv element is a (1, L_b, H, D) tensor with requires_grad=True (independent
+    leaf, for per-batch reference grads).
+    """
+    Hkv = Hkv if Hkv is not None else H
+    total = sum(seqlens)
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    q_data = torch.randn(total, H, D, dtype=dtype, device="cuda", generator=g)
+    k_data = torch.randn(total, Hkv, D, dtype=dtype, device="cuda", generator=g)
+    v_data = torch.randn(total, Hkv, D, dtype=dtype, device="cuda", generator=g)
+    q = q_data.detach().clone().requires_grad_(True)
+    k = k_data.detach().clone().requires_grad_(True)
+    v = v_data.detach().clone().requires_grad_(True)
+    cu = torch.tensor(
+        [0, *list(__import__("itertools").accumulate(seqlens))],
+        dtype=torch.int32, device="cuda",
+    )
+    # Per-batch independent leaves for reference.
+    per_batch = []
+    offsets = [0, *list(__import__("itertools").accumulate(seqlens))]
+    for b, L in enumerate(seqlens):
+        s, e = offsets[b], offsets[b + 1]
+        qb = q_data[s:e].detach().clone().unsqueeze(0).requires_grad_(True)
+        kb = k_data[s:e].detach().clone().unsqueeze(0).requires_grad_(True)
+        vb = v_data[s:e].detach().clone().unsqueeze(0).requires_grad_(True)
+        per_batch.append((qb, kb, vb))
+    return q, k, v, cu, per_batch, offsets
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_varlen_backward_basic(causal):
+    """Backward through `flash_attn_varlen_func` must work (autograd
+    flows through the per-batch slice + `flash_attn_func` + slice-assign).
+    Compare per-batch grads against `flash_attn_func` called per-batch
+    on unpacked tensors."""
+    seqlens = [64, 128, 96]
+    H, D = 4, 64
+    q, k, v, cu, per_batch, offsets = _make_varlen_qkv(seqlens, H, D)
+    max_s = max(seqlens)
+
+    out = flash_attn_mojo.flash_attn_varlen_func(
+        q, k, v, cu, cu, max_s, max_s, causal=causal,
+    )
+    assert out.shape == q.shape
+    dout = torch.randn_like(out)
+    out.backward(dout)
+
+    assert q.grad is not None and q.grad.shape == q.shape
+    assert k.grad is not None and k.grad.shape == k.shape
+    assert v.grad is not None and v.grad.shape == v.shape
+
+    # Per-batch reference: call flash_attn_func on each unpacked (1, L, H, D)
+    # tile and gather grads.
+    max_err = 0.0
+    for b, L in enumerate(seqlens):
+        qb, kb, vb = per_batch[b]
+        out_b = flash_attn_mojo.flash_attn_func(qb, kb, vb, causal=causal)
+        s, e = offsets[b], offsets[b + 1]
+        out_b.backward(dout[s:e].unsqueeze(0))
+        max_err = max(
+            max_err,
+            _max_abs(q.grad[s:e], qb.grad.squeeze(0)),
+            _max_abs(k.grad[s:e], kb.grad.squeeze(0)),
+            _max_abs(v.grad[s:e], vb.grad.squeeze(0)),
+        )
+    # Same kernel, same inputs ⇒ bit-identical expected. Use a tight tol.
+    assert max_err < 1e-6, f"varlen vs per-batch grad mismatch: {max_err}"
+
+
 def test_backward_dropout_raises():
     B, L, H, D = 1, 32, 1, 64
     q, k, v = _make_qkv(B, L, H, D)

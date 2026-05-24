@@ -751,6 +751,12 @@ def flash_attn_varlen_func(
     max_seqlen_q, max_seqlen_k: ints (currently informational; the
         wrapper slices and dispatches per-batch).
 
+    Autograd: backward is supported and flows through transparently — the
+    per-batch slice + `flash_attn_func` + slice-assign are all
+    autograd-traceable, so `out.backward(...)` populates `q.grad`,
+    `k.grad`, `v.grad` with the same gradients you'd get by calling
+    `flash_attn_func` on each unpacked batch element and gathering.
+
     Current limitations of this first-cut implementation:
     - Python-level wrapper: loops over batches on the host, slices Q/K/V,
       calls `flash_attn_func` per slice. Correct but slow; a kernel-side
