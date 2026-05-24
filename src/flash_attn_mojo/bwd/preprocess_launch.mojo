@@ -24,6 +24,7 @@ def launch_bwd_preprocess[
     dout_addr: Int,
     o_addr: Int,
     delta_addr: Int,
+    dqaccum_addr: Int,
     do_b_stride: Int,
     do_l_stride: Int,
     do_h_stride: Int,
@@ -32,6 +33,9 @@ def launch_bwd_preprocess[
     o_h_stride: Int,
     delta_b_stride: Int,
     delta_h_stride: Int,
+    dqaccum_b_stride: Int,
+    dqaccum_h_stride: Int,
+    dqaccum_l_stride: Int,
     stream_handle_addr: Int,
     ctx_handle_addr: Int,
 ) raises:
@@ -57,6 +61,9 @@ def launch_bwd_preprocess[
     var delta_ptr = UnsafePointer[Float32, MutAnyOrigin](
         unsafe_from_address=delta_addr
     )
+    var dqaccum_ptr = UnsafePointer[Float32, MutAnyOrigin](
+        unsafe_from_address=dqaccum_addr
+    )
 
     var grid = (
         ceildiv(seqlen_int, Int(kPreprocBM)),
@@ -73,6 +80,7 @@ def launch_bwd_preprocess[
             dout_ptr,
             o_ptr,
             delta_ptr,
+            dqaccum_ptr,
             do_b_stride,
             do_l_stride,
             do_h_stride,
@@ -81,6 +89,9 @@ def launch_bwd_preprocess[
             o_h_stride,
             delta_b_stride,
             delta_h_stride,
+            dqaccum_b_stride,
+            dqaccum_h_stride,
+            dqaccum_l_stride,
             grid_dim=grid,
             block_dim=(kPreprocNThreads,),
         )
@@ -92,6 +103,7 @@ def launch_bwd_preprocess[
             dout_ptr,
             o_ptr,
             delta_ptr,
+            dqaccum_ptr,
             do_b_stride,
             do_l_stride,
             do_h_stride,
@@ -100,6 +112,9 @@ def launch_bwd_preprocess[
             o_h_stride,
             delta_b_stride,
             delta_h_stride,
+            dqaccum_b_stride,
+            dqaccum_h_stride,
+            dqaccum_l_stride,
             grid_dim=grid,
             block_dim=(kPreprocNThreads,),
         )

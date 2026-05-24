@@ -186,7 +186,8 @@ def test_bwd_preprocess_correctness():
     out = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda", generator=g)
 
     delta_mojo = torch.empty(B, H, L, dtype=torch.float32, device="cuda")
-    native_bwd_preprocess(dout, out, delta_mojo)
+    dqaccum = torch.empty(B, H, L, D, dtype=torch.float32, device="cuda")
+    native_bwd_preprocess(dout, out, delta_mojo, dqaccum)
 
     # Reference: dO * O summed over the head_dim, in fp32, then
     # transposed (B, L, H) -> (B, H, L).
@@ -207,11 +208,39 @@ def test_bwd_preprocess_head_dims(D):
     out = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda", generator=g)
 
     delta_mojo = torch.empty(B, H, L, dtype=torch.float32, device="cuda")
-    native_bwd_preprocess(dout, out, delta_mojo)
+    dqaccum = torch.empty(B, H, L, D, dtype=torch.float32, device="cuda")
+    native_bwd_preprocess(dout, out, delta_mojo, dqaccum)
 
     delta_ref = (dout.float() * out.float()).sum(dim=-1).transpose(1, 2).contiguous()
     max_err = (delta_mojo - delta_ref).abs().max().item()
     assert max_err < 1e-3, f"D={D}: delta max-abs err {max_err} >= 1e-3"
+
+
+@pytest.mark.parametrize("D", [32, 64, 128])
+@pytest.mark.parametrize("L", [64, 96, 128, 192])
+def test_bwd_preprocess_clears_dqaccum(D, L):
+    """The preprocess kernel must zero every element of the dqaccum
+    workspace it's given. Pre-fill with garbage, call preprocess, assert
+    everything is zero. Includes a non-BM-aligned seqlen (96, 192) to
+    cover the tile-tail bounds-check path."""
+    from flash_attn_mojo.bwd import native_bwd_preprocess
+
+    B, H = 2, 3
+    g = torch.Generator(device="cuda").manual_seed(0)
+    dout = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda", generator=g)
+    out = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda", generator=g)
+
+    delta = torch.empty(B, H, L, dtype=torch.float32, device="cuda")
+    # Fill with NaN/garbage so a missed write is loud.
+    dqaccum = torch.full(
+        (B, H, L, D), float("nan"), dtype=torch.float32, device="cuda"
+    )
+    native_bwd_preprocess(dout, out, delta, dqaccum)
+    assert torch.all(dqaccum == 0).item(), (
+        f"dqaccum has non-zero entries after preprocess "
+        f"(D={D}, L={L}): "
+        f"nonzero count={(dqaccum != 0).sum().item()}"
+    )
 
 
 def test_backward_dropout_raises():

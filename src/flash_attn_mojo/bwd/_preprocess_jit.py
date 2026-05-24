@@ -31,15 +31,15 @@ def call_bwd_preprocess(args: tuple) -> None:
     (dtype, head_dim, use_external_stream).
     """
     variant_fn, ctx_handle = _get_variant_fn(_config_from_args(args))
-    # Append ctx_handle as the next positional (index 18). The variant
-    # entry point destructures it from `args[18]`.
+    # Append ctx_handle as the next positional (index 22). The variant
+    # entry point destructures it from `args[22]`.
     variant_fn(*args, ctx_handle)
 
 
 def _config_from_args(args: tuple) -> tuple:
-    dtype_code = args[15]
-    head_dim = args[16]
-    use_external_stream = bool(args[17])
+    dtype_code = args[19]
+    head_dim = args[20]
+    use_external_stream = bool(args[21])
     return (dtype_code, head_dim, use_external_stream)
 
 

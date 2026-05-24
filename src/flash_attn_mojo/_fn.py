@@ -347,7 +347,23 @@ def _bwd_dispatch(
             dtype=torch.float32,
             device=dout.device,
         )
-        native_bwd_preprocess(dout, out, delta_t)
+        # dQaccum workspace: (B, H, L, D) fp32. The main bwd kernel
+        # (not yet implemented) atomically accumulates dQ contributions
+        # into this tensor across KV blocks; preprocess clears it. For
+        # this commit it's allocated and zeroed but otherwise unused —
+        # the pytorch fallback below still computes dQ directly. This
+        # mirrors Tri Dao's flash_bwd_preprocess_kernel pipeline so the
+        # GPU bwd kernel (subsequent commit) can drop in without
+        # touching the allocator.
+        dqaccum = torch.empty(
+            dout.shape[0],
+            dout.shape[2],
+            dout.shape[1],
+            dout.shape[3],
+            dtype=torch.float32,
+            device=dout.device,
+        )
+        native_bwd_preprocess(dout, out, delta_t, dqaccum)
         # Match the previous keepdim=True shape (B, Hq, Lq, 1) so the
         # broadcast in `dpt - delta` is unchanged.
         delta = delta_t.unsqueeze(-1).float()

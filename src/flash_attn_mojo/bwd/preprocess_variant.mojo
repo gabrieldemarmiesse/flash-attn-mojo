@@ -34,22 +34,26 @@ def bwd_preprocess_variant(
     var dout_addr: Int = Int(py=args[0])
     var o_addr: Int = Int(py=args[1])
     var delta_addr: Int = Int(py=args[2])
-    var batch_int: Int = Int(py=args[3])
-    var seqlen_int: Int = Int(py=args[4])
-    var nheads_int: Int = Int(py=args[5])
-    var do_b_stride: Int = Int(py=args[6])
-    var do_l_stride: Int = Int(py=args[7])
-    var do_h_stride: Int = Int(py=args[8])
-    var o_b_stride: Int = Int(py=args[9])
-    var o_l_stride: Int = Int(py=args[10])
-    var o_h_stride: Int = Int(py=args[11])
-    var delta_b_stride: Int = Int(py=args[12])
-    var delta_h_stride: Int = Int(py=args[13])
-    var stream_handle_addr: Int = Int(py=args[14])
-    # args[15..17] are comptime defines (dtype, head_dim, use_ext_stream);
+    var dqaccum_addr: Int = Int(py=args[3])
+    var batch_int: Int = Int(py=args[4])
+    var seqlen_int: Int = Int(py=args[5])
+    var nheads_int: Int = Int(py=args[6])
+    var do_b_stride: Int = Int(py=args[7])
+    var do_l_stride: Int = Int(py=args[8])
+    var do_h_stride: Int = Int(py=args[9])
+    var o_b_stride: Int = Int(py=args[10])
+    var o_l_stride: Int = Int(py=args[11])
+    var o_h_stride: Int = Int(py=args[12])
+    var delta_b_stride: Int = Int(py=args[13])
+    var delta_h_stride: Int = Int(py=args[14])
+    var dqaccum_b_stride: Int = Int(py=args[15])
+    var dqaccum_h_stride: Int = Int(py=args[16])
+    var dqaccum_l_stride: Int = Int(py=args[17])
+    var stream_handle_addr: Int = Int(py=args[18])
+    # args[19..21] are comptime defines (dtype, head_dim, use_ext_stream);
     # skipped here, read at module level via get_defined_*. ctx_handle is
-    # appended by `call_bwd_preprocess` as the 19th positional (index 18).
-    var ctx_handle_addr: Int = Int(py=args[18])
+    # appended by `call_bwd_preprocess` as the 23rd positional (index 22).
+    var ctx_handle_addr: Int = Int(py=args[22])
 
     if batch_int == 0 or seqlen_int == 0 or nheads_int == 0:
         return PythonObject(None)
@@ -61,6 +65,7 @@ def bwd_preprocess_variant(
         dout_addr,
         o_addr,
         delta_addr,
+        dqaccum_addr,
         do_b_stride,
         do_l_stride,
         do_h_stride,
@@ -69,6 +74,9 @@ def bwd_preprocess_variant(
         o_h_stride,
         delta_b_stride,
         delta_h_stride,
+        dqaccum_b_stride,
+        dqaccum_h_stride,
+        dqaccum_l_stride,
         stream_handle_addr,
         ctx_handle_addr,
     )
