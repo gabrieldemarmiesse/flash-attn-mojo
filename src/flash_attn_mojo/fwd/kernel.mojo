@@ -498,11 +498,20 @@ def fwd_kernel[
             rowsum,
         )
 
+        # V's smem tile is (BK, BN) — distinct from K's (BN, BK). The
+        # auto-derived (BN/simd_size, simd_size)-style layout used for K
+        # / Q gives (16, 8) for V, which has 2 dst frags per thread
+        # spanning rows ti and ti+16. The stdlib's swizzled copy formula
+        # `swizzle(base + idx_base) + idx_diff - base` produces the
+        # wrong physical address for the second fragment (the row
+        # ti+16 write) when row_size and stride hit this swizzle
+        # window — observed as "smem V row 31 holds V[16] data" and
+        # downstream P·V picks up the corrupted row.
+        # Pin the V copy to a one-frag-per-thread layout (32 rows × 4
+        # cols, each thread one vec) which sidesteps that swizzle bug.
         comptime async_copy_v_layout = Layout.row_major(
-            min(num_threads, kv_num_vecs)
-            * simd_size
-            // v_smem_iter.layout.stride[0].value(),
-            v_smem_iter.layout.stride[0].value() // simd_size,
+            v_smem_iter.layout.shape[0].value(),
+            num_threads // v_smem_iter.layout.shape[0].value(),
         )
 
         comptime for v_id in range(BN // BK):
