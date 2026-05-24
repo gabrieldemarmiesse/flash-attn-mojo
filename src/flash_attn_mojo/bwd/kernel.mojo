@@ -45,23 +45,24 @@ Algorithm (one block per (n_block, batch, head); see upstream lines 81-826):
        i. dK_acc += dS^T · Q.
   4. Write dK_acc (cast bf16) and dV_acc (cast bf16) to gmem.
 
-Smem layout (dynamic):
-    K_smem      : BN × D   bf16   = 8 KiB
-    V_smem      : BN × D   bf16   = 8 KiB
-    Q_smem      : BM × D   bf16   = 8 KiB
-    dO_smem     : BM × D   bf16   = 8 KiB
+Smem layout (dynamic), sizes shown at head_dim=64 / hd=128:
+    K_smem      : BN × D   bf16   = 8 / 16 KiB
+    V_smem      : BN × D   bf16   = 8 / 16 KiB
+    Q_smem      : BM × D   bf16   = 8 / 16 KiB
+    dO_smem     : BM × D   bf16   = 8 / 16 KiB
     S_smem      : BM × BN  fp32   = 16 KiB   (reused for dS after dV update)
     dP_smem     : BM × BN  fp32   = 16 KiB
-    sfcfac_smem : BM × BN  fp32   = 16 KiB   (softcap local derivative,
-                                              only used when softcap > 0)
     LSE_smem    : BM       fp32   = 256 B
     delta_smem  : BM       fp32   = 256 B
-    Total                         ~ 80.5 KiB
+    Total                         ~ 64.5 / 96.5 KiB
 
-This sits comfortably under the 99 KiB Ada dynamic-smem cap.
+This sits under the 99 KiB Ada dynamic-smem cap at hd=128. The
+softcap local-derivative factor (1 - (s_post/softcap)^2) is
+recomputed on the fly in the dS step from `log(p) + lse[m]`
+(minus alibi bias) rather than stashed in smem, saving 16 KiB.
 """
 
-from std.math import exp, log2, tanh
+from std.math import exp, log, log2, tanh
 from std.math.constants import log2e
 from std.sys import size_of
 from std.utils.index import StaticTuple
@@ -162,8 +163,11 @@ def bwd_kernel[
     var do_smem = q_smem + (BM * D)
     var s_smem = (do_smem + (BM * D)).bitcast[Float32]()
     var dp_smem = s_smem + (BM * BN)
-    var sfcfac_smem = dp_smem + (BM * BN)
-    var lse_smem = sfcfac_smem + (BM * BN)
+    # Softcap local-derivative factor is recomputed on the fly in the dS
+    # step from `log(p) + lse[m]` rather than stashed in a dedicated
+    # smem buffer — saves 16 KiB and brings hd=128 under the 99 KiB Ada
+    # dynamic-smem cap.
+    var lse_smem = dp_smem + (BM * BN)
     var delta_smem = lse_smem + BM
 
     # ---- Per-thread dK_acc, dV_acc register tiles.
@@ -344,12 +348,12 @@ def bwd_kernel[
                 # Apply softcap (if enabled). s_post is the value that
                 # actually feeds softmax: s_post = softcap*tanh(s_pre/softcap).
                 # Local derivative ds_post/ds_pre = 1 - (s_post/softcap)^2
-                # is stashed in sfcfac_smem for the dS rescale below.
+                # is recomputed in the dS loop from `log(p) + lse[m]`
+                # rather than stashed here — saves 16 KiB of smem (lets
+                # hd=128 fit under the 99 KiB Ada dynamic-smem cap).
                 var s_post: Float32 = s_pre
                 if has_softcap:
                     s_post = softcap_f * tanh(s_pre * softcap_inv)
-                    var t: Float32 = s_post * softcap_inv
-                    sfcfac_smem[m * BN + n] = Float32(1) - t * t
                 # ALiBi bias is additive and matches the fwd kernel
                 # convention exactly: causal=+slope*col, non-causal=
                 # -slope*|row-col|. Composition order: scores_raw →
@@ -434,7 +438,27 @@ def bwd_kernel[
                 # dq/dk pre-scaled (matches the pytorch fallback order).
                 var ds: Float32 = p * (dpv - delta_smem[m])
                 if has_softcap:
-                    ds = ds * sfcfac_smem[m * BN + n]
+                    # Reconstruct the post-softcap (pre-alibi) s_post from
+                    # p and LSE: p = exp(s_post_with_alibi - lse[m]), so
+                    # s_post = log(p) + lse[m] - alibi_bias. ALiBi is
+                    # additive so we subtract it back out to get the
+                    # pre-alibi s_post that softcap saw. When p == 0
+                    # (masked) ds is already 0 — skip log(0).
+                    if p > Float32(0):
+                        var g_row: Int = q_row_base + m
+                        var g_col: Int = kv_row_base + n
+                        var s_post: Float32 = log(p) + lse_smem[m]
+                        if has_alibi:
+                            @parameter
+                            if causal:
+                                s_post = s_post - alibi_slope * Float32(g_col)
+                            else:
+                                var d_rc: Int = g_col - g_row
+                                if d_rc < 0:
+                                    d_rc = -d_rc
+                                s_post = s_post + alibi_slope * Float32(d_rc)
+                        var t: Float32 = s_post * softcap_inv
+                        ds = ds * (Float32(1) - t * t)
                 ds = ds * scale_f
                 s_smem[m * BN + n] = ds
 

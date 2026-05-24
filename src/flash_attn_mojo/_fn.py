@@ -231,7 +231,7 @@ def _bwd_dispatch_native_mvp(
     window_size: tuple[int, int] = _NO_WINDOW,
     dropout_p: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Native MVP backward: bf16 / head_dim in {32, 64} / optional causal / no MQA.
+    """Native MVP backward: bf16 / head_dim in {32, 64, 128} / optional causal / no MQA.
 
     Allocates delta, dqaccum, dk, dv. Calls native_bwd_preprocess to
     fill delta + zero dqaccum. Calls native_bwd_main to fill dk, dv
@@ -377,7 +377,7 @@ def _bwd_dispatch(
     so the saved LSE matches the recomputed pre-softmax scores.
     """
     # ---- MVP native bwd routing.
-    # Inside the MVP envelope (bf16/fp16 cuda, head_dim in {32, 64}, optional
+    # Inside the MVP envelope (bf16/fp16 cuda, head_dim in {32, 64, 128}, optional
     # causal, MQA/GQA, optional softcap, no alibi/window/dropout,
     # equal seqlen) we call
     # the native bwd kernel for dk/dv/dqaccum and the convert_dq kernel
@@ -387,7 +387,7 @@ def _bwd_dispatch(
     _in_mvp_envelope = (
         dout.is_cuda
         and q.dtype in (torch.bfloat16, torch.float16)
-        and q.shape[-1] in (32, 64)
+        and q.shape[-1] in (32, 64, 128)
         and q.shape[2] % k.shape[2] == 0  # MQA/GQA: Hq divisible by Hkv
         and q.shape[1] == k.shape[1]  # equal seqlen
     )

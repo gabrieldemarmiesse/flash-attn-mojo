@@ -88,12 +88,11 @@ def launch_bwd[
     comptime do_bytes: Int = kBwdBlockM * D * size_of[dtype]()
     comptime s_bytes: Int = kBwdBlockM * kBwdBlockN * 4  # fp32
     comptime dp_bytes: Int = kBwdBlockM * kBwdBlockN * 4
-    comptime sfcfac_bytes: Int = kBwdBlockM * kBwdBlockN * 4  # fp32 softcap fac
     comptime lse_bytes: Int = kBwdBlockM * 4
     comptime delta_bytes: Int = kBwdBlockM * 4
     comptime smem_bytes: Int = (
         k_bytes + v_bytes + q_bytes + do_bytes
-        + s_bytes + dp_bytes + sfcfac_bytes + lse_bytes + delta_bytes
+        + s_bytes + dp_bytes + lse_bytes + delta_bytes
     )
 
     var compiled = ctx.compile_function[
