@@ -15,6 +15,7 @@ refactoring.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from flash_attn_mojo.reference import flash_attn_ref
 
@@ -22,6 +23,49 @@ from flash_attn_mojo.reference import flash_attn_ref
 # Sentinel for the "no window" case in flash-attn 2's sliding-window
 # parameter — `window_size=(-1, -1)` means full attention.
 _NO_WINDOW = (-1, -1)
+
+
+# Native kernel-supported head_dims. Anything else within upstream's
+# envelope (multiple of 8, <= 128) is rounded UP to the nearest of these
+# and run with zero-padded q/k/v; the output's padded slots are sliced
+# off before return. Upstream does the same (see flash_api.cpp's
+# `head_size_rounded = round_multiple(head_size, head_size <= 128 ? 32 : 64)`),
+# but rounds to {32, 64, 96, 128, 160, 192, 224, 256}. Our supported
+# subset is just the powers of two we have kernel variants for.
+_NATIVE_HEAD_DIMS = (32, 64, 128)
+_MAX_HEAD_DIM = 128
+
+
+def _round_head_dim(head_dim: int) -> int:
+    """Round `head_dim` UP to the nearest natively-supported size.
+
+    Validates against upstream's accepted envelope (multiple of 8,
+    <= 256) and rejects sizes we don't have a kernel variant for
+    (> 128). Returns the rounded size, which is guaranteed to be in
+    `_NATIVE_HEAD_DIMS`.
+    """
+    if head_dim <= 0 or head_dim % 8 != 0:
+        # Upstream wording (csrc/flash_attn/flash_api.cpp):
+        #     "head_size should be a multiple of 8".
+        raise ValueError(
+            f"flash_attn_mojo: head_size should be a multiple of 8, "
+            f"got {head_dim}."
+        )
+    if head_dim > _MAX_HEAD_DIM:
+        # Upstream accepts up to 256 by also providing 160/192/224/256
+        # kernel variants. We don't yet — see CLAUDE.md ("Kernel-design
+        # patterns to mirror") for the work needed to add them.
+        raise NotImplementedError(
+            f"flash_attn_mojo: head_dim={head_dim} > {_MAX_HEAD_DIM} is not "
+            "supported. Native kernel variants for head_dim in "
+            "(160, 192, 224, 256) are not yet implemented; see CLAUDE.md "
+            "for the kernel-side work to add them."
+        )
+    for native in _NATIVE_HEAD_DIMS:
+        if head_dim <= native:
+            return native
+    # Unreachable given the <= _MAX_HEAD_DIM check above.
+    raise AssertionError(f"unreachable: head_dim={head_dim}")
 
 
 def _fwd_dispatch(
@@ -323,15 +367,54 @@ def flash_attn_func(
         v = v.to(torch.bfloat16)
         # alibi_slopes is normalised to fp32 inside _fwd_dispatch, so no
         # cast is needed here.
+
+    # head_dim round-up. Upstream's flash-attn accepts any head_dim that
+    # is a multiple of 8 (up to 256) and runs a kernel sized to the
+    # rounded-up head_dim. We mirror that strategy for the head_dims our
+    # native kernels don't cover: pad q/k/v's last dim with zeros up to
+    # the rounded size, run the kernel, slice the output back. Since
+    # the padded q/k slots are zero, Q · K^T over the padded slots
+    # contributes 0; and since V's padded slots are zero, P · V also
+    # contributes 0 to the output's real slots. The output's padded
+    # slots are garbage which we discard. This is a copy (not free) —
+    # the proper fix is per-head_dim native kernel variants (see
+    # CLAUDE.md). softmax_scale defaults to 1/sqrt(D_user), NOT the
+    # rounded D — matches upstream and keeps the attention math sane.
+    head_dim_user = q.shape[-1]
+    head_dim_rounded = _round_head_dim(head_dim_user)
+    if softmax_scale is None:
+        # Lock the scale to the USER's head_dim before padding, otherwise
+        # _fwd_dispatch's default would use the rounded size.
+        softmax_scale = head_dim_user ** -0.5
+    if head_dim_rounded != head_dim_user:
+        pad = head_dim_rounded - head_dim_user
+        # `F.pad` on the last dim produces a contiguous tensor, which the
+        # launcher's pad-and-copy path requires (q.stride(1) == head_dim
+        # for the seqlen-unaligned chunk).
+        q = F.pad(q, (0, pad))
+        k = F.pad(k, (0, pad))
+        v = F.pad(v, (0, pad))
     result = _FlashAttnFn.apply(
         q, k, v, dropout_p, softmax_scale, causal, window_size,
         softcap, alibi_slopes, deterministic, return_attn_probs,
     )
+    # Slice the output back to the user's head_dim. The autograd op
+    # returns either a Tensor or (out, lse, rng_state); slice only the
+    # out tensor — lse is per-row (independent of head_dim).
+    def _slice_head(out_t: torch.Tensor) -> torch.Tensor:
+        if head_dim_rounded != head_dim_user:
+            return out_t[..., :head_dim_user].contiguous()
+        return out_t
+
+    if isinstance(result, tuple):
+        out, lse, rng_state = result
+        out = _slice_head(out)
+        if fp16_in:
+            out = out.to(torch.float16)
+        return out, lse, rng_state
+    result = _slice_head(result)
     if fp16_in:
-        if isinstance(result, tuple):
-            out, lse, rng_state = result
-            return out.to(torch.float16), lse, rng_state
-        return result.to(torch.float16)
+        result = result.to(torch.float16)
     return result
 
 

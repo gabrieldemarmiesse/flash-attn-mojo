@@ -440,6 +440,56 @@ def test_head_dim_128_correctness(causal):
     )
 
 
+@pytest.mark.parametrize("D", [8, 24, 40, 56, 72, 88, 104, 120])
+def test_head_dim_roundup(D):
+    """head_dims that aren't natively supported are rounded UP to the
+    next of (32, 64, 128) by padding q/k/v with zeros along the last
+    dim. Must agree with upstream flash-attn (which does the same
+    round-up internally) within bf16 tolerance, and the returned
+    output must have the user's head_dim (not the rounded one).
+    """
+    try:
+        from flash_attn import flash_attn_func as upstream_fwd
+    except ImportError:
+        pytest.skip("upstream flash-attn not available")
+    B, L, H = 2, 128, 4
+    torch.manual_seed(0)
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+
+    out_mojo = flash_attn_mojo.flash_attn_func(q, k, v, causal=False)
+    out_up = upstream_fwd(q, k, v, causal=False)
+
+    # Output preserves the user's head_dim, not the rounded one.
+    assert out_mojo.shape == (B, L, H, D), out_mojo.shape
+
+    diff = _max_abs(out_mojo, out_up)
+    assert diff < 5e-2, f"D={D} mojo-vs-upstream max |diff|={diff:.3e}"
+
+
+def test_head_dim_not_multiple_of_8_rejects():
+    """head_dim=10: not a multiple of 8 → reject with upstream's wording."""
+    B, L, H, D = 1, 32, 1, 10
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="multiple of 8"):
+        flash_attn_mojo.flash_attn_func(q, k, v)
+
+
+def test_head_dim_over_128_rejects():
+    """head_dim=160: within upstream's envelope but beyond our native
+    kernel variants. Must raise with a message pointing at CLAUDE.md.
+    """
+    B, L, H, D = 1, 32, 1, 160
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(NotImplementedError, match="CLAUDE.md"):
+        flash_attn_mojo.flash_attn_func(q, k, v)
+
+
 def test_dropout_zero_unchanged():
     """`dropout_p=0.0` must produce bit-identical output to the no-arg
     call — the dropout-active variant compiles to a separate kernel,
