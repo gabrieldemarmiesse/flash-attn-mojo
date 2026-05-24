@@ -97,6 +97,7 @@ def fwd_kernel[
     head_dim: Int,
 ](
     seq_len: Int,
+    actual_seq_len: Int,
     nheads: Int,
     softmax_scale: Float32,
     q_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -331,7 +332,7 @@ def fwd_kernel[
     )
 
     # ---- KV loop body (one (BN-tall) tile per iteration).
-    @__copy_capture(seq_len, scale_log2e)
+    @__copy_capture(seq_len, actual_seq_len, scale_log2e)
     @always_inline
     @parameter
     def loop_over_kv[
@@ -444,7 +445,13 @@ def fwd_kernel[
         )
 
         # Apply softmax_scale * log2e (we use exp2 inside online softmax).
-        # Boundary-mask scores for keys >= seq_len on the last iter.
+        # Boundary-mask scores for keys >= actual_seq_len. Launcher pads
+        # K/V/seq_len up to a multiple of BN, so `not_last_iter` (from
+        # tile_and_unswitch over padded seq_len) is always True. Instead
+        # we trigger masking whenever this tile overlaps the padding tail.
+        var tile_needs_mask: Bool = (
+            kv_tile_start_row + Int(BN) > actual_seq_len
+        )
         var p_reg_vec2 = p_reg_tile.vectorize[1, p_frag_simdwidth]()
         comptime for m_mma in range(num_m_mmas):
             comptime for n_mma in range(num_n_mmas):
@@ -459,9 +466,9 @@ def fwd_kernel[
                 comptime for i in range(2):
                     p_reg_vec2[mma_id, i] = p_reg_vec2[mma_id, i] * scale_log2e
 
-                    # Per-element OOB mask on the last KV iter: set score to
-                    # -inf so its softmax weight goes to zero.
-                    if not not_last_iter:
+                    # Per-element OOB mask: set score for any key >=
+                    # actual_seq_len to -inf so its softmax weight is zero.
+                    if tile_needs_mask:
                         var score_col: Int = (
                             kv_tile_start_row
                             + Int(mma_col_base + col_off)
@@ -471,7 +478,7 @@ def fwd_kernel[
                         )
 
                         comptime for j in range(p_frag_simdwidth):
-                            if score_col + j >= seq_len:
+                            if score_col + j >= actual_seq_len:
                                 p_reg_vec2[mma_id, i][j] = ne_inf[j]
 
         comptime reg_layout_by_mma_unit = Layout.row_major(
