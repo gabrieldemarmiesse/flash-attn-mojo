@@ -229,6 +229,7 @@ def _bwd_dispatch_native_mvp(
     softcap: float,
     alibi_slopes: torch.Tensor | None = None,
     window_size: tuple[int, int] = _NO_WINDOW,
+    dropout_p: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Native MVP backward: bf16 / head_dim=64 / optional causal / no MQA.
 
@@ -241,7 +242,18 @@ def _bwd_dispatch_native_mvp(
     fp16 inputs are bf16-cast at the API boundary (same pattern as
     the fwd kernel) since the bwd kernel only specialises on bf16
     for the MVP.
+
+    Dropout is not supported by the native bwd MVP — the kernel does
+    not reproduce the fwd's splitmix dropout mask. Reject dropout > 0
+    here with the same NotImplementedError wording the pytorch
+    fallback uses, so both paths fail with a matching error.
     """
+    if dropout_p > 0.0:
+        raise NotImplementedError(
+            "flash_attn_mojo backward: dropout_p > 0 is not supported by the "
+            "native bwd kernel (the kernel does not reproduce the fwd's "
+            "dropout mask). Train with dropout_p=0 for now."
+        )
     from flash_attn_mojo.bwd import (
         native_bwd_preprocess,
         native_bwd_main,
@@ -377,7 +389,6 @@ def _bwd_dispatch(
         and q.dtype in (torch.bfloat16, torch.float16)
         and q.shape[-1] == 64
         and q.shape[2] % k.shape[2] == 0  # MQA/GQA: Hq divisible by Hkv
-        and dropout_p == 0.0
         and q.shape[1] == k.shape[1]  # equal seqlen
     )
     if _in_mvp_envelope:
@@ -385,6 +396,7 @@ def _bwd_dispatch(
             dout, q, k, v, out, lse, softmax_scale, causal, softcap,
             alibi_slopes=alibi_slopes,
             window_size=window_size,
+            dropout_p=dropout_p,
         )
 
     if dropout_p > 0.0:
