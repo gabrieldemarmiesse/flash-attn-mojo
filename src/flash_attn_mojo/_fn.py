@@ -60,9 +60,9 @@ def _fwd_dispatch(
             "flash_attn_mojo current kernel supports bf16 only "
             f"(got {q.dtype}). See `_fn.py` for the why."
         )
-    if q.shape[-1] != 64:
+    if q.shape[-1] not in (64, 128):
         raise NotImplementedError(
-            f"flash_attn_mojo current kernel supports head_dim=64 only "
+            f"flash_attn_mojo current kernel supports head_dim in (64, 128) "
             f"(got {q.shape[-1]})."
         )
     if dropout_p != 0.0:

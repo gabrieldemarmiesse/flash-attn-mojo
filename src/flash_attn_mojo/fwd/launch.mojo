@@ -20,7 +20,7 @@ from std.memory import OpaquePointer
 from std.sys import size_of
 
 from kernel import fwd_kernel
-from common import kNThreads, kBlockM, kBlockN, kBlockK, kWM, kWN
+from common import kNThreads, kBlockM, kBlockK, kWM
 
 
 def launch_fwd[
@@ -70,19 +70,24 @@ def launch_fwd[
         unsafe_from_address=stream_handle_addr
     )
 
-    # Dynamic smem budget (bytes):
+    # BN == head_dim (see common.mojo). Smem budget at head_dim=64: 32 KiB
+    # (fits 48 KiB default). At head_dim=128: 96 KiB — needs the opt-in via
+    # FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES (Ada/Ampere support up to
+    # ~100 KiB per block).
     #   Q tile:     BM * head_dim * size_of[dtype]
     #   K tile:     BN * head_dim * size_of[dtype]
-    #   V tile:     BN * BN       * size_of[dtype]   (BN == head_dim for our shapes)
+    #   V tile:     BN * BN       * size_of[dtype]   (BN == head_dim)
+    #   P tile:     BM * BN       * size_of[dtype]   (reserved for multistage_mma)
     #   scratch:    2 * num_warps_n * BM * size_of[accum=fp32]    (zero when num_warps_n == 1)
     # plus the output write-back reuses q_smem in place — same buffer, no extra.
+    comptime BN: Int = head_dim
     comptime q_bytes: Int = kBlockM * head_dim * size_of[dtype]()
-    comptime k_bytes: Int = kBlockN * head_dim * size_of[dtype]()
-    comptime v_bytes: Int = kBlockN * kBlockN * size_of[dtype]()
+    comptime k_bytes: Int = BN * head_dim * size_of[dtype]()
+    comptime v_bytes: Int = BN * BN * size_of[dtype]()
     # `p_smem` is reserved unconditionally so `multistage_mma`'s
     # a_smem_iter parameter (which must be in SHARED address space)
     # type-checks even when num_warps_n == 1 and P stays in registers.
-    comptime p_bytes: Int = kBlockM * kBlockN * size_of[dtype]()
+    comptime p_bytes: Int = kBlockM * BN * size_of[dtype]()
     comptime scratch_bytes: Int = 0  # num_warps_n == 1 ⇒ warp_scratch is empty
     comptime smem_bytes: Int = (
         q_bytes + k_bytes + v_bytes + p_bytes + scratch_bytes
@@ -93,7 +98,7 @@ def launch_fwd[
         fwd_kernel[dtype, head_dim, causal],
     ](func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(smem_bytes))
 
-    var padded_seqlen: Int = ceildiv(seqlen_int, Int(kBlockN)) * Int(kBlockN)
+    var padded_seqlen: Int = ceildiv(seqlen_int, Int(BN)) * Int(BN)
     var needs_pad: Bool = padded_seqlen != seqlen_int
 
     # Whether we run the kernel against the user's tensors directly, or

@@ -86,7 +86,7 @@ from layout.tensor_core import get_fragment_size, get_mma_shape
 from linalg.matmul.gpu._multistage_gemm_gpu import multistage_mma
 from nn.softmax import _online_softmax_iter_for_mma_output
 
-from common import kNThreads, kBlockM, kBlockN, kBlockK, kWM, kWN
+from common import kNThreads, kBlockM, kBlockK, kWM
 
 
 @__llvm_metadata(
@@ -134,10 +134,13 @@ def fwd_kernel[
     comptime k_group_size: Int = 1
 
     comptime BM: Int = kBlockM
-    comptime BN: Int = kBlockN
+    # BN == WN == depth keeps the kernel structurally identical across
+    # head_dims: p_reg_tile (BM, BN) and output_reg_tile (BM, depth) share
+    # one shape, and `num_n_mmas = WN // MMA_N` covers both MMAs' N axes.
+    comptime BN: Int = head_dim
     comptime BK: Int = kBlockK
     comptime WM: Int = kWM
-    comptime WN: Int = kWN
+    comptime WN: Int = head_dim
     comptime num_threads: Int = kNThreads
     comptime num_warps_m: Int = BM // WM
     comptime num_warps_n: Int = BN // WN

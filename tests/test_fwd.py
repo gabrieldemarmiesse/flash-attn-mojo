@@ -386,3 +386,29 @@ def test_no_alibi_regression():
         "alibi_slopes=None must match the default (no-alibi) fast path "
         "bitwise"
     )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_head_dim_128_correctness(causal):
+    """head_dim=128: mojo must agree with upstream flash-attn within bf16 tol."""
+    try:
+        from flash_attn import flash_attn_func as upstream_fwd
+    except ImportError:
+        pytest.skip("upstream flash-attn not available")
+    B, L, H, D = 2, 512, 4, 128
+    torch.manual_seed(0)
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+
+    out_mojo = flash_attn_mojo.flash_attn_func(q, k, v, causal=causal)
+    out_up = upstream_fwd(q, k, v, causal=causal)
+    out_ref = _sdpa_ref(q, k, v, causal=causal)
+
+    diff_mojo = _max_abs(out_mojo, out_ref)
+    diff_up = _max_abs(out_up, out_ref)
+    tol = max(1.5 * diff_up, 5e-3)
+    assert diff_mojo < tol, (
+        f"hd=128 causal={causal} mojo-vs-SDPA={diff_mojo:.3e} "
+        f"vs upstream-vs-SDPA={diff_up:.3e}, tol={tol:.3e}"
+    )
