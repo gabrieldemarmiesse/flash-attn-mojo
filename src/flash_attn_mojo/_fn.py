@@ -333,7 +333,26 @@ def _bwd_dispatch(
     # dP = dO @ V^T
     dpt = torch.matmul(dout_t, vt.transpose(-2, -1))  # (B, Hq, Lq, Lk)
     # dS_post = P * (dP - rowsum(dO * O))
-    delta = (dout_t * out_t).sum(dim=-1, keepdim=True)  # (B, Hq, Lq, 1)
+    # Compute `delta = rowsum(dO * O)` via the on-device Mojo kernel
+    # when the tensors live on CUDA (fp32 accumulator, fp32 output).
+    # This is the first piece of the bwd path that runs as a native
+    # GPU kernel; the rest (P, dV, dK, dQ) still uses pytorch matmuls.
+    if dout.is_cuda:
+        from flash_attn_mojo.bwd import native_bwd_preprocess
+
+        delta_t = torch.empty(
+            dout.shape[0],
+            dout.shape[2],
+            dout.shape[1],
+            dtype=torch.float32,
+            device=dout.device,
+        )
+        native_bwd_preprocess(dout, out, delta_t)
+        # Match the previous keepdim=True shape (B, Hq, Lq, 1) so the
+        # broadcast in `dpt - delta` is unchanged.
+        delta = delta_t.unsqueeze(-1).float()
+    else:
+        delta = (dout_t * out_t).sum(dim=-1, keepdim=True)  # (B, Hq, Lq, 1)
     ds_post = p * (dpt - delta)  # gradient wrt post-softcap/post-alibi scores
 
     # Alibi is purely additive, so d/d(scores_pre_alibi) = d/d(scores_post).

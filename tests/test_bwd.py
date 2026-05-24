@@ -173,6 +173,47 @@ def test_backward_mqa():
     assert _max_abs(v.grad, vf.grad.to(v.dtype)) < 5e-2
 
 
+def test_bwd_preprocess_correctness():
+    """The Mojo `delta = rowsum(dO * O)` kernel must match a fp32
+    pytorch reference closely (both reductions run in fp32; the only
+    difference is the dO/O reads' bf16→fp32 cast happening lane-side
+    versus host-side, which is bit-identical)."""
+    from flash_attn_mojo.bwd import native_bwd_preprocess
+
+    B, L, H, D = 2, 128, 4, 64
+    g = torch.Generator(device="cuda").manual_seed(0)
+    dout = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda", generator=g)
+    out = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda", generator=g)
+
+    delta_mojo = torch.empty(B, H, L, dtype=torch.float32, device="cuda")
+    native_bwd_preprocess(dout, out, delta_mojo)
+
+    # Reference: dO * O summed over the head_dim, in fp32, then
+    # transposed (B, L, H) -> (B, H, L).
+    delta_ref = (dout.float() * out.float()).sum(dim=-1).transpose(1, 2).contiguous()
+
+    max_err = (delta_mojo - delta_ref).abs().max().item()
+    assert max_err < 1e-3, f"delta max-abs err {max_err} >= 1e-3"
+
+
+@pytest.mark.parametrize("D", [32, 64, 128])
+def test_bwd_preprocess_head_dims(D):
+    """Cover every supported head_dim (the kernel is templated over D)."""
+    from flash_attn_mojo.bwd import native_bwd_preprocess
+
+    B, L, H = 2, 64, 2
+    g = torch.Generator(device="cuda").manual_seed(0)
+    dout = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda", generator=g)
+    out = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda", generator=g)
+
+    delta_mojo = torch.empty(B, H, L, dtype=torch.float32, device="cuda")
+    native_bwd_preprocess(dout, out, delta_mojo)
+
+    delta_ref = (dout.float() * out.float()).sum(dim=-1).transpose(1, 2).contiguous()
+    max_err = (delta_mojo - delta_ref).abs().max().item()
+    assert max_err < 1e-3, f"D={D}: delta max-abs err {max_err} >= 1e-3"
+
+
 def test_backward_dropout_raises():
     B, L, H, D = 1, 32, 1, 64
     q, k, v = _make_qkv(B, L, H, D)
