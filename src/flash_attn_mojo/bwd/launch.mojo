@@ -39,6 +39,9 @@ def launch_bwd[
     dk_addr: Int,
     dv_addr: Int,
     dqa_addr: Int,
+    alibi_addr: Int,
+    alibi_b_stride: Int,
+    alibi_h_stride: Int,
     q_b_stride: Int,
     q_l_stride: Int,
     q_h_stride: Int,
@@ -123,6 +126,9 @@ def launch_bwd[
     var dqa_ptr = UnsafePointer[Float32, MutAnyOrigin](
         unsafe_from_address=dqa_addr
     )
+    var alibi_ptr = UnsafePointer[Float32, ImmutAnyOrigin](
+        unsafe_from_address=alibi_addr
+    )
 
     var num_n_blocks: Int = ceildiv(seqlen_int, Int(kBwdBlockN))
     var grid = (num_n_blocks, nheads_kv_int, batch_int)
@@ -145,6 +151,9 @@ def launch_bwd[
             dk_ptr,
             dv_ptr,
             dqa_ptr,
+            alibi_ptr,
+            alibi_b_stride,
+            alibi_h_stride,
             q_b_stride,
             q_l_stride,
             q_h_stride,
@@ -191,6 +200,9 @@ def launch_bwd[
             dk_ptr,
             dv_ptr,
             dqa_ptr,
+            alibi_ptr,
+            alibi_b_stride,
+            alibi_h_stride,
             q_b_stride,
             q_l_stride,
             q_h_stride,

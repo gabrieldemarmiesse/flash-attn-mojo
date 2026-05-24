@@ -97,6 +97,9 @@ def native_bwd_main(
     softmax_scale: float,
     causal: bool = False,
     softcap: float = 0.0,
+    alibi_addr: int = 0,
+    alibi_b_stride: int = 0,
+    alibi_h_stride: int = 0,
 ) -> None:
     """JIT-compile (if needed) and dispatch the main bwd kernel.
 
@@ -137,6 +140,9 @@ def native_bwd_main(
             dk.data_ptr(),
             dv.data_ptr(),
             dqaccum.data_ptr(),
+            int(alibi_addr),
+            int(alibi_b_stride),
+            int(alibi_h_stride),
             batch,
             seqlen,
             nheads_q,

@@ -227,6 +227,7 @@ def _bwd_dispatch_native_mvp(
     softmax_scale: float,
     causal: bool,
     softcap: float,
+    alibi_slopes: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Native MVP backward: bf16 / head_dim=64 / optional causal / no MQA.
 
@@ -267,6 +268,33 @@ def _bwd_dispatch_native_mvp(
     lse_c = lse.contiguous()
 
     B, L, H, D = q_k.shape
+    Hkv = k_k.shape[2]
+
+    # ALiBi: normalise slopes to fp32 contiguous and compute pointer +
+    # strides. None ⇒ pass null ptr + zero strides (kernel runtime-
+    # checks for ptr == 0). Slopes are indexed per Q-head (not KV-head).
+    alibi_buf: torch.Tensor | None = None
+    alibi_addr = 0
+    alibi_b_stride = 0
+    alibi_h_stride = 0
+    if alibi_slopes is not None:
+        slopes = alibi_slopes
+        if slopes.dtype != torch.float32:
+            slopes = slopes.to(torch.float32)
+        if not slopes.is_contiguous():
+            slopes = slopes.contiguous()
+        if slopes.dim() == 1:
+            alibi_b_stride = 0
+            alibi_h_stride = slopes.stride(0)
+        elif slopes.dim() == 2:
+            alibi_b_stride = slopes.stride(0)
+            alibi_h_stride = slopes.stride(1)
+        else:
+            raise ValueError(
+                f"alibi_slopes must be 1D or 2D, got {slopes.dim()}D."
+            )
+        alibi_buf = slopes
+        alibi_addr = slopes.data_ptr()
 
     delta = torch.empty(B, H, L, dtype=torch.float32, device=q_k.device)
     dqaccum = torch.empty(B, H, L, D, dtype=torch.float32, device=q_k.device)
@@ -278,7 +306,11 @@ def _bwd_dispatch_native_mvp(
         q_k, k_k, v_k, dout_k, lse_c, delta, dk, dv, dqaccum, softmax_scale,
         causal=causal,
         softcap=softcap,
+        alibi_addr=int(alibi_addr),
+        alibi_b_stride=int(alibi_b_stride),
+        alibi_h_stride=int(alibi_h_stride),
     )
+    del alibi_buf
 
     # dq: (B, L, H, D) in q_k's dtype. The convert_dq kernel reads
     # dqaccum (B, H, L, D) fp32 and writes dq (B, L, H, D) dtype with
@@ -342,7 +374,6 @@ def _bwd_dispatch(
         and q.dtype in (torch.bfloat16, torch.float16)
         and q.shape[-1] == 64
         and q.shape[2] % k.shape[2] == 0  # MQA/GQA: Hq divisible by Hkv
-        and alibi_slopes is None
         and window_size == _NO_WINDOW
         and dropout_p == 0.0
         and q.shape[1] == k.shape[1]  # equal seqlen
@@ -350,6 +381,7 @@ def _bwd_dispatch(
     if _in_mvp_envelope:
         return _bwd_dispatch_native_mvp(
             dout, q, k, v, out, lse, softmax_scale, causal, softcap,
+            alibi_slopes=alibi_slopes,
         )
 
     if dropout_p > 0.0:

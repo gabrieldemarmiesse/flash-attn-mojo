@@ -264,6 +264,37 @@ def test_bwd_convert_dq_correctness():
     )
 
 
+@pytest.mark.parametrize("slopes_shape", ["per_head", "per_batch_head"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_backward_alibi(slopes_shape, causal):
+    """Native bwd with ALiBi: compare against pytorch fallback (same
+    reference path used by `flash_attn_ref`)."""
+    B, L, H, D = 2, 128, 4, 64
+    q, k, v = _make_qkv(B, L, H, D)
+    g = torch.Generator(device="cuda").manual_seed(7)
+    if slopes_shape == "per_head":
+        slopes = torch.rand(H, dtype=torch.float32, device="cuda", generator=g) * 0.5
+    else:
+        slopes = torch.rand(B, H, dtype=torch.float32, device="cuda", generator=g) * 0.5
+
+    out = flash_attn_mojo.flash_attn_func(
+        q, k, v, causal=causal, alibi_slopes=slopes
+    )
+    dout = torch.randn_like(out)
+    out.backward(dout)
+
+    # Reference: pytorch flash_attn_ref in fp32.
+    from flash_attn_mojo.reference import flash_attn_ref
+    qf = q.detach().float().requires_grad_(True)
+    kf = k.detach().float().requires_grad_(True)
+    vf = v.detach().float().requires_grad_(True)
+    out_ref = flash_attn_ref(qf, kf, vf, causal=causal, alibi_slopes=slopes)
+    out_ref.backward(dout.float())
+    assert _max_abs(q.grad, qf.grad.to(q.dtype)) < 5e-2
+    assert _max_abs(k.grad, kf.grad.to(k.dtype)) < 5e-2
+    assert _max_abs(v.grad, vf.grad.to(v.dtype)) < 5e-2
+
+
 def test_backward_dropout_raises():
     B, L, H, D = 1, 32, 1, 64
     q, k, v = _make_qkv(B, L, H, D)

@@ -101,6 +101,9 @@ def bwd_kernel[
     dk_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     dv_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     dqaccum_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    alibi_ptr: UnsafePointer[Float32, ImmutAnyOrigin],
+    alibi_b_stride: Int,
+    alibi_h_stride: Int,
     q_b_stride: Int,
     q_l_stride: Int,
     q_h_stride: Int,
@@ -217,9 +220,20 @@ def bwd_kernel[
     # as before. K/V smem tiles are loaded once before this loop and
     # reused across every Q-head in the group; dK/dV registers
     # accumulate across the full group.
+    # ---- ALiBi slope load. `alibi_ptr` is null (addr 0) when caller
+    # passes no slopes — the fast path stays zero-overhead. Slope is
+    # per (batch, q-head); we load it inside the q-head loop below.
+    var has_alibi: Bool = Int(alibi_ptr) != 0
+
     for h_q_in_group in range(group_size):
         var q_head_idx: Int = kv_head_idx * group_size + h_q_in_group
         var q_base_off: Int = batch * q_b_stride + q_head_idx * q_h_stride
+        var alibi_slope: Float32 = Float32(0)
+        if has_alibi:
+            var alibi_off: Int = (
+                batch * alibi_b_stride + q_head_idx * alibi_h_stride
+            )
+            alibi_slope = (alibi_ptr + alibi_off)[0]
         var do_base_off: Int = batch * do_b_stride + q_head_idx * do_h_stride
         var lse_base_off: Int = (
             batch * lse_b_stride + q_head_idx * lse_h_stride
@@ -304,6 +318,21 @@ def bwd_kernel[
                     s_post = softcap_f * tanh(s_pre * softcap_inv)
                     var t: Float32 = s_post * softcap_inv
                     sfcfac_smem[m * BN + n] = Float32(1) - t * t
+                # ALiBi bias is additive and matches the fwd kernel
+                # convention exactly: causal=+slope*col, non-causal=
+                # -slope*|row-col|. Composition order: scores_raw →
+                # softcap → alibi → mask → exp(... - LSE). Pure additive
+                # so dS/dS_pre_alibi = 1; doesn't affect softcap
+                # derivative below.
+                if has_alibi:
+                    @parameter
+                    if causal:
+                        s_post = s_post + alibi_slope * Float32(g_col)
+                    else:
+                        var d_rc: Int = g_col - g_row
+                        if d_rc < 0:
+                            d_rc = -d_rc
+                        s_post = s_post - alibi_slope * Float32(d_rc)
                 var p: Float32
                 var masked: Bool = g_row >= seq_len or g_col >= seq_len
                 @parameter
