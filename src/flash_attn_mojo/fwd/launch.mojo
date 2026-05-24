@@ -20,7 +20,7 @@ from std.memory import OpaquePointer
 from std.sys import size_of
 
 from kernel import fwd_kernel
-from common import kNThreads, kBlockM, kBlockK, kWM
+from common import kNThreads, kBlockM, kBlockK, kBlockN_for, kWM
 
 
 def launch_fwd[
@@ -74,20 +74,30 @@ def launch_fwd[
         unsafe_from_address=stream_handle_addr
     )
 
-    # BN == head_dim (see common.mojo). Smem budget at head_dim=64: 32 KiB
-    # (fits 48 KiB default). At head_dim=128: 96 KiB — needs the opt-in via
-    # FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES (Ada/Ampere support up to
-    # ~100 KiB per block).
-    #   Q tile:     BM * head_dim * size_of[dtype]
-    #   K tile:     BN * head_dim * size_of[dtype]
-    #   V tile:     BN * BN       * size_of[dtype]   (BN == head_dim)
-    #   P tile:     BM * BN       * size_of[dtype]   (reserved for multistage_mma)
-    #   scratch:    2 * num_warps_n * BM * size_of[accum=fp32]    (zero when num_warps_n == 1)
-    # plus the output write-back reuses q_smem in place — same buffer, no extra.
-    comptime BN: Int = head_dim
+    # BN is decoupled from head_dim — see common.mojo::kBlockN_for. At
+    # head_dim ∈ {32, 64, 128} BN == head_dim (bit-identical to the
+    # previous BN==depth path). At head_dim ∈ {192, 256} BN = 64, so
+    # the K smem tile (BN × depth) and P smem tile (BM × BN) both stay
+    # small enough to fit Ada's 99 KiB dynamic-smem cap.
+    #
+    # Smem budget (bf16):
+    #   Q tile:     BM * head_dim * 2
+    #   K tile:     BN * head_dim * 2
+    #   V tile:     BN * head_dim * 2     (was BN*BN before decoupling — same
+    #                                      value when BN==head_dim)
+    #   P tile:     BM * BN       * 2     (reserved for multistage_mma's a_smem_iter)
+    #   scratch:    0                     (num_warps_n == 1)
+    # The output write-back reuses q_smem in place — same buffer, no extra.
+    #
+    # Examples:
+    #   head_dim=64,  BN=64  : 8 + 8 + 8 + 8     = 32 KiB
+    #   head_dim=128, BN=128 : 16 + 16 + 16 + 16 = 64 KiB
+    #   head_dim=192, BN=64  : 24 + 24 + 12 + 8  = 68 KiB
+    #   head_dim=256, BN=64  : 32 + 32 + 16 + 8  = 88 KiB  (fits Ada's 99 KiB cap)
+    comptime BN: Int = kBlockN_for[head_dim]()
     comptime q_bytes: Int = kBlockM * head_dim * size_of[dtype]()
     comptime k_bytes: Int = BN * head_dim * size_of[dtype]()
-    comptime v_bytes: Int = BN * BN * size_of[dtype]()
+    comptime v_bytes: Int = BN * head_dim * size_of[dtype]()  # = BN_keys × depth × bf16
     # `p_smem` is reserved unconditionally so `multistage_mma`'s
     # a_smem_iter parameter (which must be in SHARED address space)
     # type-checks even when num_warps_n == 1 and P stays in registers.

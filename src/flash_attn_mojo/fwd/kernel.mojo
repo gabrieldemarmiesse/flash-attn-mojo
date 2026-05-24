@@ -86,7 +86,7 @@ from layout.tensor_core import get_fragment_size, get_mma_shape
 from linalg.matmul.gpu._multistage_gemm_gpu import multistage_mma
 from nn.softmax import _online_softmax_iter_for_mma_output
 
-from common import kNThreads, kBlockM, kBlockK, kWM
+from common import kNThreads, kBlockM, kBlockK, kBlockN_for, kWM
 
 
 @__llvm_metadata(
@@ -138,24 +138,40 @@ def fwd_kernel[
     comptime k_group_size: Int = 1
 
     comptime BM: Int = kBlockM
-    # BN == WN == depth keeps the kernel structurally identical across
-    # head_dims: p_reg_tile (BM, BN) and output_reg_tile (BM, depth) share
-    # one shape, and `num_n_mmas = WN // MMA_N` covers both MMAs' N axes.
-    comptime BN: Int = head_dim
+    # BN is the keys-axis tile width. At head_dim ∈ {32, 64, 128} BN == depth
+    # (bit-identical to the previous BN==depth code path). At head_dim ∈
+    # {192, 256} BN = 64 so the K smem tile stays small enough to fit Ada's
+    # 99 KiB dynamic-smem cap. Per-MMA WN follows the N axis of that MMA:
+    #   Q · Kᵀ : N-axis = keys, so WN_keys  = BN.
+    #   P · V  : N-axis = depth, so WN_depth = depth.
+    # Both MMAs keep num_warps_n == 1 along their respective N axis, so P and
+    # the output tile both stay in registers.
+    comptime BN: Int = kBlockN_for[head_dim]()
     comptime BK: Int = kBlockK
     comptime WM: Int = kWM
-    comptime WN: Int = head_dim
+    comptime WN_keys: Int = BN
+    comptime WN_depth: Int = head_dim
     comptime num_threads: Int = kNThreads
     comptime num_warps_m: Int = BM // WM
-    comptime num_warps_n: Int = BN // WN
+    comptime num_warps_n_keys: Int = BN // WN_keys
+    comptime num_warps_n_depth: Int = head_dim // WN_depth
     comptime depth: Int = head_dim
 
-    comptime assert num_warps_m * num_warps_n == num_threads // WARP_SIZE, (
+    comptime assert num_warps_m * num_warps_n_keys == num_threads // WARP_SIZE, (
         "warp tile / num_threads mismatch"
     )
-    comptime assert num_warps_n == 1, (
-        "this port specialises on num_warps_n == 1 so we keep P in registers"
+    comptime assert num_warps_n_keys == 1 and num_warps_n_depth == 1, (
+        "this port specialises on num_warps_n == 1 along both MMAs' N axes"
+        " so P and the output tile stay in registers"
     )
+    comptime assert depth % BN == 0, (
+        "depth must be a multiple of BN so num_n_mmas_depth is a multiple"
+        " of num_n_mmas_keys (online-softmax helper output-replication path)"
+    )
+    # Legacy alias used by some warp-coord computations below. With
+    # num_warps_n_{keys,depth} == 1 there is one warp along both N axes
+    # so a single `num_warps_n` symbol is unambiguous.
+    comptime num_warps_n: Int = 1
 
     var tid: UInt32 = UInt32(thread_idx.x)
     var warp_id_v: UInt32 = warp.broadcast(tid // UInt32(WARP_SIZE))
@@ -178,7 +194,7 @@ def fwd_kernel[
     comptime alignment = align_of[SIMD[dtype, simd_size]]()
     comptime q_smem_size: Int = BM * depth
     comptime k_smem_size: Int = BN * depth
-    comptime v_smem_size: Int = BN * BN  # BN * depth when depth == BN
+    comptime v_smem_size: Int = BN * depth  # (BN_keys × depth) — the full V tile
 
     var q_smem = external_memory[
         Scalar[dtype],
@@ -222,7 +238,7 @@ def fwd_kernel[
     var v_smem = (k_smem + k_smem_size).bitcast[Scalar[dtype]]()
     comptime IteratorTypeV = LayoutTensorIter[
         dtype,
-        Layout.row_major(BK, BN),
+        Layout.row_major(BK, depth),
         _,
         address_space=AddressSpace.SHARED,
         circular=True,
@@ -237,7 +253,12 @@ def fwd_kernel[
     comptime MMA_N: Int = mma_shape[1]
     comptime MMA_K: Int = mma_shape[2]
     comptime num_m_mmas: Int = WM // MMA_M
-    comptime num_n_mmas: Int = WN // MMA_N
+    comptime num_n_mmas_keys: Int = WN_keys // MMA_N
+    comptime num_n_mmas_depth: Int = WN_depth // MMA_N
+    # Legacy alias: where the inner loops only ever touch the keys axis
+    # (score masking, softmax, dropout, P-as-A in the second MMA) we use
+    # the keys count. The writeback / output_reg_tile use _depth.
+    comptime num_n_mmas: Int = num_n_mmas_keys
 
     comptime frag_size = get_fragment_size[mma_shape]()
     comptime p_frag_size: Int = frag_size[2]
@@ -246,7 +267,7 @@ def fwd_kernel[
 
     var p_reg_tile = LayoutTensor[
         accum_type,
-        Layout.row_major(num_m_mmas * num_n_mmas, p_frag_size),
+        Layout.row_major(num_m_mmas * num_n_mmas_keys, p_frag_size),
         MutAnyOrigin,
         address_space=AddressSpace.LOCAL,
     ].stack_allocation[stack_alignment=p_frag_align]()
@@ -254,7 +275,7 @@ def fwd_kernel[
     var output_reg_tile = (
         LayoutTensor[
             accum_type,
-            Layout.row_major(num_m_mmas * num_n_mmas, p_frag_size),
+            Layout.row_major(num_m_mmas * num_n_mmas_depth, p_frag_size),
             MutAnyOrigin,
             address_space=AddressSpace.LOCAL,
         ]
@@ -304,10 +325,10 @@ def fwd_kernel[
 
     var warp_scratch = LayoutTensor[
         accum_type,
-        Layout.row_major(2 * num_warps_n, BM),
+        Layout.row_major(2 * num_warps_n_keys, BM),
         address_space=AddressSpace.SHARED,
     ](
-        (p_smem + (BM * BN if num_warps_n > 1 else 0)).bitcast[
+        (p_smem + (BM * BN if num_warps_n_keys > 1 else 0)).bitcast[
             Scalar[accum_type]
         ]()
     )
@@ -541,7 +562,7 @@ def fwd_kernel[
             BN,
             BK,
             WM,
-            WN,
+            WN_keys,
             num_threads,
             num_pipeline_stages,
             True,  # transpose_b for Q · Kᵀ
@@ -590,7 +611,7 @@ def fwd_kernel[
             comptime for n_mma in range(num_n_mmas):
                 comptime mma_id = n_mma * num_m_mmas + m_mma
                 var mma_col_base: UInt32 = (
-                    UInt32(warp_x) * UInt32(WN) + UInt32(n_mma * MMA_N)
+                    UInt32(warp_x) * UInt32(WN_keys) + UInt32(n_mma * MMA_N)
                 )
                 var col_off: UInt32 = (
                     lane * UInt32(p_frag_simdwidth) % UInt32(MMA_N)
@@ -719,19 +740,27 @@ def fwd_kernel[
                             ):
                                 p_reg_vec2[mma_id, i][j] = ne_inf_w[j]
 
-        comptime reg_layout_by_mma_unit = Layout.row_major(
-            2 * num_m_mmas * num_n_mmas, 2
+        # The helper handles `num_output_replications = num_n_mmas_depth /
+        # num_n_mmas_keys` by treating the output tile's first axis as
+        # (replications, num_rowwise_tiles, num_colwise_tiles). The
+        # softmax correction (exp2(rowmax_prev - rowmax_new)) applies row-
+        # wise, so replicating across the depth-N axis is bit-correct.
+        comptime score_reg_layout_by_mma_unit = Layout.row_major(
+            2 * num_m_mmas * num_n_mmas_keys, 2
+        )
+        comptime output_reg_layout_by_mma_unit = Layout.row_major(
+            2 * num_m_mmas * num_n_mmas_depth, 2
         )
         _online_softmax_iter_for_mma_output[
             accum_type,
-            Layout.row_major(2 * num_m_mmas, num_n_mmas),
-            Layout.row_major(num_warps_m, num_warps_n),
+            Layout.row_major(2 * num_m_mmas, num_n_mmas_keys),
+            Layout.row_major(num_warps_m, num_warps_n_keys),
             Layout.row_major(8, 4),
             use_exp2=True,
         ](
-            output_reg_tile.reshape[reg_layout_by_mma_unit]().vectorize[1, 2](),
-            p_reg_tile.reshape[reg_layout_by_mma_unit]().vectorize[1, 2](),
-            warp_scratch.tile[2 * num_warps_n, WM](0, Int(warp_y)),
+            output_reg_tile.reshape[output_reg_layout_by_mma_unit]().vectorize[1, 2](),
+            p_reg_tile.reshape[score_reg_layout_by_mma_unit]().vectorize[1, 2](),
+            warp_scratch.tile[2 * num_warps_n_keys, WM](0, Int(warp_y)),
             rowmax,
             rowsum,
         )
@@ -763,7 +792,7 @@ def fwd_kernel[
                 comptime for n_mma in range(num_n_mmas):
                     comptime mma_id_d = n_mma * num_m_mmas + m_mma
                     var mma_col_base_d: UInt32 = (
-                        UInt32(warp_x) * UInt32(WN)
+                        UInt32(warp_x) * UInt32(WN_keys)
                         + UInt32(n_mma * MMA_N)
                     )
                     var col_off_d: UInt32 = (
@@ -846,12 +875,14 @@ def fwd_kernel[
         async_copy_wait_all()
         barrier()
 
+        # P · V — N-axis is depth (output cols), K-axis reduces over keys
+        # (= BN). num_iters is the number of BK-chunks along the K axis.
         multistage_mma[
             BM,
-            BN,
+            depth,  # BN of the second MMA = depth
             BK,
             WM,
-            WN,
+            WN_depth,
             num_threads,
             num_pipeline_stages,
             False,  # transpose_b for P · V
@@ -962,7 +993,7 @@ def fwd_kernel[
         var rowsum_inv0 = recip(rowsum[2 * m_mma])
         var rowsum_inv1 = recip(rowsum[2 * m_mma + 1])
 
-        comptime for n_mma in range(num_n_mmas):
+        comptime for n_mma in range(num_n_mmas_depth):
             comptime for i in range(p_frag_size // 2):
                 output_reg_tile[n_mma * num_m_mmas + m_mma, i] *= rowsum_inv0
                 output_reg_tile[
@@ -1009,9 +1040,9 @@ def fwd_kernel[
     var lane_group: UInt32 = lane // 4
     var lane_tid_in_grp: UInt32 = lane % 4
     var warp_row_base: Int = Int(warp_y) * WM
-    var warp_col_base: Int = Int(warp_x) * WN
+    var warp_col_base: Int = Int(warp_x) * WN_depth
 
-    comptime for n_mma in range(num_n_mmas):
+    comptime for n_mma in range(num_n_mmas_depth):
         var col_off: Int = (
             warp_col_base
             + n_mma * MMA_N

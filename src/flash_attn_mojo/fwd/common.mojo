@@ -2,17 +2,19 @@
 
 Tile sizes are picked to match modular's `mha_single_batch` config
 for non-MQA bf16 on Ampere/Ada (num_warps_m=4, num_warps_n=1).
-At head_dim=64:
-    BM = 64   queries per block
-    BN = 64   keys per inner KV tile (= depth)
-    BK = 32   reduction (head_dim) tile per multistage_mma step
-    WM = 16   queries per warp (= MMA_M)
-    WN = 64   keys per warp     (= BN, since num_warps_n == 1)
-At head_dim=128: BN/WN bumped to 128 (BN == depth, so the second MMA
-P·V's output (BM, depth) fits cleanly into one warp tile (WM, WN==BN)
-without splitting the depth axis across warps). Smem grows to ~96 KiB,
-which requires the Ada/Ampere dynamic-smem opt-in
-(MAX_DYNAMIC_SHARED_SIZE_BYTES) — handled by `launch_fwd`.
+
+Per-head-dim BN (keys-axis tile width):
+    head_dim ∈ {32, 64, 128} → BN = head_dim (bit-identical to the
+        previous BN==depth code path).
+    head_dim ∈ {192, 256}    → BN = 64. Decoupling BN from depth here
+        keeps the K-smem tile (BN × depth) small enough to fit Ada's
+        99 KiB dynamic-smem cap (Q smem 64×depth*2 + K smem 64×depth*2 +
+        V smem BN×depth*2 + P smem BM×BN*2). At depth=256 the total is
+        ~76 KiB.
+
+WN follows the per-MMA N-axis:
+    Q · Kᵀ:  WN = BN     (num_warps_n_keys  == 1, P stays in registers)
+    P · V:   WN = depth  (num_warps_n_depth == 1, output stays in regs)
 """
 
 
@@ -24,6 +26,11 @@ comptime kBlockK: Int = 32
 comptime kWM: Int = 16
 
 
-# Per-head-dim BN/WN: BN == WN == depth so the second MMA's output tile
-# (BM, depth) fits one warp's WN cols (num_warps_n == 1). Defined in
-# kernel.mojo and launch.mojo as `BN = head_dim`.
+@always_inline
+fn kBlockN_for[head_dim: Int]() -> Int:
+    """Pick the keys-axis tile width for a given head_dim."""
+    @parameter
+    if head_dim <= 128:
+        return head_dim
+    else:
+        return 64
