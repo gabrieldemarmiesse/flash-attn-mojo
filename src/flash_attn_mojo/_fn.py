@@ -326,18 +326,14 @@ def _bwd_dispatch(
     so the saved LSE matches the recomputed pre-softmax scores.
     """
     # ---- MVP native bwd routing.
-    # Gated behind FLASH_ATTN_MOJO_NATIVE_BWD=1 until correctness is
-    # verified across the test suite. Inside the MVP envelope (bf16,
-    # head_dim=64, non-causal, no MQA, no softcap/alibi/window/dropout,
-    # equal seqlen, cuda) we call the native bwd kernel for dk/dv and
-    # dqaccum and convert dq from fp32 via a torch one-liner. Outside
-    # the envelope (or when the flag is off) we fall through to the
-    # pytorch reference.
-    import os as _os
-    _native_bwd_enabled = _os.environ.get("FLASH_ATTN_MOJO_NATIVE_BWD", "0") == "1"
+    # Inside the MVP envelope (bf16/fp16 cuda, head_dim=64, non-causal,
+    # no MQA, no softcap/alibi/window/dropout, equal seqlen) we call
+    # the native bwd kernel for dk/dv/dqaccum and the convert_dq kernel
+    # for fp32 -> dtype. Outside the envelope we fall through to the
+    # pytorch reference. The MVP envelope expands as feature commits
+    # land (causal, MQA, softcap, etc.).
     _in_mvp_envelope = (
-        _native_bwd_enabled
-        and dout.is_cuda
+        dout.is_cuda
         and q.dtype in (torch.bfloat16, torch.float16)
         and q.shape[-1] == 64
         and not causal
