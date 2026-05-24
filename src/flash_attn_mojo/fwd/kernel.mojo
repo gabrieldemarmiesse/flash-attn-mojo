@@ -41,7 +41,7 @@ same size). Total: ~24 KiB.
 """
 
 from std.collections import OptionalReg
-from std.math import recip, exp, tanh
+from std.math import log2, recip, exp, tanh
 from std.math.constants import log2e
 from std.sys import align_of, simd_width_of, size_of
 from std.algorithm.functional import tile_and_unswitch, unswitch
@@ -119,6 +119,9 @@ def fwd_kernel[
     o_h_stride: Int,
     nheads_kv: Int,
     softcap: Float32,
+    lse_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    lse_b_stride: Int,
+    lse_h_stride: Int,
 ):
     comptime accum_type = get_accum_type[dtype]()
     comptime simd_size: Int = simd_width_of[dtype]()
@@ -665,6 +668,45 @@ def fwd_kernel[
     if causal:
         kv_end = min(seq_len, (Int(q_tile_idx) + 1) * Int(BM))
     tile_and_unswitch[loop_over_kv, [BN]](0, kv_end)
+
+    # ---- Write LSE (log-sum-exp, natural log) before rowsum is consumed.
+    # With our exp2-based online softmax: rowsum is sum_j exp2(scaled_j - rowmax),
+    # and rowmax is in the log2 domain (= softmax_scale * log2e * max_score).
+    # The natural-log LSE is:
+    #   lse = log(sum_j exp(scale * s_j)) = (rowmax + log2(rowsum)) / log2e
+    # If rowsum == 0 (fully masked row) write -inf so downstream code sees
+    # a clean "no valid keys" sentinel.
+    # Only lane%4 == 0 owns the row (4 lanes share the same row index).
+    var lse_lane_group: UInt32 = lane // 4
+    var lse_lane_tid_in_grp: UInt32 = lane % 4
+    if lse_lane_tid_in_grp == 0:
+        var lse_batch_head_off: Int = (
+            Int(batch) * lse_b_stride + Int(head_idx) * lse_h_stride
+        )
+        var inv_log2e_f32: Float32 = Float32(1) / Float32(log2e)
+        comptime for m_mma in range(num_m_mmas):
+            comptime for i in range(2):
+                var rm = rowmax[2 * m_mma + i]
+                var rs = rowsum[2 * m_mma + i]
+                var lse_val: Float32
+                if rs == Scalar[accum_type](0):
+                    lse_val = min_or_neg_inf[DType.float32]()
+                else:
+                    var rm_f32 = rm.cast[DType.float32]()
+                    var rs_f32 = rs.cast[DType.float32]()
+                    lse_val = (rm_f32 + log2(rs_f32)) * inv_log2e_f32
+                var row_in_warp: Int = (
+                    Int(m_mma) * Int(MMA_M)
+                    + Int(lse_lane_group)
+                    + (8 if i == 1 else 0)
+                )
+                var q_row: Int = (
+                    Int(q_tile_idx) * Int(BM)
+                    + Int(warp_y) * Int(WM)
+                    + row_in_warp
+                )
+                if q_row < actual_seq_len:
+                    (lse_ptr + lse_batch_head_off + q_row)[0] = lse_val
 
     # ---- Normalise by 1/rowsum.
     # Defensive: a fully-masked row (no in-bounds, in-diagonal keys) has

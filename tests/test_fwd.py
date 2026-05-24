@@ -161,6 +161,53 @@ def test_softcap_zero_unchanged():
     assert torch.equal(out_default, out_zero)
 
 
+@pytest.mark.parametrize("causal", [False, True])
+def test_return_attn_probs(causal):
+    """`return_attn_probs=True` must yield an LSE that matches both
+    upstream flash-attn's `softmax_lse` and a pure-fp32 reference."""
+    B, L, H, D = 2, 128, 2, 64
+    torch.manual_seed(0)
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+
+    out_mojo, lse_mojo, rng = flash_attn_mojo.flash_attn_func(
+        q, k, v, causal=causal, return_attn_probs=True
+    )
+    assert rng is None
+    assert lse_mojo.shape == (B, H, L)
+    assert lse_mojo.dtype == torch.float32
+    assert torch.isfinite(lse_mojo).all(), "LSE has non-finite entries"
+
+    # Pure-fp32 reference: lse[b, h, q] = log(sum_j exp(scale * s_ij))
+    # over valid (non-masked) keys.
+    scale = D ** -0.5
+    q_f = q.transpose(1, 2).float()  # (B, H, L, D)
+    k_f = k.transpose(1, 2).float()
+    scores = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale  # (B, H, L, L)
+    if causal:
+        mask = torch.triu(
+            torch.ones(L, L, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        scores = scores.masked_fill(mask, float("-inf"))
+    lse_ref = torch.logsumexp(scores, dim=-1)  # (B, H, L)
+
+    diff_ref = (lse_mojo - lse_ref).abs().max().item()
+    assert diff_ref < 1e-2, (
+        f"causal={causal} mojo LSE vs fp32 ref: max|diff|={diff_ref:.3e}"
+    )
+
+    try:
+        from flash_attn import flash_attn_func as upstream_fwd
+    except ImportError:
+        return
+    out_up, lse_up, _ = upstream_fwd(q, k, v, causal=causal, return_attn_probs=True)
+    diff_up = (lse_mojo - lse_up).abs().max().item()
+    assert diff_up < 1e-2, (
+        f"causal={causal} mojo LSE vs upstream: max|diff|={diff_up:.3e}"
+    )
+
+
 @pytest.mark.parametrize("L", [16, 32, 64, 128, 512])
 def test_noncausal_regression(L):
     """Non-causal path must still match SDPA (regression for the

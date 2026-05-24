@@ -37,15 +37,15 @@ def call_fwd(args: tuple) -> None:
 
 def _config_from_args(args: tuple) -> tuple:
     # See `fwd/__init__.py::native_fwd` for the runtime tuple layout.
-    # Indices 21..22 are runtime args (nheads_kv, softcap). Indices
-    # 23..26 are the compile-time gating fields (dtype, head_dim,
-    # causal, use_external_stream). softcap is runtime-only (no
-    # template specialisation), so it's deliberately excluded from
-    # the cache key.
-    dtype_code = args[23]
-    head_dim = args[24]
-    causal = bool(args[25])
-    use_external_stream = bool(args[26])
+    # Indices 21..25 are runtime args (nheads_kv, softcap, lse_addr,
+    # lse_b_stride, lse_h_stride). Indices 26..29 are the compile-time
+    # gating fields (dtype, head_dim, causal, use_external_stream).
+    # softcap and lse_* are runtime-only (no template specialisation),
+    # so they're deliberately excluded from the cache key.
+    dtype_code = args[26]
+    head_dim = args[27]
+    causal = bool(args[28])
+    use_external_stream = bool(args[29])
     return (dtype_code, head_dim, causal, use_external_stream)
 
 

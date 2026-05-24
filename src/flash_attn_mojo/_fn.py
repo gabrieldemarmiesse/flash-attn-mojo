@@ -88,14 +88,13 @@ def _fwd_dispatch(
         softmax_scale = q.shape[-1] ** -0.5
 
     out = torch.empty_like(q)
-    # Empty lse for now — backward isn't wired up, this is just a
-    # placeholder so the autograd Function's `save_for_backward`
-    # signature stays stable.
+    # lse: (batch, nheads, seqlen) fp32. Contiguous so the kernel can
+    # use simple per-row indexing.
     lse = torch.empty(
         q.shape[0], q.shape[2], q.shape[1], dtype=torch.float32, device=q.device
     )
 
-    native_fwd(q, k, v, out, softmax_scale, causal, nheads_kv, softcap)
+    native_fwd(q, k, v, out, softmax_scale, causal, nheads_kv, softcap, lse)
     return out, lse
 
 
@@ -143,7 +142,7 @@ class _FlashAttnFn(torch.autograd.Function):
         alibi_slopes: torch.Tensor | None,
         deterministic: bool,
         return_attn_probs: bool,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** -0.5
         out, lse = _fwd_dispatch(
@@ -195,7 +194,7 @@ def flash_attn_func(
     alibi_slopes: torch.Tensor | None = None,
     deterministic: bool = False,
     return_attn_probs: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Multi-head scaled-dot-product attention with Flash Attention's
     block-tiled algorithm.
 

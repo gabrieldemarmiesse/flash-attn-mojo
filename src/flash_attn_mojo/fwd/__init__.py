@@ -16,6 +16,7 @@ def native_fwd(
     causal: bool = False,
     nheads_kv: int | None = None,
     softcap: float = 0.0,
+    lse: torch.Tensor | None = None,
 ) -> None:
     """JIT-compile (if needed) and dispatch a single GPU forward call.
 
@@ -30,6 +31,18 @@ def native_fwd(
     batch, seqlen, nheads, head_dim = q.shape
     if nheads_kv is None:
         nheads_kv = k.shape[2]
+
+    if lse is None:
+        lse_addr = 0
+        lse_b_stride = 0
+        lse_h_stride = 0
+    else:
+        # lse shape: (batch, nheads, seqlen), strides in fp32 elements.
+        assert lse.dtype == torch.float32
+        assert lse.is_contiguous()
+        lse_addr = lse.data_ptr()
+        lse_b_stride = lse.stride(0)
+        lse_h_stride = lse.stride(1)
 
     call_fwd(
         (
@@ -56,6 +69,9 @@ def native_fwd(
             torch.cuda.current_stream().cuda_stream,
             int(nheads_kv),
             float(softcap),
+            int(lse_addr),
+            int(lse_b_stride),
+            int(lse_h_stride),
             _DTYPE_CODE[q.dtype],
             head_dim,
             1 if causal else 0,
