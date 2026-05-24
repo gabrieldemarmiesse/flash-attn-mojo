@@ -1,9 +1,11 @@
 """Launch helper for the main bwd kernel.
 
 Computes the dynamic-smem budget and enqueues `bwd_kernel`. Grid is
-(num_n_blocks, nheads, batch). The MVP launches the kernel directly on
-the user's tensors (no seqlen padding) since the kernel internally
-boundary-masks both K-row and Q-row OOB accesses to zeros.
+(num_n_blocks, nheads_kv, batch) — one block per (KV-block, KV-head,
+batch). The kernel loops over the `group_size = nheads_q // nheads_kv`
+Q-heads sharing each KV-head internally. The MVP launches the kernel
+directly on the user's tensors (no seqlen padding) since the kernel
+internally boundary-masks both K-row and Q-row OOB accesses to zeros.
 """
 
 from std.gpu.host import DeviceContext, FuncAttribute
@@ -24,7 +26,8 @@ def launch_bwd[
 ](
     batch_int: Int,
     seqlen_int: Int,
-    nheads_int: Int,
+    nheads_q_int: Int,
+    nheads_kv_int: Int,
     softmax_scale: Float32,
     q_addr: Int,
     k_addr: Int,
@@ -120,14 +123,15 @@ def launch_bwd[
     )
 
     var num_n_blocks: Int = ceildiv(seqlen_int, Int(kBwdBlockN))
-    var grid = (num_n_blocks, nheads_int, batch_int)
+    var grid = (num_n_blocks, nheads_kv_int, batch_int)
 
     comptime if use_external_stream:
         var stream = ctx.create_external_stream(stream_opaque)
         stream.enqueue_function(
             compiled,
             seqlen_int,
-            nheads_int,
+            nheads_q_int,
+            nheads_kv_int,
             softmax_scale,
             q_ptr,
             k_ptr,
@@ -171,7 +175,8 @@ def launch_bwd[
         ctx.enqueue_function(
             compiled,
             seqlen_int,
-            nheads_int,
+            nheads_q_int,
+            nheads_kv_int,
             softmax_scale,
             q_ptr,
             k_ptr,

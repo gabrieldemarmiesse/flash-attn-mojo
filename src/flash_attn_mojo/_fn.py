@@ -338,7 +338,7 @@ def _bwd_dispatch(
         dout.is_cuda
         and q.dtype in (torch.bfloat16, torch.float16)
         and q.shape[-1] == 64
-        and q.shape[2] == k.shape[2]  # no MQA
+        and q.shape[2] % k.shape[2] == 0  # MQA/GQA: Hq divisible by Hkv
         and softcap == 0.0
         and alibi_slopes is None
         and window_size == _NO_WINDOW

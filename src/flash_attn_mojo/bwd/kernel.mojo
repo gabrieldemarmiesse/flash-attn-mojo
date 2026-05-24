@@ -7,9 +7,16 @@ MVP envelope (locked at variant compile time):
   - dtype = bf16  (fp16 routed via API-boundary cast — same pattern as fwd)
   - head_dim = 64
   - non-causal
-  - no MQA/GQA (nheads_q == nheads_kv)
   - no softcap, alibi, window, dropout
   - single seqlen (Q and K share length)
+
+MQA/GQA: supported via the Tri Dao block layout. Grid Y dim is
+`nheads_kv`; inside each block we loop over the `group_size =
+nheads_q // nheads_kv` Q-heads sharing this KV-head. K/V smem tiles
+are loaded once and reused across the inner group loop. dK_acc /
+dV_acc registers accumulate contributions from every Q-head in the
+group. dQ contributions go to per-Q-head dQaccum slots — no atomic
+conflicts between Q-heads.
 
 The bwd is far harder to make bit-correct than the fwd, so this MVP
 trades performance for correctness: smem holds *every* per-block tile
@@ -78,7 +85,8 @@ def bwd_kernel[
     causal: Bool,
 ](
     seq_len: Int,
-    nheads: Int,
+    nheads_q: Int,
+    nheads_kv: Int,
     softmax_scale: Float32,
     q_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     k_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -122,8 +130,11 @@ def bwd_kernel[
 
     var tid: Int = Int(thread_idx.x)
     var n_block: Int = Int(block_idx.x)
-    var head_idx: Int = Int(block_idx.y)
+    var kv_head_idx: Int = Int(block_idx.y)
     var batch: Int = Int(block_idx.z)
+    # Number of Q-heads sharing this KV-head. Caller guarantees
+    # nheads_q % nheads_kv == 0.
+    var group_size: Int = nheads_q // nheads_kv
 
     var kv_row_base: Int = n_block * BN
     # Out-of-range KV block guard. Launcher rounds up the grid so seqlen
@@ -157,9 +168,11 @@ def bwd_kernel[
         dv_acc[i] = Float32(0)
 
     # ---- Load K, V (cooperative, contiguous-in-D).
-    # K_gmem stride: batch, head, l, d.
-    var k_base_off: Int = batch * k_b_stride + head_idx * k_h_stride
-    var v_base_off: Int = batch * v_b_stride + head_idx * v_h_stride
+    # K_gmem stride: batch, head, l, d. K/V are indexed by the
+    # KV-head, NOT the Q-head — multiple Q-heads share one KV-head
+    # under MQA/GQA.
+    var k_base_off: Int = batch * k_b_stride + kv_head_idx * k_h_stride
+    var v_base_off: Int = batch * v_b_stride + kv_head_idx * v_h_stride
     # Each thread loads (BN*D)/nthreads bf16 elements.
     comptime KV_PER_THREAD: Int = (BN * D) // nthreads  # 32
     for i in range(KV_PER_THREAD):
@@ -186,178 +199,190 @@ def bwd_kernel[
     @parameter
     if causal:
         qb_start = (n_block * BN) // BM
-    var q_base_off: Int = batch * q_b_stride + head_idx * q_h_stride
-    var do_base_off: Int = batch * do_b_stride + head_idx * do_h_stride
-    var lse_base_off: Int = batch * lse_b_stride + head_idx * lse_h_stride
-    var delta_base_off: Int = (
-        batch * delta_b_stride + head_idx * delta_h_stride
-    )
-    var dqa_base_off: Int = batch * dqa_b_stride + head_idx * dqa_h_stride
 
     var scale_f: Float32 = softmax_scale
 
-    for qb in range(qb_start, num_q_blocks):
-        var q_row_base: Int = qb * BM
+    # ---- Outer Q-head-in-group loop (MQA/GQA). For non-MQA configs
+    # group_size == 1 so this collapses to a single pass — same flops
+    # as before. K/V smem tiles are loaded once before this loop and
+    # reused across every Q-head in the group; dK/dV registers
+    # accumulate across the full group.
+    for h_q_in_group in range(group_size):
+        var q_head_idx: Int = kv_head_idx * group_size + h_q_in_group
+        var q_base_off: Int = batch * q_b_stride + q_head_idx * q_h_stride
+        var do_base_off: Int = batch * do_b_stride + q_head_idx * do_h_stride
+        var lse_base_off: Int = (
+            batch * lse_b_stride + q_head_idx * lse_h_stride
+        )
+        var delta_base_off: Int = (
+            batch * delta_b_stride + q_head_idx * delta_h_stride
+        )
+        var dqa_base_off: Int = (
+            batch * dqa_b_stride + q_head_idx * dqa_h_stride
+        )
 
-        # ---- Load Q, dO into smem.
-        for i in range(KV_PER_THREAD):
-            var flat: Int = i * nthreads + tid
-            var row: Int = flat // D
-            var col: Int = flat - row * D
-            var g_row: Int = q_row_base + row
-            var dst: Int = row * D + col
-            if g_row < seq_len:
-                q_smem[dst] = (
-                    q_ptr + q_base_off + g_row * q_l_stride + col
-                )[0]
-                do_smem[dst] = (
-                    do_ptr + do_base_off + g_row * do_l_stride + col
-                )[0]
-            else:
-                q_smem[dst] = Scalar[dtype](0)
-                do_smem[dst] = Scalar[dtype](0)
+        for qb in range(qb_start, num_q_blocks):
+            var q_row_base: Int = qb * BM
 
-        # ---- Load LSE, delta (BM elements each, 128 threads → 2 per thread
-        #      at BM=64 first thread of each pair does it).
-        if tid < BM:
-            var g_row: Int = q_row_base + tid
-            if g_row < seq_len:
-                lse_smem[tid] = (lse_ptr + lse_base_off + g_row)[0]
-                delta_smem[tid] = (delta_ptr + delta_base_off + g_row)[0]
-            else:
-                # Padded rows: LSE = -inf, delta = 0 → P=0, contributes nothing.
-                lse_smem[tid] = Float32(-1.0e30)
-                delta_smem[tid] = Float32(0)
+            # ---- Load Q, dO into smem.
+            for i in range(KV_PER_THREAD):
+                var flat: Int = i * nthreads + tid
+                var row: Int = flat // D
+                var col: Int = flat - row * D
+                var g_row: Int = q_row_base + row
+                var dst: Int = row * D + col
+                if g_row < seq_len:
+                    q_smem[dst] = (
+                        q_ptr + q_base_off + g_row * q_l_stride + col
+                    )[0]
+                    do_smem[dst] = (
+                        do_ptr + do_base_off + g_row * do_l_stride + col
+                    )[0]
+                else:
+                    q_smem[dst] = Scalar[dtype](0)
+                    do_smem[dst] = Scalar[dtype](0)
 
-        barrier()
+            # ---- Load LSE, delta (BM elements each, 128 threads → 2 per thread
+            #      at BM=64 first thread of each pair does it).
+            if tid < BM:
+                var g_row: Int = q_row_base + tid
+                if g_row < seq_len:
+                    lse_smem[tid] = (lse_ptr + lse_base_off + g_row)[0]
+                    delta_smem[tid] = (delta_ptr + delta_base_off + g_row)[0]
+                else:
+                    # Padded rows: LSE = -inf, delta = 0 → P=0, contributes nothing.
+                    lse_smem[tid] = Float32(-1.0e30)
+                    delta_smem[tid] = Float32(0)
 
-        # ---- S = Q · K^T  (BM × BN), fp32.
-        # Output layout S_smem[m, n] at index m*BN + n. 128 threads, BM*BN=4096
-        # cells → 32 cells per thread, flat-strided.
-        comptime SBN_PER_THREAD: Int = (BM * BN) // nthreads  # 32
-        for i in range(SBN_PER_THREAD):
-            var flat: Int = i * nthreads + tid
-            var m: Int = flat // BN
-            var n: Int = flat - m * BN
-            var acc: Float32 = Float32(0)
-            for d in range(D):
-                var qv: Float32 = q_smem[m * D + d].cast[DType.float32]()
-                var kv: Float32 = k_smem[n * D + d].cast[DType.float32]()
-                acc = acc + qv * kv
-            s_smem[m * BN + n] = acc
+            barrier()
 
-        barrier()
-
-        # ---- Apply scale, subtract LSE, exponentiate to P. Store back in S_smem.
-        # P[m, n] = exp(S[m, n] * softmax_scale - LSE[m]).
-        # Use natural exp here (delta convention matches: dS = P * (dP - delta)
-        # with natural-log LSE — same as the pytorch fallback).
-        for i in range(SBN_PER_THREAD):
-            var flat: Int = i * nthreads + tid
-            var m: Int = flat // BN
-            var n: Int = flat - m * BN
-            var g_row: Int = q_row_base + m
-            var g_col: Int = kv_row_base + n
-            var s: Float32 = s_smem[m * BN + n] * scale_f - lse_smem[m]
-            var p: Float32
-            var masked: Bool = g_row >= seq_len or g_col >= seq_len
-            @parameter
-            if causal:
-                if g_row < g_col:
-                    masked = True
-            if masked:
-                p = Float32(0)
-            else:
-                p = exp(s)
-            s_smem[m * BN + n] = p
-
-        barrier()
-
-        # ---- dV_acc += P^T · dO   (BN × D), accumulate in registers.
-        # dV[n, d] += sum_m P[m, n] * dO[m, d].
-        # Thread t owns dv_acc indices [t*32 .. (t+1)*32). Flat → (n, d).
-        for i in range(ELTS_PER_THREAD):
-            var flat: Int = tid * ELTS_PER_THREAD + i
-            var n: Int = flat // D
-            var d: Int = flat - n * D
-            var acc: Float32 = Float32(0)
-            for m in range(BM):
-                var pv: Float32 = s_smem[m * BN + n]
-                var dov: Float32 = do_smem[m * D + d].cast[DType.float32]()
-                acc = acc + pv * dov
-            dv_acc[i] = dv_acc[i] + acc
-
-        # ---- dP = dO · V^T  (BM × BN), fp32.
-        for i in range(SBN_PER_THREAD):
-            var flat: Int = i * nthreads + tid
-            var m: Int = flat // BN
-            var n: Int = flat - m * BN
-            var acc: Float32 = Float32(0)
-            for d in range(D):
-                var dov: Float32 = do_smem[m * D + d].cast[DType.float32]()
-                var vv: Float32 = v_smem[n * D + d].cast[DType.float32]()
-                acc = acc + dov * vv
-            dp_smem[m * BN + n] = acc
-
-        barrier()
-
-        # ---- dS = P * (dP - delta[m]) * softmax_scale. Overwrites P in S_smem.
-        # We fold softmax_scale into dS here (upstream FA2 splits the scale
-        # between the dQ and dK paths; the simplest correct accounting is to
-        # bake the full scale into dS once so the trailing matmuls' results
-        # are already scaled — matches the pytorch fallback in _fn.py which
-        # multiplies dq/dk by softmax_scale after a `ds_raw = ds_post * ...`
-        # step).
-        for i in range(SBN_PER_THREAD):
-            var flat: Int = i * nthreads + tid
-            var m: Int = flat // BN
-            var n: Int = flat - m * BN
-            var p: Float32 = s_smem[m * BN + n]
-            var dpv: Float32 = dp_smem[m * BN + n]
-            var ds: Float32 = p * (dpv - delta_smem[m]) * scale_f
-            s_smem[m * BN + n] = ds
-
-        barrier()
-
-        # ---- dQ_contrib (BM × D) = dS · K. Atomic-add into dqaccum.
-        # Thread layout: BM*D = 4096 cells / 128 threads = 32 per thread.
-        for i in range(ELTS_PER_THREAD):
-            var flat: Int = i * nthreads + tid
-            var m: Int = flat // D
-            var d: Int = flat - m * D
-            var g_row: Int = q_row_base + m
-            if g_row < seq_len:
+            # ---- S = Q · K^T  (BM × BN), fp32.
+            # Output layout S_smem[m, n] at index m*BN + n. 128 threads, BM*BN=4096
+            # cells → 32 cells per thread, flat-strided.
+            comptime SBN_PER_THREAD: Int = (BM * BN) // nthreads  # 32
+            for i in range(SBN_PER_THREAD):
+                var flat: Int = i * nthreads + tid
+                var m: Int = flat // BN
+                var n: Int = flat - m * BN
                 var acc: Float32 = Float32(0)
-                for n in range(BN):
-                    var dsv: Float32 = s_smem[m * BN + n]
+                for d in range(D):
+                    var qv: Float32 = q_smem[m * D + d].cast[DType.float32]()
                     var kv: Float32 = k_smem[n * D + d].cast[DType.float32]()
-                    acc = acc + dsv * kv
-                var dqa_addr = (
-                    dqaccum_ptr
-                    + dqa_base_off
-                    + g_row * dqa_l_stride
-                    + d
-                )
-                _ = Atomic.fetch_add(dqa_addr, acc)
+                    acc = acc + qv * kv
+                s_smem[m * BN + n] = acc
 
-        # ---- dK_acc += dS^T · Q  (BN × D). Accumulate in registers.
-        for i in range(ELTS_PER_THREAD):
-            var flat: Int = tid * ELTS_PER_THREAD + i
-            var n: Int = flat // D
-            var d: Int = flat - n * D
-            var acc: Float32 = Float32(0)
-            for m in range(BM):
-                var dsv: Float32 = s_smem[m * BN + n]
-                var qv: Float32 = q_smem[m * D + d].cast[DType.float32]()
-                acc = acc + dsv * qv
-            dk_acc[i] = dk_acc[i] + acc
+            barrier()
 
-        barrier()
+            # ---- Apply scale, subtract LSE, exponentiate to P. Store back in S_smem.
+            # P[m, n] = exp(S[m, n] * softmax_scale - LSE[m]).
+            # Use natural exp here (delta convention matches: dS = P * (dP - delta)
+            # with natural-log LSE — same as the pytorch fallback).
+            for i in range(SBN_PER_THREAD):
+                var flat: Int = i * nthreads + tid
+                var m: Int = flat // BN
+                var n: Int = flat - m * BN
+                var g_row: Int = q_row_base + m
+                var g_col: Int = kv_row_base + n
+                var s: Float32 = s_smem[m * BN + n] * scale_f - lse_smem[m]
+                var p: Float32
+                var masked: Bool = g_row >= seq_len or g_col >= seq_len
+                @parameter
+                if causal:
+                    if g_row < g_col:
+                        masked = True
+                if masked:
+                    p = Float32(0)
+                else:
+                    p = exp(s)
+                s_smem[m * BN + n] = p
+
+            barrier()
+
+            # ---- dV_acc += P^T · dO   (BN × D), accumulate in registers.
+            # dV[n, d] += sum_m P[m, n] * dO[m, d].
+            # Thread t owns dv_acc indices [t*32 .. (t+1)*32). Flat → (n, d).
+            for i in range(ELTS_PER_THREAD):
+                var flat: Int = tid * ELTS_PER_THREAD + i
+                var n: Int = flat // D
+                var d: Int = flat - n * D
+                var acc: Float32 = Float32(0)
+                for m in range(BM):
+                    var pv: Float32 = s_smem[m * BN + n]
+                    var dov: Float32 = do_smem[m * D + d].cast[DType.float32]()
+                    acc = acc + pv * dov
+                dv_acc[i] = dv_acc[i] + acc
+
+            # ---- dP = dO · V^T  (BM × BN), fp32.
+            for i in range(SBN_PER_THREAD):
+                var flat: Int = i * nthreads + tid
+                var m: Int = flat // BN
+                var n: Int = flat - m * BN
+                var acc: Float32 = Float32(0)
+                for d in range(D):
+                    var dov: Float32 = do_smem[m * D + d].cast[DType.float32]()
+                    var vv: Float32 = v_smem[n * D + d].cast[DType.float32]()
+                    acc = acc + dov * vv
+                dp_smem[m * BN + n] = acc
+
+            barrier()
+
+            # ---- dS = P * (dP - delta[m]) * softmax_scale. Overwrites P in S_smem.
+            # We fold softmax_scale into dS here (upstream FA2 splits the scale
+            # between the dQ and dK paths; the simplest correct accounting is to
+            # bake the full scale into dS once so the trailing matmuls' results
+            # are already scaled — matches the pytorch fallback in _fn.py which
+            # multiplies dq/dk by softmax_scale after a `ds_raw = ds_post * ...`
+            # step).
+            for i in range(SBN_PER_THREAD):
+                var flat: Int = i * nthreads + tid
+                var m: Int = flat // BN
+                var n: Int = flat - m * BN
+                var p: Float32 = s_smem[m * BN + n]
+                var dpv: Float32 = dp_smem[m * BN + n]
+                var ds: Float32 = p * (dpv - delta_smem[m]) * scale_f
+                s_smem[m * BN + n] = ds
+
+            barrier()
+
+            # ---- dQ_contrib (BM × D) = dS · K. Atomic-add into dqaccum.
+            # Thread layout: BM*D = 4096 cells / 128 threads = 32 per thread.
+            for i in range(ELTS_PER_THREAD):
+                var flat: Int = i * nthreads + tid
+                var m: Int = flat // D
+                var d: Int = flat - m * D
+                var g_row: Int = q_row_base + m
+                if g_row < seq_len:
+                    var acc: Float32 = Float32(0)
+                    for n in range(BN):
+                        var dsv: Float32 = s_smem[m * BN + n]
+                        var kv: Float32 = k_smem[n * D + d].cast[DType.float32]()
+                        acc = acc + dsv * kv
+                    var dqa_addr = (
+                        dqaccum_ptr
+                        + dqa_base_off
+                        + g_row * dqa_l_stride
+                        + d
+                    )
+                    _ = Atomic.fetch_add(dqa_addr, acc)
+
+            # ---- dK_acc += dS^T · Q  (BN × D). Accumulate in registers.
+            for i in range(ELTS_PER_THREAD):
+                var flat: Int = tid * ELTS_PER_THREAD + i
+                var n: Int = flat // D
+                var d: Int = flat - n * D
+                var acc: Float32 = Float32(0)
+                for m in range(BM):
+                    var dsv: Float32 = s_smem[m * BN + n]
+                    var qv: Float32 = q_smem[m * D + d].cast[DType.float32]()
+                    acc = acc + dsv * qv
+                dk_acc[i] = dk_acc[i] + acc
+
+            barrier()
 
     # ---- Write dK, dV back to gmem (cast to bf16). dK has softmax_scale
     # already folded in (since we baked it into dS). dV does NOT have it.
-    var dk_base_off: Int = batch * dk_b_stride + head_idx * dk_h_stride
-    var dv_base_off: Int = batch * dv_b_stride + head_idx * dv_h_stride
+    var dk_base_off: Int = batch * dk_b_stride + kv_head_idx * dk_h_stride
+    var dv_base_off: Int = batch * dv_b_stride + kv_head_idx * dv_h_stride
     for i in range(ELTS_PER_THREAD):
         var flat: Int = tid * ELTS_PER_THREAD + i
         var n: Int = flat // D

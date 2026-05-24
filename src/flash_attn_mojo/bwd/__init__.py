@@ -99,15 +99,16 @@ def native_bwd_main(
 ) -> None:
     """JIT-compile (if needed) and dispatch the main bwd kernel.
 
-    MVP envelope: bf16, head_dim=64, non-causal, no MQA. Outputs dk/dv
-    are written directly; dq is accumulated into ``dqaccum`` (fp32) and
-    must be converted to dq's dtype by the caller (eventual convert_dq
-    kernel; pytorch one-liner for the MVP).
+    MVP envelope: bf16, head_dim=64. MQA/GQA supported (nheads_q must
+    be a multiple of nheads_kv). Outputs dk/dv are written directly;
+    dq is accumulated into ``dqaccum`` (fp32) and must be converted
+    to dq's dtype by the caller (the convert_dq kernel).
 
-    q, k, v, dout: (B, L, H, D) bf16.
-    lse, delta:    (B, H, L) fp32.
-    dk, dv:        (B, L, H, D) bf16 — same shape as k, v.
-    dqaccum:       (B, H, L, D) fp32 — pre-zeroed by preprocess kernel.
+    q, dout:       (B, L, Hq, D) bf16.
+    k, v:          (B, L, Hkv, D) bf16. Hq % Hkv == 0.
+    lse, delta:    (B, Hq, L) fp32.
+    dk, dv:        (B, L, Hkv, D) bf16 — same shape as k, v.
+    dqaccum:       (B, Hq, L, D) fp32 — pre-zeroed by preprocess kernel.
     """
     from flash_attn_mojo.bwd._main_jit import call_bwd_main
 
@@ -118,7 +119,11 @@ def native_bwd_main(
     assert dqaccum.dtype == torch.float32
     assert lse.is_contiguous() and delta.is_contiguous()
 
-    batch, seqlen, nheads, head_dim = q.shape
+    batch, seqlen, nheads_q, head_dim = q.shape
+    nheads_kv = k.shape[2]
+    assert nheads_q % nheads_kv == 0, (
+        f"nheads_q ({nheads_q}) must be a multiple of nheads_kv ({nheads_kv})"
+    )
 
     call_bwd_main(
         (
@@ -133,7 +138,8 @@ def native_bwd_main(
             dqaccum.data_ptr(),
             batch,
             seqlen,
-            nheads,
+            nheads_q,
+            nheads_kv,
             float(softmax_scale),
             q.stride(0),
             q.stride(1),
