@@ -4,13 +4,56 @@ Guidance for working on this repo: a Mojo port of Tri Dao's CUDA
 `flash-attn`. The benchmark we care about is "GPU kernel time vs
 upstream flash-attn 2 CUDA", with upstream as the moving target.
 
-**Status: scaffolding only.** The Python infrastructure (JIT-on-first-
-use cache, env-signature keying, autograd + `torch.library.custom_op`
-plumbing, compat package for `import flash_attn`, beartype-in-tests)
-is in place. The Mojo kernels themselves (`fwd/kernel.mojo`,
-`bwd/kernel.mojo`) are not yet implemented — calls to
-`flash_attn_func` on CUDA tensors raise `NotImplementedError` and
-point at the missing piece.
+**Status: fwd kernel substantially feature-complete, backward TBD.**
+
+The fwd kernel ships at perf parity (~1.06x upstream geomean across
+the canonical shape grid at nheads=8) and supports the envelope below.
+The backward kernel is still stubbed.
+
+Fwd feature matrix vs upstream flash-attn 2:
+
+| feature | status |
+|---|---|
+| bf16 | done |
+| fp16 | done (internal cast to bf16; ~5e-3 vs upstream fp16) |
+| head_dim in {32, 64, 128} | done (native) |
+| head_dim in {96, 160, 192, 224, 256} | blocked (see below) |
+| causal (with block-skip) | done |
+| MQA/GQA | done |
+| softcap | done |
+| sliding window (with KV-tile block-skip) | done |
+| ALiBi (per-head and per-batch-head) | done |
+| dropout (inline splitmix RNG, deterministic seed/offset) | done |
+| return_attn_probs (LSE) | done |
+| qkvpacked / kvpacked Python wrappers | done |
+| flash_attn_varlen_func | done (python-wrapper baseline, prefill-only) |
+| flash_attn_with_kvcache | done (prefill-only) |
+| non-contig (L, D) strides on unaligned seqlens | done |
+| backward (`bwd/`) | not implemented |
+
+**Known blocker — head_dim in {96, 160, 192, 224, 256}.** V's smem
+tile is `Layout.row_major(BK, depth)` so V's row stride equals
+`depth`. `multistage_mma`'s `load_b` (used by the P·V MMA) goes
+through a bank-conflict swizzle that requires the row stride be a
+power of 2 in {16, 32, 64, 128, 256, 512} half-elements. Depths 96 /
+160 / 192 / 224 fail this constraint outright. Depth 256 satisfies
+the swizzle but hits the Ada ~99 KiB dynamic-smem cap with BN=64
+(104 KiB needed); the BN=32 fallback compiles but produces wrong
+output, suspected to be `multistage_mma`'s prefetch gate when
+`static_num_iters=1`. The `multistage_mma`'s `swizzle_b` template
+param is hardcoded for the B operand on NVIDIA
+(`_multistage_gemm_gpu.mojo:290`), so swizzle can't be opted out at
+the call site. Unblocking either requires (a) restructuring V's
+smem as multiple BN-wide depth strips (algorithmic change, splits
+the P·V MMA into per-strip iterations) or (b) a hand-rolled inner
+MMA loop that bypasses `multistage_mma` for the second matmul. Both
+are M-H sessions of work.
+
+**fp16 native path** (vs the current cast-to-bf16 wrapper) is
+blocked on `multistage_mma` too: `get_mma_shape[fp16, fp32]` picks
+`m16n8k16` and that intrinsic only ships for bf16 in mojo-compiler
+1.0.0b1's stdlib. A mojo bump (or hand-rolled `m16n8k8` fp16 path)
+unblocks this.
 
 ## Repository layout
 
