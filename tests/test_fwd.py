@@ -224,3 +224,49 @@ def test_noncausal_regression(L):
     out_ref = _sdpa_ref(q, k, v, causal=False)
     diff = _max_abs(out_mojo, out_ref)
     assert diff < 5e-2, f"L={L} non-causal vs SDPA: max |diff|={diff:.3e}"
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_qkvpacked_matches_unpacked(causal):
+    """`flash_attn_qkvpacked_func` must be bit-equal to the unpacked
+    `flash_attn_func` on the same data."""
+    B, L, H, D = 2, 128, 4, 64
+    # H=4 with the kernel's launcher requires q.stride(1)==head_dim; the
+    # packed-along-dim=2 layout still produces contiguous per-token rows
+    # when we materialise q/k/v via `.contiguous()` after unbind. The
+    # packed wrapper does the unbind internally — the kernel is the same
+    # one called by `flash_attn_func`, so we round-trip both through
+    # `.contiguous()` here to keep the strides identical.
+    qkv = torch.randn(B, L, 3, H, D, dtype=torch.bfloat16, device="cuda")
+    q, k, v = (t.contiguous() for t in qkv.unbind(dim=2))
+
+    out_packed = flash_attn_mojo.flash_attn_qkvpacked_func(qkv, causal=causal)
+    out_unpacked = flash_attn_mojo.flash_attn_func(q, k, v, causal=causal)
+
+    # The packed wrapper feeds the unbound (non-contiguous) views into
+    # the kernel. If the kernel requires contiguous q, packed may
+    # differ; allow a tiny numeric drift but expect exact equality on
+    # contiguous-equivalent inputs.
+    assert torch.equal(out_packed, out_unpacked), (
+        f"qkvpacked vs unpacked (causal={causal}) differ: "
+        f"max |diff|={_max_abs(out_packed, out_unpacked):.3e}"
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_kvpacked_matches_unpacked(causal):
+    """`flash_attn_kvpacked_func` must be bit-equal to the unpacked
+    `flash_attn_func` on the same data, with MQA (H_q != H_kv)."""
+    B, L, D = 2, 128, 64
+    H_q, H_kv = 4, 2
+    q = torch.randn(B, L, H_q, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(B, L, 2, H_kv, D, dtype=torch.bfloat16, device="cuda")
+    k, v = (t.contiguous() for t in kv.unbind(dim=2))
+
+    out_packed = flash_attn_mojo.flash_attn_kvpacked_func(q, kv, causal=causal)
+    out_unpacked = flash_attn_mojo.flash_attn_func(q, k, v, causal=causal)
+
+    assert torch.equal(out_packed, out_unpacked), (
+        f"kvpacked vs unpacked (causal={causal}) differ: "
+        f"max |diff|={_max_abs(out_packed, out_unpacked):.3e}"
+    )

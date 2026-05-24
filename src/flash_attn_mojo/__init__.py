@@ -34,12 +34,18 @@ if "MODULAR_NVPTX_COMPILER_PATH" not in os.environ:
 # here so the first call doesn't pay the hook-registration cost.
 import mojo.importer  # noqa: F401, E402
 
-from flash_attn_mojo._fn import flash_attn_func  # noqa: E402
+from flash_attn_mojo._fn import (  # noqa: E402
+    flash_attn_func,
+    flash_attn_kvpacked_func,
+    flash_attn_qkvpacked_func,
+)
 from flash_attn_mojo.reference import flash_attn_ref  # noqa: E402
 
 __version__ = "0.0.1"
 
 __all__ = [
     "flash_attn_func",
+    "flash_attn_kvpacked_func",
+    "flash_attn_qkvpacked_func",
     "flash_attn_ref",
 ]

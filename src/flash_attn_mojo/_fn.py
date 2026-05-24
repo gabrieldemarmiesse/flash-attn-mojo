@@ -234,3 +234,65 @@ def flash_attn_func(
         softcap, alibi_slopes, deterministic, return_attn_probs,
     )
     return result
+
+
+def flash_attn_qkvpacked_func(
+    qkv: torch.Tensor,
+    dropout_p: float = 0.0,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    window_size: tuple[int, int] = _NO_WINDOW,
+    softcap: float = 0.0,
+    alibi_slopes: torch.Tensor | None = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Packed-QKV variant of `flash_attn_func`.
+
+    qkv: (batch, seqlen, 3, nheads, head_dim) — Q, K, V stacked along
+        dim=2. Unstacked and forwarded to `flash_attn_func`.
+    """
+    q, k, v = qkv.unbind(dim=2)
+    return flash_attn_func(
+        q, k, v,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
+    )
+
+
+def flash_attn_kvpacked_func(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    dropout_p: float = 0.0,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    window_size: tuple[int, int] = _NO_WINDOW,
+    softcap: float = 0.0,
+    alibi_slopes: torch.Tensor | None = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Packed-KV variant of `flash_attn_func`.
+
+    q: (batch, seqlen_q, nheads_q, head_dim).
+    kv: (batch, seqlen_k, 2, nheads_kv, head_dim) — K, V stacked along
+        dim=2. Supports MQA/GQA when nheads_q != nheads_kv.
+    """
+    k, v = kv.unbind(dim=2)
+    return flash_attn_func(
+        q, k, v,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
+    )
