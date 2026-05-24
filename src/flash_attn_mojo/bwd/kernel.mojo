@@ -104,6 +104,8 @@ def bwd_kernel[
     alibi_ptr: UnsafePointer[Float32, ImmutAnyOrigin],
     alibi_b_stride: Int,
     alibi_h_stride: Int,
+    window_left: Int,
+    window_right: Int,
     q_b_stride: Int,
     q_l_stride: Int,
     q_h_stride: Int,
@@ -204,9 +206,39 @@ def bwd_kernel[
     # entirely above the diagonal vs this KV block → P = 0 everywhere →
     # contribute nothing to dK/dV/dQ. Skip them.
     var qb_start: Int = 0
+    var qb_end: Int = num_q_blocks
     @parameter
     if causal:
         qb_start = (n_block * BN) // BM
+    # Sliding-window block-skip. For (q_row, kv_row) to be in window:
+    #   kv_row - right <= q_row <= kv_row + left   (when each side >= 0).
+    # kv_row spans [kv_row_base, kv_row_base + BN - 1] in this block,
+    # so the q-row range that can contribute is
+    #   [kv_row_base - right, (kv_row_base + BN - 1) + left]
+    # for the right and left sides respectively (when each >= 0).
+    var has_window: Bool = window_left >= 0 or window_right >= 0
+    if has_window:
+        if window_right >= 0:
+            # Lower bound on q_row: q_row >= kv_row_base - window_right.
+            # Block qb contains q_rows [qb*BM, qb*BM+BM-1]; need
+            # qb*BM + BM - 1 >= kv_row_base - window_right, i.e.
+            # qb >= ceil((kv_row_base - window_right - BM + 1) / BM).
+            var lo: Int = kv_row_base - window_right - BM + 1
+            var qb_lo: Int = (lo + BM - 1) // BM if lo > 0 else 0
+            # Floor-div for negative numerators: lo <= 0 ⇒ qb_lo = 0.
+            if qb_lo > qb_start:
+                qb_start = qb_lo
+        if window_left >= 0:
+            # Upper bound on q_row: q_row <= kv_row_base + BN - 1 + window_left.
+            # Block qb contains q_rows [qb*BM, qb*BM+BM-1]; need
+            # qb*BM <= kv_row_base + BN - 1 + window_left, i.e.
+            # qb <= (kv_row_base + BN - 1 + window_left) // BM.
+            var hi_inclusive: Int = (
+                kv_row_base + BN - 1 + window_left
+            ) // BM
+            var qb_hi: Int = hi_inclusive + 1
+            if qb_hi < qb_end:
+                qb_end = qb_hi
 
     var scale_f: Float32 = softmax_scale
     var softcap_f: Float32 = softcap
@@ -245,7 +277,7 @@ def bwd_kernel[
             batch * dqa_b_stride + q_head_idx * dqa_h_stride
         )
 
-        for qb in range(qb_start, num_q_blocks):
+        for qb in range(qb_start, qb_end):
             var q_row_base: Int = qb * BM
 
             # ---- Load Q, dO into smem.
@@ -338,6 +370,14 @@ def bwd_kernel[
                 @parameter
                 if causal:
                     if g_row < g_col:
+                        masked = True
+                # Sliding-window mask: kv_col must lie in
+                # [g_row - window_left, g_row + window_right] when each
+                # bound is >= 0. -1 = unbounded.
+                if has_window:
+                    if window_left >= 0 and g_col < g_row - window_left:
+                        masked = True
+                    if window_right >= 0 and g_col > g_row + window_right:
                         masked = True
                 if masked:
                     p = Float32(0)

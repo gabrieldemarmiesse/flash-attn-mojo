@@ -228,6 +228,7 @@ def _bwd_dispatch_native_mvp(
     causal: bool,
     softcap: float,
     alibi_slopes: torch.Tensor | None = None,
+    window_size: tuple[int, int] = _NO_WINDOW,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Native MVP backward: bf16 / head_dim=64 / optional causal / no MQA.
 
@@ -309,6 +310,8 @@ def _bwd_dispatch_native_mvp(
         alibi_addr=int(alibi_addr),
         alibi_b_stride=int(alibi_b_stride),
         alibi_h_stride=int(alibi_h_stride),
+        window_left=int(window_size[0]),
+        window_right=int(window_size[1]),
     )
     del alibi_buf
 
@@ -374,7 +377,6 @@ def _bwd_dispatch(
         and q.dtype in (torch.bfloat16, torch.float16)
         and q.shape[-1] == 64
         and q.shape[2] % k.shape[2] == 0  # MQA/GQA: Hq divisible by Hkv
-        and window_size == _NO_WINDOW
         and dropout_p == 0.0
         and q.shape[1] == k.shape[1]  # equal seqlen
     )
@@ -382,6 +384,7 @@ def _bwd_dispatch(
         return _bwd_dispatch_native_mvp(
             dout, q, k, v, out, lse, softmax_scale, causal, softcap,
             alibi_slopes=alibi_slopes,
+            window_size=window_size,
         )
 
     if dropout_p > 0.0:

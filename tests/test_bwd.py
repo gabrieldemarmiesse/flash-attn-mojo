@@ -295,6 +295,29 @@ def test_backward_alibi(slopes_shape, causal):
     assert _max_abs(v.grad, vf.grad.to(v.dtype)) < 5e-2
 
 
+@pytest.mark.parametrize("window", [(64, 0), (32, 32), (128, -1)])
+@pytest.mark.parametrize("causal", [False, True])
+def test_backward_window(window, causal):
+    """Native bwd with sliding window: compare against pytorch fallback."""
+    B, L, H, D = 2, 256, 4, 64
+    q, k, v = _make_qkv(B, L, H, D)
+    out = flash_attn_mojo.flash_attn_func(
+        q, k, v, causal=causal, window_size=window
+    )
+    dout = torch.randn_like(out)
+    out.backward(dout)
+
+    from flash_attn_mojo.reference import flash_attn_ref
+    qf = q.detach().float().requires_grad_(True)
+    kf = k.detach().float().requires_grad_(True)
+    vf = v.detach().float().requires_grad_(True)
+    out_ref = flash_attn_ref(qf, kf, vf, causal=causal, window_size=window)
+    out_ref.backward(dout.float())
+    assert _max_abs(q.grad, qf.grad.to(q.dtype)) < 5e-2
+    assert _max_abs(k.grad, kf.grad.to(k.dtype)) < 5e-2
+    assert _max_abs(v.grad, vf.grad.to(v.dtype)) < 5e-2
+
+
 def test_backward_dropout_raises():
     B, L, H, D = 1, 32, 1, 64
     q, k, v = _make_qkv(B, L, H, D)

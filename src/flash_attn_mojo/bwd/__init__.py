@@ -100,6 +100,8 @@ def native_bwd_main(
     alibi_addr: int = 0,
     alibi_b_stride: int = 0,
     alibi_h_stride: int = 0,
+    window_left: int = -1,
+    window_right: int = -1,
 ) -> None:
     """JIT-compile (if needed) and dispatch the main bwd kernel.
 
@@ -143,6 +145,8 @@ def native_bwd_main(
             int(alibi_addr),
             int(alibi_b_stride),
             int(alibi_h_stride),
+            int(window_left),
+            int(window_right),
             batch,
             seqlen,
             nheads_q,
