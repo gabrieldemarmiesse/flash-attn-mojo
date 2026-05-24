@@ -5,10 +5,12 @@ implementation in a `record_function` range, calls it N times under
 `torch.profiler`, walks `prof.events()` and sums per-kernel GPU time.
 Reports `mojo (us/call)`, `upstream (us/call)`, and the ratio.
 
-The mojo kernel currently only supports the simplest envelope (fp16,
-head_dim=64, non-causal); the shape grid below stays inside that
-envelope until more variants land. Once we expand support, more
-shapes / dtypes / causal modes get added here.
+The mojo kernel currently supports bf16 only (fp16 lands once the
+stdlib m16n8k16 fp16 intrinsic is available), head_dim=64, non-causal.
+BN-aligned seqlens use the user tensors directly; unaligned seqlens
+take the pad-and-copy fast path which requires contiguous (L, D)
+inner strides. The shape grid below stays inside that envelope until
+more variants land.
 
     # bench all shapes
     uv run --extra nvidia python benchmarks/bench_gpu_kernel_time.py
@@ -51,9 +53,11 @@ def _is_mojo_fwd(name: str) -> bool:
 
 
 def _is_upstream_fwd(name: str) -> bool:
-    return name.startswith("void flash_fwd_kernel") or name.startswith(
-        "void flash::flash_fwd_kernel"
-    )
+    # Upstream picks `flash_fwd_kernel` for the canonical multi-head path
+    # and `flash_fwd_splitkv_kernel` (+ `flash_fwd_splitkv_combine_kernel`)
+    # for low-parallelism cases like nheads=1. Sum across both so the
+    # ratio reflects total upstream GPU time, not just one of the two.
+    return "flash_fwd" in name
 
 
 def _sum_cuda_us(prof, predicate) -> float:
@@ -139,13 +143,13 @@ def main() -> None:
     )
     p.add_argument("--iters", type=int, default=100)
     p.add_argument("--warmup", type=int, default=10)
-    p.add_argument("--dtype", choices=["fp16"], default="fp16")
+    p.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     args = p.parse_args()
 
     if not torch.cuda.is_available():
         raise SystemExit("no CUDA device — bench requires GPU")
     device = "cuda"
-    dtype = {"fp16": torch.float16}[args.dtype]
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
 
     if args.shape is not None:
         shapes = [tuple(int(x) for x in args.shape.split(","))]
