@@ -26,6 +26,7 @@ from common import kNThreads, kBlockM, kBlockN, kBlockK, kWM, kWN
 def launch_fwd[
     dtype: DType,
     head_dim: Int,
+    causal: Bool,
     use_external_stream: Bool,
 ](
     batch_int: Int,
@@ -78,8 +79,8 @@ def launch_fwd[
     )
 
     var compiled = ctx.compile_function[
-        fwd_kernel[dtype, head_dim],
-        fwd_kernel[dtype, head_dim],
+        fwd_kernel[dtype, head_dim, causal],
+        fwd_kernel[dtype, head_dim, causal],
     ](func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(smem_bytes))
 
     var padded_seqlen: Int = ceildiv(seqlen_int, Int(kBlockN)) * Int(kBlockN)

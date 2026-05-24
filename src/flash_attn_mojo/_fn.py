@@ -65,8 +65,6 @@ def _fwd_dispatch(
             f"flash_attn_mojo current kernel supports head_dim=64 only "
             f"(got {q.shape[-1]})."
         )
-    if causal:
-        raise NotImplementedError("flash_attn_mojo: causal not yet implemented.")
     if dropout_p != 0.0:
         raise NotImplementedError("flash_attn_mojo: dropout not yet implemented.")
     if softcap != 0.0:
@@ -91,7 +89,7 @@ def _fwd_dispatch(
         q.shape[0], q.shape[2], q.shape[1], dtype=torch.float32, device=q.device
     )
 
-    native_fwd(q, k, v, out, softmax_scale)
+    native_fwd(q, k, v, out, softmax_scale, causal)
     return out, lse
 
 

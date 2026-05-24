@@ -95,6 +95,7 @@ from common import kNThreads, kBlockM, kBlockN, kBlockK, kWM, kWN
 def fwd_kernel[
     dtype: DType,
     head_dim: Int,
+    causal: Bool,
 ](
     seq_len: Int,
     actual_seq_len: Int,
@@ -459,6 +460,25 @@ def fwd_kernel[
         var tile_needs_mask: Bool = (
             kv_tile_start_row + Int(BN) > actual_seq_len
         )
+        # Causal mask only matters when the diagonal cuts through this tile.
+        # A pair (q_row, kv_col) is above-diagonal iff kv_col > q_row. The
+        # smallest q_row in this Q-tile is q_tile_idx*BM; the largest kv_col
+        # in this tile is kv_tile_start_row + BN - 1. So the tile contains
+        # at least one above-diagonal element iff
+        #   kv_tile_start_row + BN - 1 > q_tile_idx*BM
+        # i.e. kv_tile_start_row + BN > q_tile_idx*BM + 1. With BM == BN
+        # and the block-skip cap at (q_tile_idx+1)*BM this is equivalent
+        # to "this is the diagonal tile (kv_tile_start_row == q_tile_idx*BM)".
+        var causal_tile_needs_mask: Bool = causal and (
+            kv_tile_start_row + Int(BN)
+            > Int(q_tile_idx) * Int(BM) + 1
+        )
+        # Per-lane row indices (m16n8k16 C-frag layout: i=0 → row lane/4,
+        # i=1 → row lane/4 + 8 inside the WM×MMA_N MMA sub-tile).
+        var lane_row0: UInt32 = lane // UInt32(4)
+        var q_tile_row_base: Int = Int(q_tile_idx) * Int(BM) + Int(warp_y) * Int(WM)
+        # Per-lane column offset inside the MMA_N tile: cols 2*(lane%4) and
+        # 2*(lane%4)+1 (i.e. p_frag_simdwidth = 2 contiguous columns).
         var p_reg_vec2 = p_reg_tile.vectorize[1, p_frag_simdwidth]()
         comptime for m_mma in range(num_m_mmas):
             comptime for n_mma in range(num_n_mmas):
@@ -472,6 +492,14 @@ def fwd_kernel[
 
                 comptime for i in range(2):
                     p_reg_vec2[mma_id, i] = p_reg_vec2[mma_id, i] * scale_log2e
+
+                    # Per-row query index for this score frag slot.
+                    var q_idx: Int = (
+                        q_tile_row_base
+                        + Int(m_mma) * Int(MMA_M)
+                        + Int(lane_row0)
+                        + (8 if i == 1 else 0)
+                    )
 
                     # Per-element OOB mask: set score for any key >=
                     # actual_seq_len to -inf so its softmax weight is zero.
@@ -487,6 +515,20 @@ def fwd_kernel[
                         comptime for j in range(p_frag_simdwidth):
                             if score_col + j >= actual_seq_len:
                                 p_reg_vec2[mma_id, i][j] = ne_inf[j]
+
+                    # Causal mask: key column j must satisfy j <= q_idx.
+                    if causal_tile_needs_mask:
+                        var score_col_c: Int = (
+                            kv_tile_start_row
+                            + Int(mma_col_base + col_off)
+                        )
+                        var ne_inf_c = SIMD[accum_type, p_frag_simdwidth](
+                            min_or_neg_inf[accum_type]()
+                        )
+
+                        comptime for j in range(p_frag_simdwidth):
+                            if score_col_c + j > q_idx:
+                                p_reg_vec2[mma_id, i][j] = ne_inf_c[j]
 
         comptime reg_layout_by_mma_unit = Layout.row_major(
             2 * num_m_mmas * num_n_mmas, 2
@@ -568,10 +610,26 @@ def fwd_kernel[
             BN // BK,
         )
 
-    tile_and_unswitch[loop_over_kv, [BN]](0, seq_len)
+    # Block-skip for causal: KV tiles starting strictly above the last
+    # query row of this Q-tile are entirely above the diagonal and
+    # contribute nothing. Cap the loop at (q_tile_idx + 1) * BM.
+    var kv_end: Int = seq_len
+    @parameter
+    if causal:
+        kv_end = min(seq_len, (Int(q_tile_idx) + 1) * Int(BM))
+    tile_and_unswitch[loop_over_kv, [BN]](0, kv_end)
 
     # ---- Normalise by 1/rowsum.
+    # Defensive: a fully-masked row (no in-bounds, in-diagonal keys) has
+    # rowsum == 0 → recip → inf. For seq_len_q == seq_len_k every query
+    # has at least one valid key (itself), so this only fires on padded
+    # tail rows, which the launcher discards. Still, swap 0 → 1 so the
+    # output is a clean 0.
     comptime for m_mma in range(num_m_mmas):
+        if rowsum[2 * m_mma] == Scalar[accum_type](0):
+            rowsum[2 * m_mma] = Scalar[accum_type](1)
+        if rowsum[2 * m_mma + 1] == Scalar[accum_type](0):
+            rowsum[2 * m_mma + 1] = Scalar[accum_type](1)
         var rowsum_inv0 = recip(rowsum[2 * m_mma])
         var rowsum_inv1 = recip(rowsum[2 * m_mma + 1])
 

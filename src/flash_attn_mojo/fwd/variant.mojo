@@ -17,6 +17,7 @@ from _ctx import acquire_ctx_handle
 
 comptime DTYPE: DType = get_defined_dtype["DTYPE", DType.float16]()
 comptime HEAD_DIM: Int = get_defined_int["HEAD_DIM"]()
+comptime CAUSAL: Bool = get_defined_bool["CAUSAL"]()
 comptime USE_EXTERNAL_STREAM: Bool = get_defined_bool["USE_EXTERNAL_STREAM"]()
 
 
@@ -53,11 +54,11 @@ def flash_attn_fwd_variant(
     var o_l_stride: Int = Int(py=args[18])
     var o_h_stride: Int = Int(py=args[19])
     var stream_handle_addr: Int = Int(py=args[20])
-    # args[21..23] (dtype, head_dim, use_external_stream) are all
-    # comptime defines — read at module level via get_defined_*, so
+    # args[21..24] (dtype, head_dim, causal, use_external_stream) are
+    # all comptime defines — read at module level via get_defined_*, so
     # they're skipped here. ctx_handle is appended by `call_fwd` as
-    # the 25th positional (index 24).
-    var ctx_handle_addr: Int = Int(py=args[24])
+    # the 26th positional (index 25).
+    var ctx_handle_addr: Int = Int(py=args[25])
 
     if batch_int == 0 or seqlen_int == 0 or nheads_int == 0:
         return PythonObject(None)
@@ -65,6 +66,7 @@ def flash_attn_fwd_variant(
     launch_fwd[
         DTYPE,
         HEAD_DIM,
+        CAUSAL,
         USE_EXTERNAL_STREAM,
     ](
         batch_int,

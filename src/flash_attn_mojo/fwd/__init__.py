@@ -13,6 +13,7 @@ def native_fwd(
     v: torch.Tensor,
     out: torch.Tensor,
     softmax_scale: float,
+    causal: bool = False,
 ) -> None:
     """JIT-compile (if needed) and dispatch a single GPU forward call.
 
@@ -51,6 +52,7 @@ def native_fwd(
             torch.cuda.current_stream().cuda_stream,
             _DTYPE_CODE[q.dtype],
             head_dim,
+            1 if causal else 0,
             1,  # use_external_stream: CUDA path wraps torch's stream
         )
     )

@@ -87,11 +87,11 @@ def test_cuda_kernel_matches_reference():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
 def test_cuda_outside_envelope_rejects_clearly():
-    """Anything outside the current minimal envelope (causal, dropout,
+    """Anything outside the current minimal envelope (dropout,
     head_dim != 64, etc.) must error cleanly with NotImplementedError."""
     B, L, H, D = 1, 4, 2, 64
-    q = torch.randn(B, L, H, D, dtype=torch.float16, device="cuda")
-    k = torch.randn(B, L, H, D, dtype=torch.float16, device="cuda")
-    v = torch.randn(B, L, H, D, dtype=torch.float16, device="cuda")
-    with pytest.raises(NotImplementedError, match="causal"):
-        flash_attn_mojo.flash_attn_func(q, k, v, causal=True)
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(NotImplementedError, match="dropout"):
+        flash_attn_mojo.flash_attn_func(q, k, v, dropout_p=0.1)

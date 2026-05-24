@@ -37,24 +37,26 @@ def call_fwd(args: tuple) -> None:
 
 def _config_from_args(args: tuple) -> tuple:
     # See `fwd/__init__.py::native_fwd` for the runtime tuple layout.
-    # Indices 21, 22, 23 are the compile-time gating fields appended
+    # Indices 21..24 are the compile-time gating fields appended
     # after the kernel's actual positional args (which end at 20 with
     # the CUDA stream handle).
     dtype_code = args[21]
     head_dim = args[22]
-    use_external_stream = bool(args[23])
-    return (dtype_code, head_dim, use_external_stream)
+    causal = bool(args[23])
+    use_external_stream = bool(args[24])
+    return (dtype_code, head_dim, causal, use_external_stream)
 
 
 def _mod_name(config: tuple) -> str:
     """Readable, deterministic identifier for a config."""
-    (dt, hd, ues) = config
-    return f"{_DTYPE_NAME[dt]}_hd{hd}_extstr{int(ues)}"
+    (dt, hd, causal, ues) = config
+    causal_tag = "causal" if causal else "noncausal"
+    return f"{_DTYPE_NAME[dt]}_hd{hd}_{causal_tag}_extstr{int(ues)}"
 
 
 def _defines(config: tuple) -> dict[str, str]:
     """Materialise the config as `-D KEY=VALUE` pairs for `mojo build`."""
-    (dt, hd, ues) = config
+    (dt, hd, causal, ues) = config
 
     def b(x: bool) -> str:
         return "true" if x else "false"
@@ -62,6 +64,7 @@ def _defines(config: tuple) -> dict[str, str]:
     return {
         "DTYPE": _DTYPE_DEFINE[dt],
         "HEAD_DIM": str(hd),
+        "CAUSAL": b(causal),
         "USE_EXTERNAL_STREAM": b(ues),
     }
 
