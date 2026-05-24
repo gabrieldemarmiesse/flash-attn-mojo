@@ -96,6 +96,7 @@ def native_bwd_main(
     dqaccum: torch.Tensor,
     softmax_scale: float,
     causal: bool = False,
+    softcap: float = 0.0,
 ) -> None:
     """JIT-compile (if needed) and dispatch the main bwd kernel.
 
@@ -141,6 +142,7 @@ def native_bwd_main(
             nheads_q,
             nheads_kv,
             float(softmax_scale),
+            float(softcap),
             q.stride(0),
             q.stride(1),
             q.stride(2),

@@ -6,8 +6,9 @@ MVP envelope (locked at variant compile time):
 
   - dtype = bf16  (fp16 routed via API-boundary cast — same pattern as fwd)
   - head_dim = 64
-  - non-causal
-  - no softcap, alibi, window, dropout
+  - causal: optional (comptime)
+  - softcap: optional (runtime)
+  - no alibi, window, dropout
   - single seqlen (Q and K share length)
 
 MQA/GQA: supported via the Tri Dao block layout. Grid Y dim is
@@ -45,20 +46,22 @@ Algorithm (one block per (n_block, batch, head); see upstream lines 81-826):
   4. Write dK_acc (cast bf16) and dV_acc (cast bf16) to gmem.
 
 Smem layout (dynamic):
-    K_smem    : BN × D   bf16   = 8 KiB
-    V_smem    : BN × D   bf16   = 8 KiB
-    Q_smem    : BM × D   bf16   = 8 KiB
-    dO_smem   : BM × D   bf16   = 8 KiB
-    S_smem    : BM × BN  fp32   = 16 KiB   (reused for dS after dV update)
-    dP_smem   : BM × BN  fp32   = 16 KiB
-    LSE_smem  : BM       fp32   = 256 B
-    delta_smem: BM       fp32   = 256 B
-    Total                       ~ 64.5 KiB
+    K_smem      : BN × D   bf16   = 8 KiB
+    V_smem      : BN × D   bf16   = 8 KiB
+    Q_smem      : BM × D   bf16   = 8 KiB
+    dO_smem     : BM × D   bf16   = 8 KiB
+    S_smem      : BM × BN  fp32   = 16 KiB   (reused for dS after dV update)
+    dP_smem     : BM × BN  fp32   = 16 KiB
+    sfcfac_smem : BM × BN  fp32   = 16 KiB   (softcap local derivative,
+                                              only used when softcap > 0)
+    LSE_smem    : BM       fp32   = 256 B
+    delta_smem  : BM       fp32   = 256 B
+    Total                         ~ 80.5 KiB
 
 This sits comfortably under the 99 KiB Ada dynamic-smem cap.
 """
 
-from std.math import exp, log2
+from std.math import exp, log2, tanh
 from std.math.constants import log2e
 from std.sys import size_of
 from std.utils.index import StaticTuple
@@ -88,6 +91,7 @@ def bwd_kernel[
     nheads_q: Int,
     nheads_kv: Int,
     softmax_scale: Float32,
+    softcap: Float32,
     q_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     k_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     v_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -153,7 +157,8 @@ def bwd_kernel[
     var do_smem = q_smem + (BM * D)
     var s_smem = (do_smem + (BM * D)).bitcast[Float32]()
     var dp_smem = s_smem + (BM * BN)
-    var lse_smem = dp_smem + (BM * BN)
+    var sfcfac_smem = dp_smem + (BM * BN)
+    var lse_smem = sfcfac_smem + (BM * BN)
     var delta_smem = lse_smem + BM
 
     # ---- Per-thread dK_acc, dV_acc register tiles.
@@ -201,6 +206,11 @@ def bwd_kernel[
         qb_start = (n_block * BN) // BM
 
     var scale_f: Float32 = softmax_scale
+    var softcap_f: Float32 = softcap
+    var has_softcap: Bool = softcap_f > Float32(0)
+    var softcap_inv: Float32 = (
+        Float32(1) / softcap_f if has_softcap else Float32(0)
+    )
 
     # ---- Outer Q-head-in-group loop (MQA/GQA). For non-MQA configs
     # group_size == 1 so this collapses to a single pass — same flops
@@ -283,7 +293,17 @@ def bwd_kernel[
                 var n: Int = flat - m * BN
                 var g_row: Int = q_row_base + m
                 var g_col: Int = kv_row_base + n
-                var s: Float32 = s_smem[m * BN + n] * scale_f - lse_smem[m]
+                # s_pre = (Q · K^T) * softmax_scale.
+                var s_pre: Float32 = s_smem[m * BN + n] * scale_f
+                # Apply softcap (if enabled). s_post is the value that
+                # actually feeds softmax: s_post = softcap*tanh(s_pre/softcap).
+                # Local derivative ds_post/ds_pre = 1 - (s_post/softcap)^2
+                # is stashed in sfcfac_smem for the dS rescale below.
+                var s_post: Float32 = s_pre
+                if has_softcap:
+                    s_post = softcap_f * tanh(s_pre * softcap_inv)
+                    var t: Float32 = s_post * softcap_inv
+                    sfcfac_smem[m * BN + n] = Float32(1) - t * t
                 var p: Float32
                 var masked: Bool = g_row >= seq_len or g_col >= seq_len
                 @parameter
@@ -293,7 +313,7 @@ def bwd_kernel[
                 if masked:
                     p = Float32(0)
                 else:
-                    p = exp(s)
+                    p = exp(s_post - lse_smem[m])
                 s_smem[m * BN + n] = p
 
             barrier()
@@ -339,7 +359,14 @@ def bwd_kernel[
                 var n: Int = flat - m * BN
                 var p: Float32 = s_smem[m * BN + n]
                 var dpv: Float32 = dp_smem[m * BN + n]
-                var ds: Float32 = p * (dpv - delta_smem[m]) * scale_f
+                # dS_post = P * (dP - delta). Chain through softcap:
+                # dS_pre = dS_post * (1 - (s_post/softcap)^2). Then bake
+                # softmax_scale into dS so the trailing matmuls land
+                # dq/dk pre-scaled (matches the pytorch fallback order).
+                var ds: Float32 = p * (dpv - delta_smem[m])
+                if has_softcap:
+                    ds = ds * sfcfac_smem[m * BN + n]
+                ds = ds * scale_f
                 s_smem[m * BN + n] = ds
 
             barrier()

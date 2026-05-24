@@ -226,6 +226,7 @@ def _bwd_dispatch_native_mvp(
     lse: torch.Tensor,
     softmax_scale: float,
     causal: bool,
+    softcap: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Native MVP backward: bf16 / head_dim=64 / optional causal / no MQA.
 
@@ -276,6 +277,7 @@ def _bwd_dispatch_native_mvp(
     native_bwd_main(
         q_k, k_k, v_k, dout_k, lse_c, delta, dk, dv, dqaccum, softmax_scale,
         causal=causal,
+        softcap=softcap,
     )
 
     # dq: (B, L, H, D) in q_k's dtype. The convert_dq kernel reads
@@ -328,8 +330,9 @@ def _bwd_dispatch(
     so the saved LSE matches the recomputed pre-softmax scores.
     """
     # ---- MVP native bwd routing.
-    # Inside the MVP envelope (bf16/fp16 cuda, head_dim=64, non-causal,
-    # no MQA, no softcap/alibi/window/dropout, equal seqlen) we call
+    # Inside the MVP envelope (bf16/fp16 cuda, head_dim=64, optional
+    # causal, MQA/GQA, optional softcap, no alibi/window/dropout,
+    # equal seqlen) we call
     # the native bwd kernel for dk/dv/dqaccum and the convert_dq kernel
     # for fp32 -> dtype. Outside the envelope we fall through to the
     # pytorch reference. The MVP envelope expands as feature commits
@@ -339,7 +342,6 @@ def _bwd_dispatch(
         and q.dtype in (torch.bfloat16, torch.float16)
         and q.shape[-1] == 64
         and q.shape[2] % k.shape[2] == 0  # MQA/GQA: Hq divisible by Hkv
-        and softcap == 0.0
         and alibi_slopes is None
         and window_size == _NO_WINDOW
         and dropout_p == 0.0
@@ -347,7 +349,7 @@ def _bwd_dispatch(
     )
     if _in_mvp_envelope:
         return _bwd_dispatch_native_mvp(
-            dout, q, k, v, out, lse, softmax_scale, causal,
+            dout, q, k, v, out, lse, softmax_scale, causal, softcap,
         )
 
     if dropout_p > 0.0:

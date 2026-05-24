@@ -29,6 +29,7 @@ def launch_bwd[
     nheads_q_int: Int,
     nheads_kv_int: Int,
     softmax_scale: Float32,
+    softcap: Float32,
     q_addr: Int,
     k_addr: Int,
     v_addr: Int,
@@ -82,11 +83,12 @@ def launch_bwd[
     comptime do_bytes: Int = kBwdBlockM * D * size_of[dtype]()
     comptime s_bytes: Int = kBwdBlockM * kBwdBlockN * 4  # fp32
     comptime dp_bytes: Int = kBwdBlockM * kBwdBlockN * 4
+    comptime sfcfac_bytes: Int = kBwdBlockM * kBwdBlockN * 4  # fp32 softcap fac
     comptime lse_bytes: Int = kBwdBlockM * 4
     comptime delta_bytes: Int = kBwdBlockM * 4
     comptime smem_bytes: Int = (
         k_bytes + v_bytes + q_bytes + do_bytes
-        + s_bytes + dp_bytes + lse_bytes + delta_bytes
+        + s_bytes + dp_bytes + sfcfac_bytes + lse_bytes + delta_bytes
     )
 
     var compiled = ctx.compile_function[
@@ -133,6 +135,7 @@ def launch_bwd[
             nheads_q_int,
             nheads_kv_int,
             softmax_scale,
+            softcap,
             q_ptr,
             k_ptr,
             v_ptr,
@@ -178,6 +181,7 @@ def launch_bwd[
             nheads_q_int,
             nheads_kv_int,
             softmax_scale,
+            softcap,
             q_ptr,
             k_ptr,
             v_ptr,

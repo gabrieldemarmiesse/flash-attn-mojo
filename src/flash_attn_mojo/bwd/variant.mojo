@@ -45,36 +45,37 @@ def bwd_main_variant(
     var nheads_q_int: Int = Int(py=args[11])
     var nheads_kv_int: Int = Int(py=args[12])
     var softmax_scale: Float32 = Float32(py=args[13])
-    var q_b_stride: Int = Int(py=args[14])
-    var q_l_stride: Int = Int(py=args[15])
-    var q_h_stride: Int = Int(py=args[16])
-    var k_b_stride: Int = Int(py=args[17])
-    var k_l_stride: Int = Int(py=args[18])
-    var k_h_stride: Int = Int(py=args[19])
-    var v_b_stride: Int = Int(py=args[20])
-    var v_l_stride: Int = Int(py=args[21])
-    var v_h_stride: Int = Int(py=args[22])
-    var do_b_stride: Int = Int(py=args[23])
-    var do_l_stride: Int = Int(py=args[24])
-    var do_h_stride: Int = Int(py=args[25])
-    var dk_b_stride: Int = Int(py=args[26])
-    var dk_l_stride: Int = Int(py=args[27])
-    var dk_h_stride: Int = Int(py=args[28])
-    var dv_b_stride: Int = Int(py=args[29])
-    var dv_l_stride: Int = Int(py=args[30])
-    var dv_h_stride: Int = Int(py=args[31])
-    var lse_b_stride: Int = Int(py=args[32])
-    var lse_h_stride: Int = Int(py=args[33])
-    var delta_b_stride: Int = Int(py=args[34])
-    var delta_h_stride: Int = Int(py=args[35])
-    var dqa_b_stride: Int = Int(py=args[36])
-    var dqa_h_stride: Int = Int(py=args[37])
-    var dqa_l_stride: Int = Int(py=args[38])
-    var stream_handle_addr: Int = Int(py=args[39])
-    # args[40..43] are comptime defines (dtype, head_dim, causal,
+    var softcap: Float32 = Float32(py=args[14])
+    var q_b_stride: Int = Int(py=args[15])
+    var q_l_stride: Int = Int(py=args[16])
+    var q_h_stride: Int = Int(py=args[17])
+    var k_b_stride: Int = Int(py=args[18])
+    var k_l_stride: Int = Int(py=args[19])
+    var k_h_stride: Int = Int(py=args[20])
+    var v_b_stride: Int = Int(py=args[21])
+    var v_l_stride: Int = Int(py=args[22])
+    var v_h_stride: Int = Int(py=args[23])
+    var do_b_stride: Int = Int(py=args[24])
+    var do_l_stride: Int = Int(py=args[25])
+    var do_h_stride: Int = Int(py=args[26])
+    var dk_b_stride: Int = Int(py=args[27])
+    var dk_l_stride: Int = Int(py=args[28])
+    var dk_h_stride: Int = Int(py=args[29])
+    var dv_b_stride: Int = Int(py=args[30])
+    var dv_l_stride: Int = Int(py=args[31])
+    var dv_h_stride: Int = Int(py=args[32])
+    var lse_b_stride: Int = Int(py=args[33])
+    var lse_h_stride: Int = Int(py=args[34])
+    var delta_b_stride: Int = Int(py=args[35])
+    var delta_h_stride: Int = Int(py=args[36])
+    var dqa_b_stride: Int = Int(py=args[37])
+    var dqa_h_stride: Int = Int(py=args[38])
+    var dqa_l_stride: Int = Int(py=args[39])
+    var stream_handle_addr: Int = Int(py=args[40])
+    # args[41..44] are comptime defines (dtype, head_dim, causal,
     # use_ext_stream); ctx_handle is appended by `call_bwd_main` as the
-    # 45th positional (index 44).
-    var ctx_handle_addr: Int = Int(py=args[44])
+    # 46th positional (index 45).
+    var ctx_handle_addr: Int = Int(py=args[45])
 
     if batch_int == 0 or seqlen_int == 0 or nheads_q_int == 0 or nheads_kv_int == 0:
         return PythonObject(None)
@@ -85,6 +86,7 @@ def bwd_main_variant(
         nheads_q_int,
         nheads_kv_int,
         softmax_scale,
+        softcap,
         q_addr,
         k_addr,
         v_addr,
