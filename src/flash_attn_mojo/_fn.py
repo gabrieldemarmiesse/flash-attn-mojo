@@ -442,6 +442,209 @@ def flash_attn_varlen_func(
     return out
 
 
+def flash_attn_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: torch.Tensor | None = None,
+    v: torch.Tensor | None = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
+    cache_seqlens: int | torch.Tensor | None = None,
+    cache_batch_idx: torch.Tensor | None = None,
+    cache_leftpad: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    window_size: tuple[int, int] = _NO_WINDOW,
+    softcap: float = 0.0,
+    rotary_interleaved: bool = True,
+    alibi_slopes: torch.Tensor | None = None,
+    num_splits: int = 0,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """KV-cache attention.
+
+    q: (batch, seqlen_q, nheads_q, head_dim).
+    k_cache, v_cache: (batch, seqlen_cache, nheads_kv, head_dim). When
+        `k` / `v` are provided they are appended into these tensors at
+        offset `cache_seqlens[b]` (in place), and `cache_seqlens` is
+        incremented by `seqlen_new` in place (matching upstream).
+    k, v: (batch, seqlen_new, nheads_kv, head_dim) — new tokens to
+        append to the cache. Optional.
+    cache_seqlens: int or (batch,) int32 tensor — current valid length
+        per batch. None ⇒ full cache (`seqlen_cache`).
+
+    Current limitations (first-cut python wrapper):
+    - The underlying mojo fwd kernel requires `seqlen_q == seqlen_k`.
+      So this entry point only supports the case where, after the
+      optional append, every batch element has its used K/V length
+      exactly equal to `seqlen_q`. The typical autoregressive decode
+      shape (`seqlen_q=1`, `seqlen_k=large`) raises NotImplementedError.
+    - Not supported (raise NotImplementedError):
+      rotary_cos / rotary_sin, cache_batch_idx, cache_leftpad,
+      block_table, num_splits != 0.
+    """
+    if rotary_cos is not None or rotary_sin is not None:
+        raise NotImplementedError(
+            "flash_attn_mojo.flash_attn_with_kvcache: rotary embeddings "
+            "(rotary_cos / rotary_sin) are not supported yet."
+        )
+    if cache_batch_idx is not None:
+        raise NotImplementedError(
+            "flash_attn_mojo.flash_attn_with_kvcache: cache_batch_idx is "
+            "not supported yet."
+        )
+    if cache_leftpad is not None:
+        raise NotImplementedError(
+            "flash_attn_mojo.flash_attn_with_kvcache: cache_leftpad is "
+            "not supported yet."
+        )
+    if block_table is not None:
+        raise NotImplementedError(
+            "flash_attn_mojo.flash_attn_with_kvcache: block_table (paged "
+            "KV) is not supported yet."
+        )
+    if num_splits not in (0, 1):
+        raise NotImplementedError(
+            "flash_attn_mojo.flash_attn_with_kvcache: num_splits != 0/1 "
+            f"(got {num_splits}) is not supported."
+        )
+
+    if q.dim() != 4 or k_cache.dim() != 4 or v_cache.dim() != 4:
+        raise ValueError(
+            "q, k_cache, v_cache must be 4-D "
+            "(batch, seqlen, nheads, head_dim)."
+        )
+
+    batch, seqlen_q, _nheads_q, _D = q.shape
+    seqlen_cache = k_cache.shape[1]
+    if v_cache.shape[1] != seqlen_cache:
+        raise ValueError(
+            "k_cache and v_cache must share their seqlen dim "
+            f"(got {k_cache.shape[1]} vs {v_cache.shape[1]})."
+        )
+    if k_cache.shape[0] != batch or v_cache.shape[0] != batch:
+        raise ValueError(
+            "q, k_cache, v_cache must share batch dim "
+            f"(got {q.shape[0]}, {k_cache.shape[0]}, {v_cache.shape[0]})."
+        )
+
+    # Normalise cache_seqlens to a (batch,) int64 host list for the
+    # per-batch loop; keep the original tensor so we can update it
+    # in place when we append.
+    cache_seqlens_t: torch.Tensor | None
+    if cache_seqlens is None:
+        cache_seqlens_host = [seqlen_cache] * batch
+        cache_seqlens_t = None
+    elif isinstance(cache_seqlens, int):
+        cache_seqlens_host = [int(cache_seqlens)] * batch
+        cache_seqlens_t = None
+    else:
+        if cache_seqlens.dim() != 1 or cache_seqlens.shape[0] != batch:
+            raise ValueError(
+                f"cache_seqlens must be a (batch,) tensor; got shape "
+                f"{tuple(cache_seqlens.shape)} for batch={batch}."
+            )
+        cache_seqlens_t = cache_seqlens
+        cache_seqlens_host = cache_seqlens.detach().to(
+            "cpu", dtype=torch.int64
+        ).tolist()
+
+    # Validate append shapes and figure out the post-append used length
+    # per batch.
+    if (k is None) != (v is None):
+        raise ValueError("k and v must both be provided, or both None.")
+    if k is not None:
+        assert v is not None
+        if k.dim() != 4 or v.dim() != 4:
+            raise ValueError("k, v must be 4-D (batch, seqlen_new, nheads_kv, head_dim).")
+        if k.shape[0] != batch or v.shape[0] != batch:
+            raise ValueError(
+                "k, v batch dim must match q "
+                f"(got {k.shape[0]}, {v.shape[0]}, expected {batch})."
+            )
+        seqlen_new = k.shape[1]
+        if v.shape[1] != seqlen_new:
+            raise ValueError(
+                f"k and v must share seqlen_new (got {k.shape[1]} vs "
+                f"{v.shape[1]})."
+            )
+        if k.shape[2] != k_cache.shape[2] or v.shape[2] != v_cache.shape[2]:
+            raise ValueError(
+                "k/v nheads_kv must match k_cache/v_cache."
+            )
+    else:
+        seqlen_new = 0
+
+    used_lengths = [cache_seqlens_host[b] + seqlen_new for b in range(batch)]
+
+    # Mojo fwd kernel needs seqlen_q == seqlen_k. Reject the decode
+    # shape (seqlen_q < used_length) up front so users see a clear error
+    # instead of a confusing kernel failure.
+    for b in range(batch):
+        if used_lengths[b] != seqlen_q:
+            raise NotImplementedError(
+                "flash_attn_mojo.flash_attn_with_kvcache currently requires "
+                f"seqlen_q == used_kv_length per batch (batch {b}: "
+                f"seqlen_q={seqlen_q}, used_kv={used_lengths[b]}). The "
+                "underlying mojo fwd kernel does not yet handle "
+                "seqlen_q != seqlen_k (the autoregressive decode shape); "
+                "this is separate work."
+            )
+        if used_lengths[b] > seqlen_cache:
+            raise ValueError(
+                f"cache overflow on batch {b}: cache_seqlens={cache_seqlens_host[b]}"
+                f" + seqlen_new={seqlen_new} > seqlen_cache={seqlen_cache}."
+            )
+
+    # Append new k/v into the cache slots and update cache_seqlens.
+    if k is not None:
+        assert v is not None
+        for b in range(batch):
+            start = cache_seqlens_host[b]
+            end = start + seqlen_new
+            k_cache[b, start:end].copy_(k[b])
+            v_cache[b, start:end].copy_(v[b])
+        if cache_seqlens_t is not None:
+            cache_seqlens_t.add_(seqlen_new)
+
+    # Per-batch attention. Slices are non-contiguous along seqlen
+    # because k_cache[b, :used] is a view into a (B, L, H, D) tensor;
+    # the inner (nheads, head_dim) is still contiguous which is what
+    # the kernel cares about. We unsqueeze the batch dim for each call.
+    out = torch.empty_like(q)
+    for b in range(batch):
+        used = used_lengths[b]
+        if alibi_slopes is None:
+            alibi_b = None
+        elif alibi_slopes.dim() == 1:
+            alibi_b = alibi_slopes
+        elif alibi_slopes.dim() == 2:
+            alibi_b = alibi_slopes[b]
+        else:
+            raise ValueError(
+                "alibi_slopes must be 1-D (nheads,) or 2-D (batch, nheads)."
+            )
+
+        q_b = q[b : b + 1]                            # (1, seqlen_q, Hq, D)
+        k_b = k_cache[b : b + 1, :used].contiguous()  # (1, used, Hkv, D)
+        v_b = v_cache[b : b + 1, :used].contiguous()
+        out_b = flash_attn_func(
+            q_b, k_b, v_b,
+            dropout_p=0.0,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_b,
+            deterministic=False,
+            return_attn_probs=False,
+        )
+        out[b : b + 1] = out_b
+
+    return out
+
+
 def flash_attn_qkvpacked_func(
     qkv: torch.Tensor,
     dropout_p: float = 0.0,

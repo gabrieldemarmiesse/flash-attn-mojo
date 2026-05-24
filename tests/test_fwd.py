@@ -645,3 +645,86 @@ def test_varlen_mismatched_qk_raises():
             q, k, v, cu_q, cu_k,
             max_seqlen_q=64, max_seqlen_k=32,
         )
+
+
+def test_kvcache_prefill_basic():
+    """Pre-filled k_cache/v_cache, no new k/v. q runs against the full
+    cache and must match a direct flash_attn_func call on the same
+    K/V."""
+    torch.manual_seed(0)
+    B, L, H, D = 2, 128, 1, 64
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    k_cache = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v_cache = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    cache_seqlens = torch.full((B,), L, dtype=torch.int32, device="cuda")
+
+    out_kvc = flash_attn_mojo.flash_attn_with_kvcache(
+        q, k_cache, v_cache, cache_seqlens=cache_seqlens, causal=True,
+    )
+    out_ref = flash_attn_mojo.flash_attn_func(
+        q, k_cache, v_cache, causal=True,
+    )
+    diff = _max_abs(out_kvc, out_ref)
+    assert diff < 5e-2, f"kvcache prefill: max |diff|={diff:.3e}"
+    # cache_seqlens must be unchanged when no new k/v was appended.
+    assert torch.equal(
+        cache_seqlens,
+        torch.full((B,), L, dtype=torch.int32, device="cuda"),
+    )
+
+
+def test_kvcache_append_then_attend():
+    """Pre-fill cache to L=64, append L=64 new tokens, attend against
+    the full 128. Must match a direct flash_attn_func on the
+    concatenated K/V, and cache_seqlens must be updated in-place."""
+    torch.manual_seed(1)
+    B, L0, Lnew, H, D = 2, 64, 64, 1, 64
+    Ltotal = L0 + Lnew
+
+    # Allocate full-size cache and fill the first L0 slots with known data.
+    k_full = torch.randn(B, Ltotal, H, D, dtype=torch.bfloat16, device="cuda")
+    v_full = torch.randn(B, Ltotal, H, D, dtype=torch.bfloat16, device="cuda")
+    k_cache = torch.zeros_like(k_full)
+    v_cache = torch.zeros_like(v_full)
+    k_cache[:, :L0].copy_(k_full[:, :L0])
+    v_cache[:, :L0].copy_(v_full[:, :L0])
+
+    # The "new" tokens to append.
+    k_new = k_full[:, L0:].contiguous()
+    v_new = v_full[:, L0:].contiguous()
+
+    q = torch.randn(B, Ltotal, H, D, dtype=torch.bfloat16, device="cuda")
+    cache_seqlens = torch.full((B,), L0, dtype=torch.int32, device="cuda")
+
+    out_kvc = flash_attn_mojo.flash_attn_with_kvcache(
+        q, k_cache, v_cache, k=k_new, v=v_new,
+        cache_seqlens=cache_seqlens, causal=True,
+    )
+    # cache_seqlens incremented by Lnew, in place.
+    assert torch.equal(
+        cache_seqlens,
+        torch.full((B,), L0 + Lnew, dtype=torch.int32, device="cuda"),
+    )
+    # The cache itself must equal the concatenated K/V.
+    assert torch.equal(k_cache, k_full)
+    assert torch.equal(v_cache, v_full)
+
+    out_ref = flash_attn_mojo.flash_attn_func(
+        q, k_full, v_full, causal=True,
+    )
+    diff = _max_abs(out_kvc, out_ref)
+    assert diff < 5e-2, f"kvcache append: max |diff|={diff:.3e}"
+
+
+def test_kvcache_decode_not_supported():
+    """seqlen_q=1 with a large cache must raise NotImplementedError
+    with a clear message — the underlying kernel needs seqlen_q == seqlen_k."""
+    B, L, H, D = 1, 128, 1, 64
+    q = torch.randn(B, 1, H, D, dtype=torch.bfloat16, device="cuda")
+    k_cache = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v_cache = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    cache_seqlens = torch.full((B,), L, dtype=torch.int32, device="cuda")
+    with pytest.raises(NotImplementedError, match="seqlen_q == used_kv_length"):
+        flash_attn_mojo.flash_attn_with_kvcache(
+            q, k_cache, v_cache, cache_seqlens=cache_seqlens,
+        )
