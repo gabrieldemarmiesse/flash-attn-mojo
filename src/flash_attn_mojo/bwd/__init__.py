@@ -1,10 +1,11 @@
 """GPU backward subpackage: kernel + JIT dispatcher + Python wrapper.
 
-STATUS: partial — `native_bwd_preprocess` is implemented (computes
-`delta = rowsum(dO * O)` on-device). The full `native_bwd` (dq, dk, dv
-matmuls) is still a TODO; the autograd backward in `_fn.py` currently
-calls into the preprocess kernel for `delta` and falls back to pytorch
-for the rest.
+STATUS: MVP main bwd kernel (`native_bwd_main`) added alongside the
+existing `native_bwd_preprocess`. The MVP envelope is bf16 / head_dim=64
+/ non-causal / no MQA / no softcap-alibi-window-dropout / equal seqlen.
+Outside that envelope (and by default until correctness is verified)
+the autograd backward in `_fn.py` still falls back to the pure-pytorch
+reference path.
 """
 
 from __future__ import annotations
@@ -12,29 +13,6 @@ from __future__ import annotations
 import torch
 
 from flash_attn_mojo._dtype import _DTYPE_CODE
-
-
-def native_bwd(
-    dout: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    out: torch.Tensor,
-    lse: torch.Tensor,
-    dq: torch.Tensor,
-    dk: torch.Tensor,
-    dv: torch.Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    causal: bool,
-) -> None:
-    """JIT-compile + dispatch the GPU backward kernel.
-
-    Placeholder until the full bwd kernel is implemented.
-    """
-    raise NotImplementedError(
-        "flash_attn_mojo.bwd.native_bwd: kernel not implemented yet"
-    )
 
 
 def native_bwd_preprocess(
@@ -100,6 +78,89 @@ def native_bwd_preprocess(
             dqaccum.stride(2),
             torch.cuda.current_stream().cuda_stream,
             _DTYPE_CODE[dout.dtype],
+            head_dim,
+            1,  # use_external_stream
+        )
+    )
+
+
+def native_bwd_main(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    delta: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    dqaccum: torch.Tensor,
+    softmax_scale: float,
+) -> None:
+    """JIT-compile (if needed) and dispatch the main bwd kernel.
+
+    MVP envelope: bf16, head_dim=64, non-causal, no MQA. Outputs dk/dv
+    are written directly; dq is accumulated into ``dqaccum`` (fp32) and
+    must be converted to dq's dtype by the caller (eventual convert_dq
+    kernel; pytorch one-liner for the MVP).
+
+    q, k, v, dout: (B, L, H, D) bf16.
+    lse, delta:    (B, H, L) fp32.
+    dk, dv:        (B, L, H, D) bf16 — same shape as k, v.
+    dqaccum:       (B, H, L, D) fp32 — pre-zeroed by preprocess kernel.
+    """
+    from flash_attn_mojo.bwd._main_jit import call_bwd_main
+
+    assert q.dtype == k.dtype == v.dtype == dout.dtype, (
+        "q, k, v, dout must share dtype"
+    )
+    assert lse.dtype == torch.float32 and delta.dtype == torch.float32
+    assert dqaccum.dtype == torch.float32
+    assert lse.is_contiguous() and delta.is_contiguous()
+
+    batch, seqlen, nheads, head_dim = q.shape
+
+    call_bwd_main(
+        (
+            q.data_ptr(),
+            k.data_ptr(),
+            v.data_ptr(),
+            dout.data_ptr(),
+            lse.data_ptr(),
+            delta.data_ptr(),
+            dk.data_ptr(),
+            dv.data_ptr(),
+            dqaccum.data_ptr(),
+            batch,
+            seqlen,
+            nheads,
+            float(softmax_scale),
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            dout.stride(0),
+            dout.stride(1),
+            dout.stride(2),
+            dk.stride(0),
+            dk.stride(1),
+            dk.stride(2),
+            dv.stride(0),
+            dv.stride(1),
+            dv.stride(2),
+            lse.stride(0),
+            lse.stride(1),
+            delta.stride(0),
+            delta.stride(1),
+            dqaccum.stride(0),
+            dqaccum.stride(1),
+            dqaccum.stride(2),
+            torch.cuda.current_stream().cuda_stream,
+            _DTYPE_CODE[q.dtype],
             head_dim,
             1,  # use_external_stream
         )

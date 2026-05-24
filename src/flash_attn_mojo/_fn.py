@@ -217,6 +217,71 @@ def _fwd_dispatch(
     return out, lse, rng_state
 
 
+def _bwd_dispatch_native_mvp(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Native MVP backward: bf16 / head_dim=64 / non-causal / no MQA.
+
+    Allocates delta, dqaccum, dk, dv. Calls native_bwd_preprocess to
+    fill delta + zero dqaccum. Calls native_bwd_main to fill dk, dv
+    and atomic-add dq contributions into dqaccum. Casts dqaccum (fp32)
+    to dq (bf16/fp16) via torch — the dedicated convert_dq kernel
+    lands in a subsequent commit.
+
+    fp16 inputs are bf16-cast at the API boundary (same pattern as
+    the fwd kernel) since the bwd kernel only specialises on bf16
+    for the MVP.
+    """
+    from flash_attn_mojo.bwd import native_bwd_preprocess, native_bwd_main
+
+    orig_dtype = q.dtype
+    if orig_dtype == torch.float16:
+        q_k = q.to(torch.bfloat16)
+        k_k = k.to(torch.bfloat16)
+        v_k = v.to(torch.bfloat16)
+        out_k = out.to(torch.bfloat16)
+        dout_k = dout.to(torch.bfloat16)
+    else:
+        q_k, k_k, v_k, out_k, dout_k = q, k, v, out, dout
+
+    # All inputs must be contiguous and use the canonical (B, L, H, D) /
+    # (B, H, L) layout the kernel expects. The autograd wrapper passes
+    # contiguous tensors already, but be defensive.
+    q_k = q_k.contiguous()
+    k_k = k_k.contiguous()
+    v_k = v_k.contiguous()
+    out_k = out_k.contiguous()
+    dout_k = dout_k.contiguous()
+    lse_c = lse.contiguous()
+
+    B, L, H, D = q_k.shape
+
+    delta = torch.empty(B, H, L, dtype=torch.float32, device=q_k.device)
+    dqaccum = torch.empty(B, H, L, D, dtype=torch.float32, device=q_k.device)
+    native_bwd_preprocess(dout_k, out_k, delta, dqaccum)
+
+    dk = torch.empty_like(k_k)
+    dv = torch.empty_like(v_k)
+    native_bwd_main(
+        q_k, k_k, v_k, dout_k, lse_c, delta, dk, dv, dqaccum, softmax_scale,
+    )
+
+    dq = dqaccum.to(q_k.dtype).transpose(1, 2).contiguous()
+    # The native kernel writes dk/dv directly in the (B, L, H, D) layout.
+
+    if orig_dtype == torch.float16:
+        dq = dq.to(torch.float16)
+        dk = dk.to(torch.float16)
+        dv = dv.to(torch.float16)
+    return dq, dk, dv
+
+
 def _bwd_dispatch(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -252,6 +317,34 @@ def _bwd_dispatch(
     alibi, window, causal exactly mirrors the fwd reference's order
     so the saved LSE matches the recomputed pre-softmax scores.
     """
+    # ---- MVP native bwd routing.
+    # Gated behind FLASH_ATTN_MOJO_NATIVE_BWD=1 until correctness is
+    # verified across the test suite. Inside the MVP envelope (bf16,
+    # head_dim=64, non-causal, no MQA, no softcap/alibi/window/dropout,
+    # equal seqlen, cuda) we call the native bwd kernel for dk/dv and
+    # dqaccum and convert dq from fp32 via a torch one-liner. Outside
+    # the envelope (or when the flag is off) we fall through to the
+    # pytorch reference.
+    import os as _os
+    _native_bwd_enabled = _os.environ.get("FLASH_ATTN_MOJO_NATIVE_BWD", "0") == "1"
+    _in_mvp_envelope = (
+        _native_bwd_enabled
+        and dout.is_cuda
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and q.shape[-1] == 64
+        and not causal
+        and q.shape[2] == k.shape[2]  # no MQA
+        and softcap == 0.0
+        and alibi_slopes is None
+        and window_size == _NO_WINDOW
+        and dropout_p == 0.0
+        and q.shape[1] == k.shape[1]  # equal seqlen
+    )
+    if _in_mvp_envelope:
+        return _bwd_dispatch_native_mvp(
+            dout, q, k, v, out, lse, softmax_scale,
+        )
+
     if dropout_p > 0.0:
         # Faithfully replaying upstream's dropout RNG in PyTorch is
         # nontrivial (kernel-side Philox seed/offset over the (B,H,L_q,L_k)
