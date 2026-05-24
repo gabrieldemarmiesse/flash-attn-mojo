@@ -308,9 +308,16 @@ def fwd_kernel[
     var q_gmem_iter = q_gmem_block.tiled_iterator[BM, BK, axis=1](0, 0)
 
     comptime q_num_vecs: Int = BM * BK // simd_size
+    # One-frag-per-thread layout for Q's (BM, BK) = (64, 32) tile (8-elt vecs):
+    # (64 rows × 4 vec_cols) = 256 vec entries, 128 threads → 2 per thread.
+    # Default (32, 4) layout has each thread writing two rows (r and r+32)
+    # one col apart, which trips the same swizzled-async-copy bug as the
+    # V (16, 8) layout (row r+32 lands at the wrong physical smem cell
+    # for the last-row group → row 63 of Q comes out wrong). Pin to one
+    # vec per thread along the row axis (64 × 2 thread layout).
     comptime async_copy_q_layout = Layout.row_major(
-        min(num_threads, q_num_vecs) * simd_size // BK,
-        BK // simd_size,
+        BM,
+        num_threads // BM,
     )
 
     comptime for q_id in range(depth // BK):
@@ -397,11 +404,11 @@ def fwd_kernel[
         _ = p_reg_tile.fill(0)
 
         comptime kv_num_vecs: Int = BN * BK // simd_size
+        # Same swizzle-aware layout fix as Q: one vec entry per row per thread
+        # to avoid the (32, 4) layout's row-31/row-63 swizzle aliasing.
         comptime async_copy_k_layout = Layout.row_major(
-            min(num_threads, kv_num_vecs)
-            * simd_size
-            // k_smem_iter.layout.stride[0].value(),
-            k_smem_iter.layout.stride[0].value() // simd_size,
+            BN,
+            num_threads // BN,
         )
 
         comptime for k_id in range(depth // BK):
@@ -498,17 +505,14 @@ def fwd_kernel[
             rowsum,
         )
 
-        # V's smem tile is (BK, BN) — distinct from K's (BN, BK). The
-        # auto-derived (BN/simd_size, simd_size)-style layout used for K
-        # / Q gives (16, 8) for V, which has 2 dst frags per thread
-        # spanning rows ti and ti+16. The stdlib's swizzled copy formula
-        # `swizzle(base + idx_base) + idx_diff - base` produces the
-        # wrong physical address for the second fragment (the row
-        # ti+16 write) when row_size and stride hit this swizzle
-        # window — observed as "smem V row 31 holds V[16] data" and
-        # downstream P·V picks up the corrupted row.
-        # Pin the V copy to a one-frag-per-thread layout (32 rows × 4
-        # cols, each thread one vec) which sidesteps that swizzle bug.
+        # V's smem tile is (BK, BN). Use the same one-vec-per-row async
+        # copy layout as Q and K (see comment above q's layout). With the
+        # default (BN/simd_size, simd_size) = (16, 8) layout each thread
+        # writes two destination fragments (rows ti and ti+16); the
+        # stdlib's swizzled-async-copy formula then produces the wrong
+        # physical address for the second fragment and V's row 31 ends up
+        # holding V[16] data. Pin to one frag per thread (32 rows × 4
+        # cols) to dodge the swizzle aliasing.
         comptime async_copy_v_layout = Layout.row_major(
             v_smem_iter.layout.shape[0].value(),
             num_threads // v_smem_iter.layout.shape[0].value(),
