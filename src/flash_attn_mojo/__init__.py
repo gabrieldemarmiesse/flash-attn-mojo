@@ -38,6 +38,7 @@ from flash_attn_mojo._fn import (  # noqa: E402
     flash_attn_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
+    flash_attn_varlen_func,
 )
 from flash_attn_mojo.reference import flash_attn_ref  # noqa: E402
 
@@ -48,4 +49,5 @@ __all__ = [
     "flash_attn_kvpacked_func",
     "flash_attn_qkvpacked_func",
     "flash_attn_ref",
+    "flash_attn_varlen_func",
 ]

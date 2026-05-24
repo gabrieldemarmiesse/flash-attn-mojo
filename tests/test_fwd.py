@@ -529,3 +529,119 @@ def test_dropout_basic():
         f"averaged dropout output too far from no-drop baseline: "
         f"avg_diff={avg_diff:.3e}, nodrop_mag={nodrop_mag:.3e}"
     )
+
+
+# ----------------------------------------------------------------------------
+# Varlen / packed-batch API
+# ----------------------------------------------------------------------------
+
+
+def _pack_varlen(seqlens, H, D, dtype=torch.bfloat16, device="cuda", seed=0):
+    """Build a packed (total, H, D) Q/K/V triple plus cu_seqlens, returning
+    also the per-batch unpacked (1, L, H, D) tensors for cross-check."""
+    torch.manual_seed(seed)
+    qs, ks, vs = [], [], []
+    per_batch = []
+    for L in seqlens:
+        q_b = torch.randn(1, L, H, D, dtype=dtype, device=device)
+        k_b = torch.randn(1, L, H, D, dtype=dtype, device=device)
+        v_b = torch.randn(1, L, H, D, dtype=dtype, device=device)
+        qs.append(q_b.squeeze(0))
+        ks.append(k_b.squeeze(0))
+        vs.append(v_b.squeeze(0))
+        per_batch.append((q_b, k_b, v_b))
+    q = torch.cat(qs, dim=0).contiguous()
+    k = torch.cat(ks, dim=0).contiguous()
+    v = torch.cat(vs, dim=0).contiguous()
+    cu = torch.tensor(
+        [0] + list(torch.tensor(seqlens).cumsum(0).tolist()),
+        dtype=torch.int32, device=device,
+    )
+    return q, k, v, cu, per_batch
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_varlen_basic(causal):
+    """Packed-batch varlen output matches per-element flash_attn_func."""
+    seqlens = [64, 128, 96]
+    H, D = 1, 64
+    q, k, v, cu, per_batch = _pack_varlen(seqlens, H, D, seed=0)
+
+    out = flash_attn_mojo.flash_attn_varlen_func(
+        q, k, v, cu, cu,
+        max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens),
+        causal=causal,
+    )
+
+    start = 0
+    for (q_b, k_b, v_b), L in zip(per_batch, seqlens):
+        out_b_ref = flash_attn_mojo.flash_attn_func(
+            q_b, k_b, v_b, causal=causal
+        )
+        out_b = out[start:start + L]
+        assert torch.equal(out_b, out_b_ref.squeeze(0)), (
+            f"varlen slice mismatch at start={start}, L={L}"
+        )
+        start += L
+
+
+def test_varlen_causal():
+    """Same as basic, but explicitly causal=True (separate name for clarity)."""
+    seqlens = [16, 33, 80]  # one unaligned (33)
+    H, D = 1, 64
+    q, k, v, cu, per_batch = _pack_varlen(seqlens, H, D, seed=1)
+
+    out = flash_attn_mojo.flash_attn_varlen_func(
+        q, k, v, cu, cu,
+        max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens),
+        causal=True,
+    )
+
+    start = 0
+    for (q_b, k_b, v_b), L in zip(per_batch, seqlens):
+        out_b_ref = flash_attn_mojo.flash_attn_func(
+            q_b, k_b, v_b, causal=True
+        )
+        assert torch.equal(out[start:start + L], out_b_ref.squeeze(0))
+        start += L
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_varlen_matches_upstream(causal):
+    """Cross-check against upstream `flash_attn_varlen_func` within bf16 tol."""
+    try:
+        from flash_attn import flash_attn_varlen_func as upstream_varlen
+    except ImportError:
+        pytest.skip("upstream flash-attn not available")
+
+    seqlens = [64, 128, 96]
+    H, D = 1, 64
+    q, k, v, cu, _ = _pack_varlen(seqlens, H, D, seed=2)
+
+    out_mojo = flash_attn_mojo.flash_attn_varlen_func(
+        q, k, v, cu, cu,
+        max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens),
+        causal=causal,
+    )
+    out_up = upstream_varlen(
+        q, k, v, cu, cu, max(seqlens), max(seqlens), causal=causal,
+    )
+
+    diff = _max_abs(out_mojo, out_up)
+    assert diff < 5e-2, f"varlen vs upstream: max |diff|={diff:.3e}"
+
+
+def test_varlen_mismatched_qk_raises():
+    """If seqlen_q_b != seqlen_k_b for any batch element, raise clearly."""
+    H, D = 1, 64
+    # batch=2: seqlens_q=[32, 64], seqlens_k=[32, 32] -> batch 1 mismatched.
+    q = torch.randn(32 + 64, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(32 + 32, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(32 + 32, H, D, dtype=torch.bfloat16, device="cuda")
+    cu_q = torch.tensor([0, 32, 32 + 64], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, 32, 32 + 32], dtype=torch.int32, device="cuda")
+    with pytest.raises(NotImplementedError, match="seqlen_q_b == seqlen_k_b"):
+        flash_attn_mojo.flash_attn_varlen_func(
+            q, k, v, cu_q, cu_k,
+            max_seqlen_q=64, max_seqlen_k=32,
+        )

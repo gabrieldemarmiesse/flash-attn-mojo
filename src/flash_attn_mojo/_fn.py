@@ -305,6 +305,143 @@ def flash_attn_func(
     return result
 
 
+def flash_attn_varlen_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float = 0.0,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    window_size: tuple[int, int] = _NO_WINDOW,
+    softcap: float = 0.0,
+    alibi_slopes: torch.Tensor | None = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+    block_table: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Variable-length / packed-batch attention.
+
+    q: (total_q, nheads_q, head_dim).
+    k, v: (total_k, nheads_kv, head_dim).
+    cu_seqlens_q, cu_seqlens_k: (batch+1,) int32 prefix sums of the
+        per-batch seqlens.
+    max_seqlen_q, max_seqlen_k: ints (currently informational; the
+        wrapper slices and dispatches per-batch).
+
+    Current limitations of this first-cut implementation:
+    - Python-level wrapper: loops over batches on the host, slices Q/K/V,
+      calls `flash_attn_func` per slice. Correct but slow; a kernel-side
+      varlen path is separate work.
+    - Requires `seqlen_q_b == seqlen_k_b` for every batch element b — our
+      current kernel doesn't yet handle different Q/K seqlens. Raises
+      `NotImplementedError` otherwise.
+    - `block_table` (paged KV) is not supported.
+    - `return_attn_probs=True` returns the per-batch LSEs concatenated
+      along the seqlen axis as `(nheads_q, total_q)` to roughly match
+      upstream's shape; `rng_state` is propagated from the last batch
+      element when dropout is active (not a faithful varlen RNG).
+    """
+    if block_table is not None:
+        raise NotImplementedError(
+            "flash_attn_mojo.flash_attn_varlen_func: block_table (paged KV) "
+            "is not supported yet."
+        )
+    if cu_seqlens_q.dim() != 1 or cu_seqlens_k.dim() != 1:
+        raise ValueError(
+            "cu_seqlens_q and cu_seqlens_k must be 1-D tensors."
+        )
+    if cu_seqlens_q.shape[0] != cu_seqlens_k.shape[0]:
+        raise ValueError(
+            "cu_seqlens_q and cu_seqlens_k must have the same length "
+            f"(got {cu_seqlens_q.shape[0]} vs {cu_seqlens_k.shape[0]})."
+        )
+    batch = cu_seqlens_q.shape[0] - 1
+    if batch < 1:
+        raise ValueError(
+            f"cu_seqlens_q implies batch={batch}; need at least 1."
+        )
+
+    # Materialise the prefix sums on host once (one D->H sync, not 2*batch).
+    cu_q = cu_seqlens_q.detach().to("cpu", dtype=torch.int64).tolist()
+    cu_k = cu_seqlens_k.detach().to("cpu", dtype=torch.int64).tolist()
+
+    # Pre-validate per-batch shape compatibility before doing any work.
+    for b in range(batch):
+        Lq = cu_q[b + 1] - cu_q[b]
+        Lk = cu_k[b + 1] - cu_k[b]
+        if Lq != Lk:
+            raise NotImplementedError(
+                "flash_attn_mojo.flash_attn_varlen_func currently requires "
+                f"seqlen_q_b == seqlen_k_b for every batch element (batch "
+                f"{b}: seqlen_q={Lq}, seqlen_k={Lk}). The underlying kernel "
+                "does not yet handle Q/K seqlen mismatch; this is separate "
+                "work."
+            )
+
+    nheads_q = q.shape[1]
+    out = torch.empty_like(q)
+    # Per-batch LSE collection (only when return_attn_probs).
+    lse_chunks: list[torch.Tensor] = []
+    rng_state_last: torch.Tensor | None = None
+
+    for b in range(batch):
+        sq, eq = cu_q[b], cu_q[b + 1]
+        sk, ek = cu_k[b], cu_k[b + 1]
+        if eq == sq:
+            # Empty batch element — nothing to do (out slice is already empty).
+            continue
+        # ALiBi slopes: per-(batch, nheads_q) entries flatten to the b-th row.
+        alibi_b: torch.Tensor | None
+        if alibi_slopes is None:
+            alibi_b = None
+        elif alibi_slopes.dim() == 1:
+            alibi_b = alibi_slopes
+        elif alibi_slopes.dim() == 2:
+            alibi_b = alibi_slopes[b]
+        else:
+            raise ValueError(
+                "alibi_slopes must be 1-D (nheads,) or 2-D (batch, nheads)."
+            )
+
+        q_b = q[sq:eq].unsqueeze(0)  # (1, L, nheads_q, D)
+        k_b = k[sk:ek].unsqueeze(0)  # (1, L, nheads_kv, D)
+        v_b = v[sk:ek].unsqueeze(0)
+        res = flash_attn_func(
+            q_b, k_b, v_b,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_b,
+            deterministic=deterministic,
+            return_attn_probs=return_attn_probs,
+        )
+        if return_attn_probs:
+            out_b, lse_b, rng_b = res
+            # lse_b: (1, nheads_q, L) -> (nheads_q, L)
+            lse_chunks.append(lse_b.squeeze(0))
+            if rng_b is not None:
+                rng_state_last = rng_b
+        else:
+            out_b = res
+        out[sq:eq] = out_b.squeeze(0)
+
+    if return_attn_probs:
+        if lse_chunks:
+            lse_full = torch.cat(lse_chunks, dim=-1)  # (nheads_q, total_q)
+        else:
+            lse_full = torch.empty(
+                nheads_q, 0, dtype=torch.float32, device=q.device
+            )
+        return out, lse_full, rng_state_last
+    return out
+
+
 def flash_attn_qkvpacked_func(
     qkv: torch.Tensor,
     dropout_p: float = 0.0,
