@@ -243,6 +243,27 @@ def test_bwd_preprocess_clears_dqaccum(D, L):
     )
 
 
+def test_bwd_convert_dq_correctness():
+    """The Mojo convert-dQ kernel casts fp32 dqaccum (B, H, L, D) to
+    bf16 dq (B, L, H, D). Comparison is to pytorch's
+    `dqaccum.transpose(1, 2).to(bf16)` — both perform per-element
+    fp32->bf16 casts, so the result must be bit-identical."""
+    from flash_attn_mojo.bwd import native_bwd_convert_dq
+
+    B, L, H, D = 2, 192, 3, 64
+    g = torch.Generator(device="cuda").manual_seed(0)
+    dqaccum = torch.randn(B, H, L, D, dtype=torch.float32, device="cuda", generator=g)
+
+    dq_mojo = torch.empty(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    native_bwd_convert_dq(dqaccum, dq_mojo)
+
+    dq_ref = dqaccum.transpose(1, 2).contiguous().to(torch.bfloat16)
+    assert torch.equal(dq_mojo, dq_ref), (
+        "convert_dq output not bit-equal to pytorch cast: "
+        f"max diff {(dq_mojo.float() - dq_ref.float()).abs().max().item()}"
+    )
+
+
 def test_backward_dropout_raises():
     B, L, H, D = 1, 32, 1, 64
     q, k, v = _make_qkv(B, L, H, D)

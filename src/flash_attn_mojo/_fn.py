@@ -238,7 +238,11 @@ def _bwd_dispatch_native_mvp(
     the fwd kernel) since the bwd kernel only specialises on bf16
     for the MVP.
     """
-    from flash_attn_mojo.bwd import native_bwd_preprocess, native_bwd_main
+    from flash_attn_mojo.bwd import (
+        native_bwd_preprocess,
+        native_bwd_main,
+        native_bwd_convert_dq,
+    )
 
     orig_dtype = q.dtype
     if orig_dtype == torch.float16:
@@ -272,7 +276,11 @@ def _bwd_dispatch_native_mvp(
         q_k, k_k, v_k, dout_k, lse_c, delta, dk, dv, dqaccum, softmax_scale,
     )
 
-    dq = dqaccum.to(q_k.dtype).transpose(1, 2).contiguous()
+    # dq: (B, L, H, D) in q_k's dtype. The convert_dq kernel reads
+    # dqaccum (B, H, L, D) fp32 and writes dq (B, L, H, D) dtype with
+    # the H/L transpose baked in.
+    dq = torch.empty_like(q_k)
+    native_bwd_convert_dq(dqaccum, dq)
     # The native kernel writes dk/dv directly in the (B, L, H, D) layout.
 
     if orig_dtype == torch.float16:

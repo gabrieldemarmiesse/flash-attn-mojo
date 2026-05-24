@@ -165,3 +165,47 @@ def native_bwd_main(
             1,  # use_external_stream
         )
     )
+
+
+def native_bwd_convert_dq(
+    dqaccum: torch.Tensor,
+    dq: torch.Tensor,
+) -> None:
+    """JIT-compile (if needed) and dispatch the bwd convert-dQ kernel.
+
+    Casts ``dqaccum`` (fp32, (B, H, L, D)) to ``dq``'s dtype (bf16 or
+    fp16) and writes into ``dq`` ((B, L, H, D)) — mirrors Tri Dao's
+    flash_bwd_convert_dq_kernel. Rows past ``seq_len`` in any q-tile
+    tail are skipped.
+    """
+    from flash_attn_mojo.bwd._convert_dq_jit import call_bwd_convert_dq
+
+    assert dqaccum.dtype == torch.float32, "dqaccum must be fp32"
+    assert dq.dtype in (torch.bfloat16, torch.float16), (
+        f"dq dtype must be bf16 or fp16, got {dq.dtype}"
+    )
+
+    batch, seqlen, nheads, head_dim = dq.shape
+    assert tuple(dqaccum.shape) == (batch, nheads, seqlen, head_dim), (
+        "dqaccum shape must be (batch, nheads, seqlen, head_dim)"
+    )
+
+    call_bwd_convert_dq(
+        (
+            dqaccum.data_ptr(),
+            dq.data_ptr(),
+            batch,
+            seqlen,
+            nheads,
+            dqaccum.stride(0),
+            dqaccum.stride(1),
+            dqaccum.stride(2),
+            dq.stride(0),
+            dq.stride(1),
+            dq.stride(2),
+            torch.cuda.current_stream().cuda_stream,
+            _DTYPE_CODE[dq.dtype],
+            head_dim,
+            1,  # use_external_stream
+        )
+    )
