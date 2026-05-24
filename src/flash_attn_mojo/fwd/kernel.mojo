@@ -122,6 +122,8 @@ def fwd_kernel[
     lse_ptr: UnsafePointer[Float32, MutAnyOrigin],
     lse_b_stride: Int,
     lse_h_stride: Int,
+    window_left: Int,
+    window_right: Int,
 ):
     comptime accum_type = get_accum_type[dtype]()
     comptime simd_size: Int = simd_width_of[dtype]()
@@ -257,8 +259,20 @@ def fwd_kernel[
     var rowmax = stack_allocation[WM, accum_type, alignment=row_alignment]()
     var rowsum = stack_allocation[WM, accum_type, alignment=row_alignment]()
 
+    # Use a large finite negative sentinel instead of -inf so that the
+    # exp2(prev_max - new_max) correction in the online softmax is well-
+    # defined when a row's score tile is fully masked (e.g. by a tight
+    # sliding window): both old and new max land at this sentinel, the
+    # correction becomes exp2(0) = 1, and output_reg_tile is preserved
+    # (0 * 1 = 0). For any row with at least one finite valid score the
+    # sentinel is far below the real scores (bf16 Q·K with the typical
+    # 1/sqrt(64) scale stays in the |s| < ~100 range), so exp2(sentinel
+    # - real) underflows to 0 and the result is identical to the -inf
+    # case.
+    var neg_sentinel: Scalar[accum_type] = Scalar[accum_type](-1.0e30)
+
     comptime for i in range(0, WM, 2):
-        rowmax.store(i, SIMD[accum_type, 2](min_or_neg_inf[accum_type]()))
+        rowmax.store(i, SIMD[accum_type, 2](neg_sentinel))
         rowsum.store(i, SIMD[accum_type, 2](0))
 
     # `p_smem` is allocated unconditionally because `multistage_mma` for
@@ -362,6 +376,12 @@ def fwd_kernel[
     )
     var softcap_log2e: Scalar[accum_type] = softcap_acc * log2e
 
+    # Sliding-window: `window_left == -1` means no left bound (= +inf
+    # past), `window_right == -1` means no right bound. The fast path
+    # `has_window == False` (both -1) keeps the original score-mask cost
+    # at zero.
+    var has_window: Bool = window_left != -1 or window_right != -1
+
     # ---- KV loop body (one (BN-tall) tile per iteration).
     @__copy_capture(
         seq_len,
@@ -370,6 +390,10 @@ def fwd_kernel[
         has_softcap,
         softcap_inv_scaled,
         softcap_log2e,
+        has_window,
+        window_left,
+        window_right,
+        neg_sentinel,
     )
     @always_inline
     @parameter
@@ -559,7 +583,7 @@ def fwd_kernel[
                             + Int(mma_col_base + col_off)
                         )
                         var ne_inf = SIMD[accum_type, p_frag_simdwidth](
-                            min_or_neg_inf[accum_type]()
+                            neg_sentinel
                         )
 
                         comptime for j in range(p_frag_simdwidth):
@@ -573,12 +597,39 @@ def fwd_kernel[
                             + Int(mma_col_base + col_off)
                         )
                         var ne_inf_c = SIMD[accum_type, p_frag_simdwidth](
-                            min_or_neg_inf[accum_type]()
+                            neg_sentinel
                         )
 
                         comptime for j in range(p_frag_simdwidth):
                             if score_col_c + j > q_idx:
                                 p_reg_vec2[mma_id, i][j] = ne_inf_c[j]
+
+                    # Sliding-window mask: -1 on either side means
+                    # "unbounded on that side". The block-skip in the
+                    # outer loop already removes whole tiles fully
+                    # outside the window — this handles the partial-
+                    # overlap boundary tiles.
+                    if has_window:
+                        var score_col_w: Int = (
+                            kv_tile_start_row
+                            + Int(mma_col_base + col_off)
+                        )
+                        var ne_inf_w = SIMD[accum_type, p_frag_simdwidth](
+                            neg_sentinel
+                        )
+
+                        comptime for j in range(p_frag_simdwidth):
+                            var kv_idx_w: Int = score_col_w + j
+                            if (
+                                window_left != -1
+                                and kv_idx_w < q_idx - window_left
+                            ):
+                                p_reg_vec2[mma_id, i][j] = ne_inf_w[j]
+                            if (
+                                window_right != -1
+                                and kv_idx_w > q_idx + window_right
+                            ):
+                                p_reg_vec2[mma_id, i][j] = ne_inf_w[j]
 
         comptime reg_layout_by_mma_unit = Layout.row_major(
             2 * num_m_mmas * num_n_mmas, 2
@@ -663,11 +714,43 @@ def fwd_kernel[
     # Block-skip for causal: KV tiles starting strictly above the last
     # query row of this Q-tile are entirely above the diagonal and
     # contribute nothing. Cap the loop at (q_tile_idx + 1) * BM.
+    var kv_start: Int = 0
     var kv_end: Int = seq_len
     @parameter
     if causal:
         kv_end = min(seq_len, (Int(q_tile_idx) + 1) * Int(BM))
-    tile_and_unswitch[loop_over_kv, [BN]](0, kv_end)
+    # Block-skip for sliding-window: shrink [kv_start, kv_end) to the
+    # range of BN-aligned tiles that can overlap the window for *any*
+    # query row in this Q-tile. Aligned-down on the low side, aligned-
+    # up on the high side, then clipped to actual_seq_len (and capped
+    # against the existing causal cap above on the high side).
+    if has_window:
+        if window_left != -1:
+            var lo_raw: Int = Int(q_tile_idx) * Int(BM) - window_left
+            if lo_raw < 0:
+                lo_raw = 0
+            # Round down to BN multiple so tiles stay aligned.
+            kv_start = (lo_raw // Int(BN)) * Int(BN)
+        if window_right != -1:
+            var hi_raw: Int = (
+                (Int(q_tile_idx) + 1) * Int(BM) + window_right
+            )
+            if hi_raw > actual_seq_len:
+                hi_raw = actual_seq_len
+            # Round up to BN multiple, then clamp against kv_end (which
+            # already encodes causal cap + padded seq_len).
+            var hi_aligned: Int = (
+                (hi_raw + Int(BN) - 1) // Int(BN)
+            ) * Int(BN)
+            if hi_aligned < kv_end:
+                kv_end = hi_aligned
+    if kv_start >= kv_end:
+        # Fully-masked Q-tile (window puts every query past every key).
+        # Fall through: rowsum stays 0, output gets the defensive 0
+        # treatment below. Skip the KV loop entirely.
+        pass
+    else:
+        tile_and_unswitch[loop_over_kv, [BN]](kv_start, kv_end)
 
     # ---- Write LSE (log-sum-exp, natural log) before rowsum is consumed.
     # With our exp2-based online softmax: rowsum is sum_j exp2(scaled_j - rowmax),

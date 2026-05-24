@@ -59,11 +59,13 @@ def flash_attn_fwd_variant(
     var lse_addr: Int = Int(py=args[23])
     var lse_b_stride: Int = Int(py=args[24])
     var lse_h_stride: Int = Int(py=args[25])
-    # args[26..29] (dtype, head_dim, causal, use_external_stream) are
+    var window_left: Int = Int(py=args[26])
+    var window_right: Int = Int(py=args[27])
+    # args[28..31] (dtype, head_dim, causal, use_external_stream) are
     # all comptime defines — read at module level via get_defined_*, so
     # they're skipped here. ctx_handle is appended by `call_fwd` as
-    # the 31st positional (index 30).
-    var ctx_handle_addr: Int = Int(py=args[30])
+    # the 33rd positional (index 32).
+    var ctx_handle_addr: Int = Int(py=args[32])
 
     if batch_int == 0 or seqlen_int == 0 or nheads_int == 0:
         return PythonObject(None)
@@ -99,6 +101,8 @@ def flash_attn_fwd_variant(
         lse_addr,
         lse_b_stride,
         lse_h_stride,
+        window_left,
+        window_right,
         stream_handle_addr,
         ctx_handle_addr,
     )

@@ -17,6 +17,8 @@ def native_fwd(
     nheads_kv: int | None = None,
     softcap: float = 0.0,
     lse: torch.Tensor | None = None,
+    window_left: int = -1,
+    window_right: int = -1,
 ) -> None:
     """JIT-compile (if needed) and dispatch a single GPU forward call.
 
@@ -72,6 +74,8 @@ def native_fwd(
             int(lse_addr),
             int(lse_b_stride),
             int(lse_h_stride),
+            int(window_left),
+            int(window_right),
             _DTYPE_CODE[q.dtype],
             head_dim,
             1 if causal else 0,

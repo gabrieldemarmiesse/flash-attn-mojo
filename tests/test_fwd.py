@@ -272,6 +272,36 @@ def test_kvpacked_matches_unpacked(causal):
     )
 
 
+@pytest.mark.parametrize(
+    "window_left,window_right",
+    [(64, 0), (32, 32), (128, -1), (-1, 128)],
+)
+@pytest.mark.parametrize("causal", [False, True])
+def test_window_correctness(window_left, window_right, causal):
+    """Sliding-window attention: mojo with window_size=(L, R) must match
+    upstream flash-attn's window output within bf16 tol."""
+    try:
+        from flash_attn import flash_attn_func as upstream_fwd
+    except ImportError:
+        pytest.skip("upstream flash-attn not available")
+    B, L, H, D = 2, 512, 4, 64
+    torch.manual_seed(0)
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda")
+
+    window = (window_left, window_right)
+    out_mojo = flash_attn_mojo.flash_attn_func(
+        q, k, v, causal=causal, window_size=window
+    )
+    out_up = upstream_fwd(q, k, v, causal=causal, window_size=window)
+    diff = _max_abs(out_mojo, out_up)
+    assert diff < 5e-2, (
+        f"window mojo vs upstream: window={window} causal={causal} "
+        f"max |diff|={diff:.3e}"
+    )
+
+
 @pytest.mark.parametrize("L", [17, 47, 100])
 @pytest.mark.parametrize("H", [4, 8])
 @pytest.mark.parametrize("causal", [False, True])

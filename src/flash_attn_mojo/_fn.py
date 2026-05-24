@@ -67,8 +67,6 @@ def _fwd_dispatch(
         )
     if dropout_p != 0.0:
         raise NotImplementedError("flash_attn_mojo: dropout not yet implemented.")
-    if window_size != _NO_WINDOW:
-        raise NotImplementedError("flash_attn_mojo: window_size not yet implemented.")
     if alibi_slopes is not None:
         raise NotImplementedError("flash_attn_mojo: alibi_slopes not yet implemented.")
     nheads_q = q.shape[2]
@@ -94,7 +92,11 @@ def _fwd_dispatch(
         q.shape[0], q.shape[2], q.shape[1], dtype=torch.float32, device=q.device
     )
 
-    native_fwd(q, k, v, out, softmax_scale, causal, nheads_kv, softcap, lse)
+    window_left, window_right = window_size
+    native_fwd(
+        q, k, v, out, softmax_scale, causal, nheads_kv, softcap, lse,
+        window_left=int(window_left), window_right=int(window_right),
+    )
     return out, lse
 
 
