@@ -42,6 +42,20 @@ FWD_SHAPES = [
     (2, 1024, 8, 64),
     (4, 1024, 8, 64),
     (8, 1024, 8, 64),
+    (1, 4096, 8, 64),
+    (1, 8192, 8, 64),
+]
+
+# Bwd is much slower than fwd in our current scalar-MMA implementation
+# so the largest shapes (which would dominate wall time) are off by default.
+# Match HANDOFF.md's baseline list.
+BWD_SHAPES = [
+    (1, 128, 8, 64),
+    (1, 512, 8, 64),
+    (1, 1024, 8, 64),
+    (1, 2048, 8, 64),
+    (2, 1024, 8, 64),
+    (4, 1024, 8, 64),
 ]
 
 
@@ -58,6 +72,19 @@ def _is_upstream_fwd(name: str) -> bool:
     # for low-parallelism cases like nheads=1. Sum across both so the
     # ratio reflects total upstream GPU time, not just one of the two.
     return "flash_fwd" in name
+
+
+def _is_mojo_bwd(name: str) -> bool:
+    return (
+        ("bwd_kernel" in name
+            or "preprocess_kernel" in name
+            or "convert_dq_kernel" in name)
+        and not name.startswith("void")
+    )
+
+
+def _is_upstream_bwd(name: str) -> bool:
+    return "flash_bwd" in name
 
 
 def _sum_cuda_us(prof, predicate) -> float:
@@ -103,6 +130,47 @@ def _make_fwd_call(impl: str, shape, *, dtype, device, g):
     raise ValueError(f"unknown impl: {impl}")
 
 
+def _make_bwd_call(impl: str, shape, *, dtype, device, g):
+    """Returns a callable that runs O.backward(dO) for the given impl.
+
+    We pre-allocate q/k/v with `requires_grad`, run the fwd once outside the
+    measured region (so the bench only captures bwd kernels), then call
+    `.backward(dO, retain_graph=True)` each iteration. Each call also zeroes
+    the upstream-side grads to keep peak memory bounded, but those zero ops
+    are cheap and not flash kernels — they don't get counted by the predicate.
+    """
+    b, l, h, d = shape
+    q = torch.randn(b, l, h, d, generator=g, requires_grad=False).to(
+        device=device, dtype=dtype
+    ).detach().requires_grad_(True)
+    k = torch.randn(b, l, h, d, generator=g, requires_grad=False).to(
+        device=device, dtype=dtype
+    ).detach().requires_grad_(True)
+    v = torch.randn(b, l, h, d, generator=g, requires_grad=False).to(
+        device=device, dtype=dtype
+    ).detach().requires_grad_(True)
+    do = torch.randn(b, l, h, d, generator=g).to(device=device, dtype=dtype)
+
+    if impl == "mojo":
+        fn = flash_attn_mojo.flash_attn_func
+    elif impl == "upstream":
+        fn = upstream_fn
+    else:
+        raise ValueError(f"unknown impl: {impl}")
+
+    def call():
+        # Each call: fresh forward + one backward pass. The predicate
+        # only counts bwd-side kernels (`bwd_kernel` / `flash_bwd`), so
+        # the fwd doesn't pollute the measurement.
+        out = fn(q, k, v)
+        out.backward(do)
+        # Clear grads so the next iter doesn't accumulate.
+        for t in (q, k, v):
+            t.grad = None
+
+    return call
+
+
 def run_fwd(args, shapes, device, dtype) -> None:
     print(
         f"FWD kernel: GPU={torch.cuda.get_device_name(0)} | dtype={args.dtype} "
@@ -133,6 +201,36 @@ def run_fwd(args, shapes, device, dtype) -> None:
         )
 
 
+def run_bwd(args, shapes, device, dtype) -> None:
+    print(
+        f"BWD kernel: GPU={torch.cuda.get_device_name(0)} | dtype={args.dtype} "
+        f"| iters={args.iters}"
+    )
+    header = (
+        f"{'shape (B,L,H,D)':>20} | {'mojo (us/call)':>15} | "
+        f"{'upstream (us/call)':>19} | {'ratio':>7}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    g = torch.Generator(device="cpu").manual_seed(0)
+    for shape in shapes:
+        mojo_us = _bench(
+            _make_bwd_call("mojo", shape, dtype=dtype, device=device, g=g),
+            _is_mojo_bwd, args.iters, args.warmup,
+        )
+        up_us = _bench(
+            _make_bwd_call("upstream", shape, dtype=dtype, device=device, g=g),
+            _is_upstream_bwd, args.iters, args.warmup,
+        )
+        ratio = mojo_us / up_us if up_us > 0 else float("inf")
+        shape_str = "(" + ",".join(str(s) for s in shape) + ")"
+        print(
+            f"{shape_str:>20} | {mojo_us:>15.2f} | {up_us:>19.2f} | "
+            f"{ratio:>6.2f}x"
+        )
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -144,6 +242,12 @@ def main() -> None:
     p.add_argument("--iters", type=int, default=100)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
+    p.add_argument(
+        "--mode",
+        choices=["fwd", "bwd", "both"],
+        default="both",
+        help="Which pass to bench.",
+    )
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -152,11 +256,19 @@ def main() -> None:
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
 
     if args.shape is not None:
-        shapes = [tuple(int(x) for x in args.shape.split(","))]
+        single = tuple(int(x) for x in args.shape.split(","))
+        fwd_shapes = [single]
+        bwd_shapes = [single]
     else:
-        shapes = FWD_SHAPES
+        fwd_shapes = FWD_SHAPES
+        bwd_shapes = BWD_SHAPES
 
-    run_fwd(args, shapes, device, dtype)
+    if args.mode in ("fwd", "both"):
+        run_fwd(args, fwd_shapes, device, dtype)
+    if args.mode in ("bwd", "both"):
+        if args.mode == "both":
+            print()
+        run_bwd(args, bwd_shapes, device, dtype)
 
 
 if __name__ == "__main__":
