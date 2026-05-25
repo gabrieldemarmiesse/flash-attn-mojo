@@ -1,11 +1,123 @@
 # flash_attn_mojo — handoff notes
 
-Snapshot of where this port stands, what's left, and what changes
-when you have a Hopper / H100 to work on.
+Snapshot of where this port stands, what's left, and what to attack next.
 
-Branch: `init_flash_attn_mojo` (35 commits ahead of `main`).
+Branch: `main` (the prior `init_flash_attn_mojo` branch was merged).
 Run tests: `uv run --extra nvidia pytest`.
 Run bench: `uv run --extra nvidia python benchmarks/bench_gpu_kernel_time.py`.
+
+## Resuming the bwd perf work (left off 2026-05-25)
+
+**Recent commits on `main` (newest first):**
+```
+64ce67e bwd: deterministic dqaccum (no atomic-add) — 11-15x perf win
+d2588cc docs: HANDOFF.md updates for H100 baseline + bwd MMA rewrite
+b9794c3 bwd: tensor-core MMA rewrite (multistage_mma for all 5 matmuls)
+78316cc bench: add bwd shapes + dispatch
+```
+
+Combined effect: bwd at `(1,1024,8,64)` is now **140 μs** (was 7056 μs scalar,
+2119 μs after the MMA rewrite alone). Upstream FA3 on the same shape is
+47 μs, so we're 3.0x off. Other shapes are 1.4-3.8x off — see the perf
+table below.
+
+**State at last session pause:** all 129 tests pass; the dqaccum
+restructure landed cleanly. Next step is to identify the dominant
+remaining bottleneck *with a profiler* (the four candidates listed
+below — smem bank conflicts, register-pressure occupancy, redundant
+gmem loads, FA3 — are estimates only). Two failed/dropped experiments
+to be aware of:
+
+- **Single-buffer Q/dO/K layout** (one (M, D) row-major buffer per
+  tensor, both A-chunked and B-striped iter views over it): broke
+  correctness (max-abs diff 3.3 vs reference). Suspected swizzle
+  mismatch between async-copy writes and `multistage_mma`'s load_a
+  reads when the warp-tile sub-tile origin shifts. Reverted in the
+  same session. The win would be ~24 KiB less smem + half the per-qb
+  gmem load traffic — small impact (gmem traffic isn't the bottleneck
+  per the diagnostic), so this is low priority.
+- **BK=64 for D≥64**: no measurable change vs BK=32, reverted.
+
+### Profiling — RmProfilingAdminOnly gate
+
+ncu metric-based sections (Memory, Occupancy, SchedulerStats, etc.)
+all error with `ERR_NVGPUCTRPERM` on the current box because
+`/proc/driver/nvidia/params` has `RmProfilingAdminOnly: 1`. Unlock
+options:
+
+- Reload `nvidia.ko` with `NVreg_RestrictProfilingToAdminUsers=0` (per-
+  reboot, persists until the next module reload).
+- Run ncu under `sudo`; if you set up passwordless sudoers for the
+  ncu binary an automated agent can call it directly.
+
+ncu itself is installed via `pixi exec --spec nsight-compute=2024.3.2`.
+Quick command to confirm permission state on any host:
+
+```
+grep RmProfilingAdminOnly /proc/driver/nvidia/params
+```
+
+`0` → unlocked; `1` → need sudo / driver reload.
+
+### Concrete next steps once ncu is unlocked
+
+1. Drop this one-shot bwd target at `/tmp/bench_one.py`:
+   ```python
+   import torch, flash_attn_mojo
+   B, L, H, D = 1, 1024, 8, 64
+   torch.manual_seed(0)
+   q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device='cuda', requires_grad=True)
+   k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device='cuda', requires_grad=True)
+   v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device='cuda', requires_grad=True)
+   do = torch.randn_like(q)
+   for _ in range(3):
+       flash_attn_mojo.flash_attn_func(q, k, v).backward(do)
+       q.grad = None; k.grad = None; v.grad = None
+   torch.cuda.synchronize()
+   flash_attn_mojo.flash_attn_func(q, k, v).backward(do)
+   torch.cuda.synchronize()
+   ```
+2. Profile:
+   ```
+   pixi exec --spec nsight-compute=2024.3.2 -- ncu \
+     --target-processes all --kernel-name regex:bwd_kernel \
+     --launch-skip 5 --launch-count 1 --set full \
+     -o /tmp/bwd_prof \
+     uv run --extra nvidia python /tmp/bench_one.py
+   ```
+   The `--set full` capture pulls every section; size-on-disk is ~30 MiB.
+3. Open in nsight-compute UI (`ncu-ui /tmp/bwd_prof.ncu-rep`) — or use
+   `ncu --import /tmp/bwd_prof.ncu-rep --page details` for the CLI
+   summary. Look first at: occupancy (achieved/theoretical), shared-
+   memory bank conflicts per warp, and the "Speed Of Light" GPU
+   utilization breakdown.
+4. Pick the highest-impact section and optimize. Anchor candidates:
+   - If bank conflicts dominate: swizzle the PT/dST writes (the c-frag
+     stores in `bwd/kernel.mojo`, lines ~768-806 and ~875-913) using
+     `make_ldmatrix_swizzle[dtype, BK]()` from `layout.swizzle`. Apply
+     the swizzle to each thread's write offset, then enable
+     `swizzle_a=True` on the dV / dK `multistage_mma` calls so reads
+     unswizzle to match. The Swizzle's `__call__(Int)` does the XOR;
+     see `modular/max/kernels/src/layout/swizzle.mojo:411`.
+   - If achieved occupancy is the bottleneck: reduce register pressure
+     by sharing the s_reg / dp_reg fragment buffer (already overloaded
+     for s → p → dS; dp_reg could potentially share a window with
+     dv_acc but their lifetimes conflict — needs careful analysis).
+     Or drop one of the dual gmem load layouts and pay the cost in
+     smem-to-smem transpose.
+
+A useful one-shot bench-after-edit incantation while iterating:
+
+```
+rm -rf ~/.cache/flash_attn_mojo/bwd \
+  && uv run --extra nvidia pytest tests/test_bwd.py -q \
+  && uv run --extra nvidia python benchmarks/bench_gpu_kernel_time.py \
+       --iters 20 --warmup 5 --mode bwd
+```
+
+(clears the JIT cache so the new kernel compiles fresh; runs full
+correctness; then dumps the perf table.)
+
 
 ## Current correctness state
 
