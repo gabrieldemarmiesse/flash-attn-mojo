@@ -230,6 +230,7 @@ def _bwd_dispatch_native_mvp(
     alibi_slopes: torch.Tensor | None = None,
     window_size: tuple[int, int] = _NO_WINDOW,
     dropout_p: float = 0.0,
+    rng_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Native MVP backward: bf16 / head_dim in {32, 64, 128} / optional causal / no MQA.
 
@@ -243,17 +244,28 @@ def _bwd_dispatch_native_mvp(
     the fwd kernel) since the bwd kernel only specialises on bf16
     for the MVP.
 
-    Dropout is not supported by the native bwd MVP — the kernel does
-    not reproduce the fwd's splitmix dropout mask. Reject dropout > 0
-    here with the same NotImplementedError wording the pytorch
-    fallback uses, so both paths fail with a matching error.
+    Dropout is supported: the native bwd kernel replays the fwd's
+    splitmix32 dropout RNG bit-for-bit (same seed/offset/mixer) so
+    masked positions get P=0 and survivors are scaled by `1/(1-p)`,
+    which then propagates correctly through dV/dP/dS into dq/dk/dv.
+    `rng_state` is the (seed, offset) int64 cuda tensor returned by
+    the forward; when `dropout_p > 0` it must be non-None.
     """
+    rng_seed_i: int = 0
+    rng_offset_i: int = 0
     if dropout_p > 0.0:
-        raise NotImplementedError(
-            "flash_attn_mojo backward: dropout_p > 0 is not supported by the "
-            "native bwd kernel (the kernel does not reproduce the fwd's "
-            "dropout mask). Train with dropout_p=0 for now."
-        )
+        if rng_state is None:
+            raise RuntimeError(
+                "flash_attn_mojo backward: dropout_p > 0 requires rng_state "
+                "from the forward (the bwd needs the same seed/offset to "
+                "replay the fwd's dropout mask)."
+            )
+        # rng_state is a 2-elt int64 cuda tensor. One D->H sync to read
+        # the two scalars — the bwd has many syncs already (delta
+        # preprocess, then the main kernel), so this is in the noise.
+        rng_host = rng_state.detach().to("cpu", dtype=torch.int64).tolist()
+        rng_seed_i = int(rng_host[0])
+        rng_offset_i = int(rng_host[1])
     from flash_attn_mojo.bwd import (
         native_bwd_preprocess,
         native_bwd_main,
@@ -324,6 +336,9 @@ def _bwd_dispatch_native_mvp(
         alibi_h_stride=int(alibi_h_stride),
         window_left=int(window_size[0]),
         window_right=int(window_size[1]),
+        dropout_p=float(dropout_p),
+        rng_seed=rng_seed_i,
+        rng_offset=rng_offset_i,
     )
     del alibi_buf
 
@@ -355,6 +370,7 @@ def _bwd_dispatch(
     softcap: float,
     alibi_slopes: torch.Tensor | None,
     deterministic: bool,
+    rng_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Backward dispatch. Returns (dq, dk, dv).
 
@@ -397,6 +413,7 @@ def _bwd_dispatch(
             alibi_slopes=alibi_slopes,
             window_size=window_size,
             dropout_p=dropout_p,
+            rng_state=rng_state,
         )
 
     if dropout_p > 0.0:
@@ -575,6 +592,13 @@ class _FlashAttnFn(torch.autograd.Function):
             softcap, alibi_slopes, deterministic,
         )
         ctx.save_for_backward(q, k, v, out, lse, alibi_slopes)
+        # Save the fwd's RNG state so the bwd can replay the same dropout
+        # mask. `rng_state` is a 2-element int64 cuda tensor (seed, offset)
+        # when dropout_p > 0, None otherwise. We stash it on `ctx` rather
+        # than `save_for_backward` since it's a non-differentiable
+        # auxiliary tensor (and pytorch warns on saving such tensors via
+        # save_for_backward unless we mark them).
+        ctx.rng_state = rng_state
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -599,6 +623,7 @@ class _FlashAttnFn(torch.autograd.Function):
             dout, q, k, v, out, lse,
             ctx.dropout_p, ctx.softmax_scale, ctx.causal,
             ctx.window_size, ctx.softcap, alibi_slopes, ctx.deterministic,
+            rng_state=ctx.rng_state,
         )
         # forward arg order: q, k, v, dropout_p, softmax_scale, causal,
         # window_size, softcap, alibi_slopes, deterministic,

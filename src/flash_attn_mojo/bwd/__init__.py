@@ -102,6 +102,9 @@ def native_bwd_main(
     alibi_h_stride: int = 0,
     window_left: int = -1,
     window_right: int = -1,
+    dropout_p: float = 0.0,
+    rng_seed: int = 0,
+    rng_offset: int = 0,
 ) -> None:
     """JIT-compile (if needed) and dispatch the main bwd kernel.
 
@@ -153,6 +156,9 @@ def native_bwd_main(
             nheads_kv,
             float(softmax_scale),
             float(softcap),
+            float(dropout_p),
+            int(rng_seed),
+            int(rng_offset),
             q.stride(0),
             q.stride(1),
             q.stride(2),

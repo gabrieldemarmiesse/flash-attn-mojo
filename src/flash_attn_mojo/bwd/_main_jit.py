@@ -27,18 +27,18 @@ def call_bwd_main(args: tuple) -> None:
 
     ``args`` is the runtime tuple built by
     ``bwd/__init__.py::native_bwd_main``. The comptime gating fields
-    live at indices 46..49 (dtype, head_dim, causal, use_external_stream).
+    live at indices 49..52 (dtype, head_dim, causal, use_external_stream).
     """
     variant_fn, ctx_handle = _get_variant_fn(_config_from_args(args))
-    # Append ctx_handle as the next positional (index 50).
+    # Append ctx_handle as the next positional (index 53).
     variant_fn(*args, ctx_handle)
 
 
 def _config_from_args(args: tuple) -> tuple:
-    dtype_code = args[46]
-    head_dim = args[47]
-    causal = bool(args[48])
-    use_external_stream = bool(args[49])
+    dtype_code = args[49]
+    head_dim = args[50]
+    causal = bool(args[51])
+    use_external_stream = bool(args[52])
     return (dtype_code, head_dim, causal, use_external_stream)
 
 

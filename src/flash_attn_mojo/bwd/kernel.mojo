@@ -93,6 +93,9 @@ def bwd_kernel[
     nheads_kv: Int,
     softmax_scale: Float32,
     softcap: Float32,
+    dropout_p: Float32,
+    rng_seed: UInt64,
+    rng_offset: UInt64,
     q_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     k_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     v_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -251,6 +254,29 @@ def bwd_kernel[
         Float32(1) / softcap_f if has_softcap else Float32(0)
     )
 
+    # ---- Dropout setup. Mirrors fwd/kernel.mojo's setup exactly so the
+    # mask we recompute matches the one the fwd applied. `seed_mix` and
+    # the per-(batch, head) part of `rng_key` are loop-invariant; the
+    # per-head component is folded in inside the q-head loop.
+    var has_dropout: Bool = dropout_p > Float32(0)
+    var keep_scale: Float32 = Float32(1)
+    var log_keep_scale: Float32 = Float32(0)
+    var drop_threshold_u32: UInt32 = UInt32(0)
+    if has_dropout:
+        keep_scale = Float32(1) / (Float32(1) - dropout_p)
+        # Used by the softcap dS-reconstruction path to recover s_post
+        # from the dropout-scaled survivor p:
+        #   p_survivor = p_orig * keep_scale  ⇒  log(p_orig) = log(p) - log(keep_scale).
+        log_keep_scale = log(keep_scale)
+        var thr_f: Float32 = dropout_p * Float32(4294967296.0)
+        if thr_f > Float32(4294967040.0):
+            thr_f = Float32(4294967040.0)
+        drop_threshold_u32 = UInt32(thr_f)
+    var seed_mix: UInt64 = rng_seed ^ rng_offset
+    var seed_mix_xor32: UInt32 = (
+        UInt32(seed_mix & UInt64(0xFFFFFFFF)) ^ UInt32(seed_mix >> UInt64(32))
+    )
+
     # ---- Outer Q-head-in-group loop (MQA/GQA). For non-MQA configs
     # group_size == 1 so this collapses to a single pass — same flops
     # as before. K/V smem tiles are loaded once before this loop and
@@ -264,6 +290,18 @@ def bwd_kernel[
     for h_q_in_group in range(group_size):
         var q_head_idx: Int = kv_head_idx * group_size + h_q_in_group
         var q_base_off: Int = batch * q_b_stride + q_head_idx * q_h_stride
+        # Per-(batch, q-head) rng_key — mirrors fwd's `rng_key`
+        # computation bit-for-bit so the recomputed mask matches the
+        # fwd's applied mask at every (batch, q_head, q_idx, kv_idx).
+        var bh_mix: UInt64 = (
+            UInt64(batch) * UInt64(2654435761)
+            + UInt64(q_head_idx) * UInt64(40503)
+        )
+        var rng_key: UInt32 = (
+            seed_mix_xor32
+            ^ UInt32(bh_mix & UInt64(0xFFFFFFFF))
+            ^ UInt32(bh_mix >> UInt64(32))
+        )
         var alibi_slope: Float32 = Float32(0)
         if has_alibi:
             var alibi_off: Int = (
@@ -387,6 +425,30 @@ def bwd_kernel[
                     p = Float32(0)
                 else:
                     p = exp(s_post - lse_smem[m])
+                # ---- Dropout: replay the fwd's per-element mask. The
+                # mixer matches `fwd/kernel.mojo` bit-for-bit so the same
+                # `u` is produced at the same (b, h, q_idx, kv_idx) →
+                # dropped/kept decisions agree. Survivors get scaled by
+                # `1 / (1 - p)`. The chain that follows
+                # (dV += P^T·dO, dP = dO·V^T, dS = P*(dP-delta)) inherits
+                # the dropout naturally: dropped positions have P=0 and
+                # contribute nothing; survivor dS gets the `1/(1-p)`
+                # factor via the scaled P.
+                if has_dropout and not masked:
+                    var u: UInt32 = (
+                        rng_key
+                        ^ UInt32(g_row) * UInt32(0x9E3779B1)
+                        ^ UInt32(g_col) * UInt32(0x85EBCA77)
+                    )
+                    u = u ^ (u >> UInt32(16))
+                    u = u * UInt32(0x7FEB352D)
+                    u = u ^ (u >> UInt32(15))
+                    u = u * UInt32(0x846CA68B)
+                    u = u ^ (u >> UInt32(16))
+                    if u < drop_threshold_u32:
+                        p = Float32(0)
+                    else:
+                        p = p * keep_scale
                 s_smem[m * BN + n] = p
 
             barrier()
@@ -447,7 +509,12 @@ def bwd_kernel[
                     if p > Float32(0):
                         var g_row: Int = q_row_base + m
                         var g_col: Int = kv_row_base + n
-                        var s_post: Float32 = log(p) + lse_smem[m]
+                        # Undo the dropout keep-scale before taking log to
+                        # recover the original post-softmax p — see the
+                        # `log_keep_scale` setup comment above.
+                        var s_post: Float32 = (
+                            log(p) - log_keep_scale + lse_smem[m]
+                        )
                         if has_alibi:
                             @parameter
                             if causal:
