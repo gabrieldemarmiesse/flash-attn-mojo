@@ -120,6 +120,77 @@ the upstream flash-attn wheel that the benches diff against.
 uv run --extra nvidia python benchmarks/bench_gpu_kernel_time.py
 ```
 
+## Profiling
+
+The `scripts/` directory wraps Nsight Compute (`ncu`) so you can
+trace a single kernel launch without fighting JIT or warmup
+pollution. Defaults assume an H100 with `RmProfilingAdminOnly=1`
+but passwordless sudo configured — adjust accordingly.
+
+```bash
+# bwd main kernel, default shape (B=1, L=1024, H=8, D=64), full sections
+scripts/profile_kernel.sh --kernel bwd-main -- --kind bwd
+
+# fwd, custom shape and causal
+scripts/profile_kernel.sh --kernel fwd -- --kind fwd --shape 1,2048,8,64 --causal
+
+# fast iteration: only SOL + scheduler + launch stats
+scripts/profile_kernel.sh --kernel bwd-main --set basic -- --kind bwd
+
+# summarize a captured report on the CLI (or open .ncu-rep in ncu-ui)
+scripts/profile_summary.sh /tmp/kernel_bwd_kernel_prof.ncu-rep
+```
+
+### How the bench/profiler pipeline works
+
+`scripts/profile_bench.py` is a one-shot bench (warmup + capture)
+that brackets the capture phase with `cudaProfilerStart` /
+`cudaProfilerStop`. `scripts/profile_kernel.sh` invokes ncu with
+`--profile-from-start no`, so only the post-warmup launches inside
+the bracket are recorded — no need to count launches and tune
+`--launch-skip` manually.
+
+### Kernel filter shortcuts
+
+| `--kernel`        | regex                          | what it captures              |
+|-------------------|--------------------------------|-------------------------------|
+| `fwd`             | `kernel_fwd_kernel`            | mojo fwd                      |
+| `bwd`             | `bwd`                          | mojo bwd (all 3 sub-kernels)  |
+| `bwd-main`        | `kernel_bwd_kernel`            | mojo bwd main (dK/dV/dQaccum) |
+| `bwd-preprocess`  | `preprocess_bwd_preprocess`    | mojo bwd preprocess           |
+| `bwd-convert`     | `convert_dq_bwd_convert_dq`    | mojo bwd convert_dq           |
+
+Pass `--filter '<regex>'` for anything custom (e.g. upstream's
+`flash_fwd_kernel` to compare against the reference).
+
+### The RmProfilingAdminOnly gate
+
+Most cloud GPU hosts ship with
+`/proc/driver/nvidia/params:RmProfilingAdminOnly: 1`, which makes
+ncu's metric sections return `ERR_NVGPUCTRPERM` for non-root users.
+The wrapper auto-elevates via `sudo -E` when the gate is locked and
+passwordless sudo is available. To check / unlock manually:
+
+```bash
+grep RmProfilingAdminOnly /proc/driver/nvidia/params
+# 0 → unlocked, 1 → wrapper will use sudo
+
+# permanent unlock until next nvidia.ko reload:
+sudo rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia
+sudo modprobe nvidia NVreg_RestrictProfilingToAdminUsers=0
+```
+
+### Section sets
+
+`--set full` (default) captures everything — ~30-40 passes per
+kernel, ~6-30 MiB report. Use smaller sets while iterating on a
+hypothesis:
+
+- `--set basic` — SOL + SchedulerStats + LaunchStats (~10 passes).
+- `--set detailed` — adds Memory + Compute + Occupancy.
+- `--set source` — adds SASS/PTX-level metric overlay (heavy; only
+  useful in `ncu-ui`).
+
 ## Cache invalidation
 
 In most cases you should never need to manually clear the cache —
