@@ -4,11 +4,17 @@ Guidance for working on this repo: a Mojo port of Tri Dao's CUDA
 `flash-attn`. The benchmark we care about is "GPU kernel time vs
 upstream flash-attn 2 CUDA", with upstream as the moving target.
 
-**Status: fwd kernel substantially feature-complete, backward TBD.**
+**Status: fwd kernel at perf parity, bwd kernel feature-complete (correctness first; perf optimization pending).**
 
 The fwd kernel ships at perf parity (~1.06x upstream geomean across
-the canonical shape grid at nheads=8) and supports the envelope below.
-The backward kernel is still stubbed.
+the canonical shape grid at nheads=8). The bwd kernel is structured
+as Tri Dao's 3-kernel pipeline (preprocess -> main -> convert_dq) and
+covers the same feature envelope as fwd, modulo perf — the bwd
+currently uses scalar arithmetic loops inside the kernel rather than
+tensor-core MMA via `multistage_mma`. Correctness is at bf16 noise
+floor vs both upstream flash-attn 2 and a fp32 SDPA reference; perf
+optimization (multistage_mma + cp.async pipelining like the fwd
+kernel uses) is the next bwd work.
 
 Fwd feature matrix vs upstream flash-attn 2:
 
@@ -29,7 +35,8 @@ Fwd feature matrix vs upstream flash-attn 2:
 | flash_attn_varlen_func | done (python-wrapper baseline, prefill-only) |
 | flash_attn_with_kvcache | done (prefill-only) |
 | non-contig (L, D) strides on unaligned seqlens | done |
-| backward (`bwd/`) | not implemented |
+| backward (`bwd/`) | done (Tri Dao 3-kernel pipeline; scalar-loop MMA, not yet tensor-core) |
+| backward — causal, MQA/GQA, softcap, ALiBi, window, dropout (RNG replay), varlen, all head_dims | done |
 
 **Known blocker — head_dim in {96, 160, 192, 224, 256}.** V's smem
 tile is `Layout.row_major(BK, depth)` so V's row stride equals
