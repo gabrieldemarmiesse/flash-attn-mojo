@@ -169,9 +169,8 @@ def fwd_fa3_kernel[
         b_swizzle=swizzle,
         transpose_b=True,
     ]()
-    # PV: A comes from registers, B is V (mn-major in smem). A doesn't
-    # need swizzling (regs don't use the smem swizzle); B uses the
-    # configured TMA swizzle.
+    # PV: A from registers, B = V (mn-major). transpose_b=False so the
+    # wgmma reads B in its native (K=BN, N=D) shape.
     var wgmma_pv = TensorCoreAsync[
         accum_type,
         dtype,
