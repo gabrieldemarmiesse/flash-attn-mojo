@@ -36,6 +36,7 @@ from std.gpu import (
     warp_id,
     WARP_SIZE,
 )
+import std.gpu.primitives.warp as warp
 from std.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.gpu.memory import AddressSpace, external_memory
 from std.memory import stack_allocation
@@ -206,11 +207,10 @@ def fwd_fa3_kernel[
     ].stack_allocation()
     _ = o_reg.fill(0)
 
-    # Per-row online-softmax state. Each WGMMA c-frag has 2 rows per
-    # m-iter (m16n8 sub-fragments stacked), 8 sub-row-pairs per warp.
-    # We hold one rowmax/rowsum per (m_mma, row_in_mma=0/1, sub_row=0/1).
-    # Total = num_m_mmas * 4 rows per thread.
-    comptime rows_per_thread: Int = num_m_mmas_qk * 2 * 2  # 2 * 2 * 2 = 8
+    # Per-thread online-softmax state: 2 distinct rows per m_mma
+    # (top half lane_group and bot half lane_group+8 of warp's m16
+    # subtile), 2 m_mmas → 4 rows per thread.
+    comptime rows_per_thread: Int = num_m_mmas_qk * 2  # 4
     var rowmax = stack_allocation[
         rows_per_thread, Scalar[accum_type]
     ]()
@@ -275,49 +275,81 @@ def fwd_fa3_kernel[
         wgmma_qk.wait_group()
         warpgroup_fence(s_reg)
 
-        # ---- Online softmax (per c-frag row).
-        # m16n8 c-frag rows: thread holds 2 rows separated by 8 (top
-        # at lane/4, bot at lane/4+8). For m64n128 wgmma, num c-frags
-        # per warp = 4 (BM/16 * 1 for m-direction? actually m64 means
-        # 4 m16 subtiles per warpgroup spread across 4 warps; each warp
-        # owns 1 m16 row group). num_n_mmas_qk=1 with WGMMA_N_QK=128.
-        # Each warp owns (16, 128) of S; in c_frag_size=64 elts/thread,
-        # = 16 rows × 4 col-pairs per thread? Let me think...
+        # ---- Online softmax.
+        # WGMMA m64n128 c-frag mapping: thread t holds 64 fp32 elements
+        # per m_mma covering rows (top=lane_group, bot=lane_group+8)
+        # of the warp's m16 subtile. For c_index c ∈ [0,64):
+        #   n_unit = c / 4 ∈ [0,16)  (16 col-pair groups for WGMMA_N=128)
+        #   in_unit = c % 4
+        #   - in_unit ∈ {0,1} → top row
+        #   - in_unit ∈ {2,3} → bot row
+        # Per-thread row index = m_mma * 2 + (1 if in_unit >= 2 else 0).
         #
-        # Actually wgmma m64n128 produces a 64×128 tile per warpgroup.
-        # 128 threads, 32 fp32 elems per thread = 4096 elems / 128 =
-        # WGMMA_M * WGMMA_N / 128 = 64 * 128 / 128 = 64. ✓
-        # In the warpgroup layout: 4 warps split the 64 rows into 16
-        # per warp. Each warp has 32 threads in 8 row-groups × 4 col-
-        # pairs. Within a row group, thread holds 2 rows × 2 cols × N
-        # n-iters. Per warp: 16 rows × WGMMA_N. Per thread: 2 rows ×
-        # (WGMMA_N / 8 col-pairs * 2 cols) = 2 × WGMMA_N/4 elements.
-        # For WGMMA_N=128: 2 × 32 = 64 elts. ✓
-        #
-        # For online softmax we walk each thread's 64 fp32 c-frag and
-        # treat them as (m_mma, row_in_warp=0/1, col_pairs=16). Each
-        # row contributes its own rowmax/rowsum. We have 2 m_mma * 2
-        # rows = 4 rows per thread (PER m_mma * top/bot). Wait num_m
-        # _mmas_qk = BM/WGMMA_M = 128/64 = 2, so 2 m_mmas. Per m_mma,
-        # 2 rows in the c-frag = 4 rows total per thread.
-        #
-        # But rows_per_thread = num_m_mmas_qk * 2 * 2 = 8 — was that
-        # right? Let me recount: m16n8 sub-fragment has 4 c-frags = 2
-        # row-groups × 2 col-pairs. Each row-group has 1 row in the
-        # top half + 1 in the bottom half. m64 wgmma = 4 stacked m16
-        # subtiles per warpgroup spread across 4 warps. So each warp
-        # owns ONE m16 subtile per WGMMA_M=16-row chunk. With
-        # WGMMA_M=64: 4 warps × 16 rows = 64 ✓. Each warp has 2 rows
-        # × 16 col-pairs per c-frag, summed across the n direction.
-        #
-        # For now I'll accept this might be wrong and revisit when
-        # correctness fails.
+        # 4 consecutive lanes (lane_pair=0..3) own different col-pairs
+        # of the same row pair → reduce row-max/sum across them with
+        # lane_group_reduce[group_size=4].
 
-        # TODO: implement proper c-frag → (row, col) mapping for
-        # online softmax. Placeholder: scale S in-place by scale_log2.
-        # This produces wrong attention but exercises the wgmma path.
-        for i in range(num_m_mmas_qk * num_n_mmas_qk * c_frag_size_qk):
+        # Scale S by softmax_scale * log2e, in place.
+        comptime for i in range(num_m_mmas_qk * num_n_mmas_qk * c_frag_size_qk):
             s_reg.ptr[i] = s_reg.ptr[i] * scale_log2
+
+        # Local rowmax (per thread).
+        var local_max = stack_allocation[
+            rows_per_thread, Scalar[accum_type]
+        ]()
+        for i in range(rows_per_thread):
+            local_max[i] = neg_inf
+        comptime for m_mma in range(num_m_mmas_qk):
+            comptime for c in range(c_frag_size_qk):
+                comptime row_idx: Int = m_mma * 2 + (1 if (c % 4) >= 2 else 0)
+                var v: Scalar[accum_type] = s_reg.ptr[m_mma * c_frag_size_qk + c]
+                if v > local_max[row_idx]:
+                    local_max[row_idx] = v
+
+        # Reduce across the 4 lanes that share a row pair.
+        @parameter
+        for i in range(rows_per_thread):
+            local_max[i] = warp.lane_group_max[num_lanes=4](local_max[i])
+
+        # Update global rowmax, compute scale_old, scale O and rowsum.
+        var scale_old = stack_allocation[
+            rows_per_thread, Scalar[accum_type]
+        ]()
+        @parameter
+        for i in range(rows_per_thread):
+            var rmax_new: Scalar[accum_type] = (
+                local_max[i] if local_max[i] > rowmax[i] else rowmax[i]
+            )
+            scale_old[i] = exp2(rowmax[i] - rmax_new)
+            rowmax[i] = rmax_new
+            rowsum[i] *= scale_old[i]
+
+        # Scale O_reg by per-row scale_old. O_reg uses the same per-
+        # thread row mapping (m_mma * 2 + in_unit/2) but with
+        # c_frag_size_pv = WGMMA_M * WGMMA_N_PV / 128 = 32.
+        comptime for m_mma in range(num_m_mmas_pv):
+            comptime for c in range(c_frag_size_pv):
+                comptime row_idx: Int = m_mma * 2 + (1 if (c % 4) >= 2 else 0)
+                o_reg.ptr[m_mma * c_frag_size_pv + c] *= scale_old[row_idx]
+
+        # Compute P = exp2(S - rowmax), accumulate row sums.
+        var local_sum = stack_allocation[
+            rows_per_thread, Scalar[accum_type]
+        ]()
+        for i in range(rows_per_thread):
+            local_sum[i] = Scalar[accum_type](0)
+        comptime for m_mma in range(num_m_mmas_qk):
+            comptime for c in range(c_frag_size_qk):
+                comptime row_idx: Int = m_mma * 2 + (1 if (c % 4) >= 2 else 0)
+                var p: Scalar[accum_type] = exp2(
+                    s_reg.ptr[m_mma * c_frag_size_qk + c] - rowmax[row_idx]
+                )
+                s_reg.ptr[m_mma * c_frag_size_qk + c] = p
+                local_sum[row_idx] += p
+        @parameter
+        for i in range(rows_per_thread):
+            local_sum[i] = warp.lane_group_sum[num_lanes=4](local_sum[i])
+            rowsum[i] += local_sum[i]
 
         # V TMA load.
         if thread_idx.x == 0:
@@ -329,13 +361,10 @@ def fwd_fa3_kernel[
         mbar_v[0].wait(phase_v)
         phase_v ^= 1
 
-        # WGMMA: O += P · V, where P = exp2(S) (placeholder, no proper
-        # softmax). The PV wgmma expects A as a register tile shaped
-        # (num_m_mmas * num_k_mmas, a_frag_size) where a_frag_size =
-        # WGMMA_M * WGMMA_K / 128. For BM=128, BN=128, that's (16, 8).
-        # Underlying data is the same 128 fp32 c-frag values from S,
-        # just regrouped (correctness of this reshape vs the cutlass
-        # convert_layout_acc_Aregs shuffle is the next thing to verify).
+        # WGMMA: O += P · V. P lives in s_reg (already exp2'd above);
+        # cast to bf16 into p_reg with the a-frag layout the wgmma
+        # input expects: (num_m_mmas_pv * num_k_mmas_pv, a_frag_size).
+        # Total element count matches the QK c-frag total.
         comptime a_frag_size_pv: Int = WGMMA_M * WGMMA_K // 128  # 8
         comptime num_k_mmas_pv: Int = BN // WGMMA_K              # 8
         var p_reg = LayoutTensor[
@@ -344,8 +373,8 @@ def fwd_fa3_kernel[
             MutAnyOrigin,
             address_space=AddressSpace.LOCAL,
         ].stack_allocation()
-        for i in range(num_m_mmas_qk * num_n_mmas_qk * c_frag_size_qk):
-            p_reg.ptr[i] = exp2(s_reg.ptr[i]).cast[dtype]()
+        comptime for i in range(num_m_mmas_qk * num_n_mmas_qk * c_frag_size_qk):
+            p_reg.ptr[i] = s_reg.ptr[i].cast[dtype]()
 
         warpgroup_fence(o_reg)
         wgmma_pv.arrive()
@@ -353,6 +382,12 @@ def fwd_fa3_kernel[
         wgmma_pv.commit_group()
         wgmma_pv.wait_group()
         warpgroup_fence(o_reg)
+
+    # ---- Final normalization: O_reg /= rowsum.
+    comptime for m_mma in range(num_m_mmas_pv):
+        comptime for c in range(c_frag_size_pv):
+            comptime row_idx: Int = m_mma * 2 + (1 if (c % 4) >= 2 else 0)
+            o_reg.ptr[m_mma * c_frag_size_pv + c] /= rowsum[row_idx]
 
     # ---- Output: write O_reg → gmem row-by-row.
     # m64n64 wgmma c-frag layout per warpgroup thread:
