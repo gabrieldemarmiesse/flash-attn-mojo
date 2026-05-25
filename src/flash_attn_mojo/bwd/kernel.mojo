@@ -1,83 +1,88 @@
-"""Flash-attention backward kernel — MVP scalar/SIMD implementation.
+"""Flash-attention backward kernel — tensor-core (multistage_mma) MMA path.
 
-Port of Tri Dao's `compute_dq_dk_dv_1colblock`
-(`flash-attention/csrc/flash_attn/src/flash_bwd_kernel.h`, lines 81-826).
-MVP envelope (locked at variant compile time):
+Replaces the scalar-loop MVP. Structure mirrors Tri Dao's FA2 bwd
+(`flash-attention/csrc/flash_attn/src/flash_bwd_kernel.h`) but uses
+the same `multistage_mma` primitive the fwd kernel uses for both MMAs.
 
-  - dtype = bf16  (fp16 routed via API-boundary cast — same pattern as fwd)
-  - head_dim = 64
-  - causal: optional (comptime)
-  - softcap: optional (runtime)
-  - no alibi, window, dropout
-  - single seqlen (Q and K share length)
+Algorithm (one block per (n_block, kv_head, batch)):
 
-MQA/GQA: supported via the Tri Dao block layout. Grid Y dim is
-`nheads_kv`; inside each block we loop over the `group_size =
-nheads_q // nheads_kv` Q-heads sharing this KV-head. K/V smem tiles
-are loaded once and reused across the inner group loop. dK_acc /
-dV_acc registers accumulate contributions from every Q-head in the
-group. dQ contributions go to per-Q-head dQaccum slots — no atomic
-conflicts between Q-heads.
+  1. Load K, V into smem.
+  2. For each q-head in the MQA/GQA group, for each q-block:
+     a. Load Q, dO into smem.
+     b. Load LSE, delta.
+     c. S  = Q · Kᵀ           (register-C, fp32, via multistage_mma)
+     d. Softmax: p = exp(S*scale - LSE), apply softcap/alibi/mask/window/dropout.
+     e. Write p_reg → PT_smem (transposed view) for use as A-operand of dV MMA.
+     f. dP = dO · Vᵀ          (register-C, fp32)
+     g. dS = p * (dP - delta[m]) * scale (with softcap chain rule).
+     h. Write ds_reg → dST_smem (transposed) for use as A-operand of dK MMA.
+     i. dV_acc += Pᵀ · dO      (A from PT_smem, B from dO_B)
+     j. dQ_contrib = dS · K    (A from registers, B from K_B; atomic-add to dqaccum)
+     k. dK_acc += dSᵀ · Q      (A from dST_smem, B from Q_B)
+  3. Write dK_acc, dV_acc to gmem (cast to bf16).
 
-The bwd is far harder to make bit-correct than the fwd, so this MVP
-trades performance for correctness: smem holds *every* per-block tile
-(K, V, Q, dO, S/dS, dP) plus per-row LSE / delta scratch, and the
-matmuls run as plain thread-parallel loops over fp32 accumulators rather
-than via `multistage_mma` tensor-core MMAs. dK_acc / dV_acc live in
-registers (one (n, d) element per thread for the (BN×D)=(64×64)=4096
-slot count / 128 threads = 32 elements per thread).
+Smem layout (BM=BN=64, D=64, BK=32):
+    Q_A     (BM, D)  bf16  — (BM, BK) chunks, swizzled. A for S=Q·Kᵀ.
+    Q_B     (BM, D)  bf16  — (BK, D) stripes, swizzled. B for dK=dSᵀ·Q.
+    K_A     (BN, D)  bf16  — (BN, BK) chunks, swizzled. B for S=Q·Kᵀ.
+    K_B     (BN, D)  bf16  — (BK, D) stripes, swizzled. B for dQ=dS·K.
+    V       (BN, D)  bf16  — (BN, BK) chunks, swizzled. B for dP=dO·Vᵀ.
+    dO_A    (BM, D)  bf16  — (BM, BK) chunks, swizzled. A for dP=dO·Vᵀ.
+    dO_B    (BM, D)  bf16  — (BK, D) stripes, swizzled. B for dV=Pᵀ·dO.
+    PT      (BN, BM) bf16  — (BN, BK) chunks, no swizzle. A for dV.
+    dST     (BN, BM) bf16  — (BN, BK) chunks, no swizzle. A for dK.
+    LSE, delta  (BM,) fp32 — one per Q row.
 
-Algorithm (one block per (n_block, batch, head); see upstream lines 81-826):
-
-  1. Load K_tile (BN × D) and V_tile (BN × D) into smem once.
-  2. Initialize dK_acc, dV_acc registers to 0.
-  3. For each q_block in [0, num_q_blocks):
-       a. Load Q (BM × D), dO (BM × D) into smem.
-       b. Load LSE[q], delta[q] into smem.
-       c. S = Q · K^T                                      (BM × BN) fp32
-       d. P = exp2((S * softmax_scale - LSE) * log2e)      (BM × BN) fp32
-          Stored back in S_smem.
-       e. dV_acc += P^T · dO                               (BN × D)
-       f. dP = dO · V^T                                    (BM × BN) fp32
-       g. dS = P * (dP - delta) * softmax_scale            (BM × BN) fp32
-          Stored back overwriting P in S_smem.
-       h. dQ_contrib = dS · K   (per (b,h,q,:) atomic-add into dQaccum fp32)
-       i. dK_acc += dS^T · Q.
-  4. Write dK_acc (cast bf16) and dV_acc (cast bf16) to gmem.
-
-Smem layout (dynamic), sizes shown at head_dim=64 / hd=128:
-    K_smem      : BN × D   bf16   = 8 / 16 KiB
-    V_smem      : BN × D   bf16   = 8 / 16 KiB
-    Q_smem      : BM × D   bf16   = 8 / 16 KiB
-    dO_smem     : BM × D   bf16   = 8 / 16 KiB
-    S_smem      : BM × BN  fp32   = 16 KiB   (reused for dS after dV update)
-    dP_smem     : BM × BN  fp32   = 16 KiB
-    LSE_smem    : BM       fp32   = 256 B
-    delta_smem  : BM       fp32   = 256 B
-    Total                         ~ 64.5 / 96.5 KiB
-
-This sits under the 99 KiB Ada dynamic-smem cap at hd=128. The
-softcap local-derivative factor (1 - (s_post/softcap)^2) is
-recomputed on the fly in the dS step from `log(p) + lse[m]`
-(minus alibi bias) rather than stashed in smem, saving 16 KiB.
+Total at D=64: 9 × BM*D*sizeof(bf16) + small ≈ 72.5 KiB.
+At D=128:   ~144.5 KiB (fits H100's 228 KiB cap; over Ada's 99 KiB).
 """
 
 from std.math import exp, log, log2, tanh
 from std.math.constants import log2e
-from std.sys import size_of
+from std.sys import align_of, simd_width_of, size_of
 from std.utils.index import StaticTuple
+from std.utils.numerics import get_accum_type
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
     barrier,
     block_idx,
+    lane_id,
     thread_idx,
 )
-from std.gpu.memory import AddressSpace, external_memory
+import std.gpu.primitives.warp as warp
+from std.gpu.memory import (
+    AddressSpace,
+    async_copy_commit_group,
+    async_copy_wait_all,
+    external_memory,
+)
 from std.memory import stack_allocation
 from std.atomic import Atomic
 
+from layout import (
+    IntTuple,
+    Layout,
+    LayoutTensor,
+    RuntimeLayout,
+    RuntimeTuple,
+    UNKNOWN_VALUE,
+)
+from layout.layout_tensor import (
+    LayoutTensorIter,
+    copy_dram_to_sram_async,
+)
+from layout.tensor_core import get_fragment_size, get_mma_shape
+
+from linalg.matmul.gpu._multistage_gemm_gpu import multistage_mma
+
 from common import kBwdNThreads, kBwdBlockM, kBwdBlockN
+
+
+# BK chunk size along the K axis of every MMA. Picked to be a multiple
+# of MMA_K (=16 for bf16 m16n8k16) and to divide BM, BN, and head_dim
+# cleanly at the supported head_dims (32, 64, 128).
+comptime kBwdBlockK: Int = 32
 
 
 @__llvm_metadata(
@@ -136,110 +141,180 @@ def bwd_kernel[
     dqa_h_stride: Int,
     dqa_l_stride: Int,
 ):
+    # ---- Comptime configuration.
+    comptime accum_type = get_accum_type[dtype]()
+    comptime simd_size: Int = simd_width_of[dtype]()
+    comptime alignment = align_of[SIMD[dtype, simd_size]]()
+    comptime num_pipeline_stages: Int = 2
+    comptime k_group_size: Int = 1
+
     comptime BM: Int = kBwdBlockM
     comptime BN: Int = kBwdBlockN
+    comptime BK: Int = kBwdBlockK
     comptime D: Int = head_dim
-    comptime nthreads: Int = kBwdNThreads
+    comptime num_threads: Int = kBwdNThreads
 
+    # MMA shape (m16n8k16 for bf16/fp16, fp32 accum).
+    comptime mma_shape = get_mma_shape[dtype, accum_type]()
+    comptime MMA_M: Int = mma_shape[0]
+    comptime MMA_N: Int = mma_shape[1]
+    comptime MMA_K: Int = mma_shape[2]
+
+    comptime WM: Int = BM // 4
+    comptime WN_qk: Int = BN          # WN for S=Q·Kᵀ and dP=dO·Vᵀ
+    comptime WN_dv: Int = D            # WN for dV / dQ / dK
+
+    comptime num_m_mmas_qk: Int = WM // MMA_M
+    comptime num_n_mmas_qk: Int = WN_qk // MMA_N
+    comptime num_m_mmas_dv: Int = WM // MMA_M
+    comptime num_n_mmas_dv: Int = WN_dv // MMA_N
+
+    comptime num_iters_qk_k: Int = D // BK       # S, dP (K=D)
+    comptime num_iters_bn_k: Int = BN // BK      # dQ (K=BN)
+    comptime num_iters_bm_k: Int = BM // BK      # dV, dK (K=BM)
+
+    comptime frag_size = get_fragment_size[mma_shape]()
+    comptime c_frag_size: Int = frag_size[2]
+    comptime c_frag_simdwidth: Int = c_frag_size // 2
+    comptime c_frag_align = align_of[SIMD[accum_type, c_frag_size]]()
+
+    # ---- Per-thread / per-warp coordinates.
     var tid: Int = Int(thread_idx.x)
+    var warp_id_v: UInt32 = warp.broadcast(UInt32(tid) // UInt32(WARP_SIZE))
+    var warp_y: Int = Int(warp_id_v)
+    var lane: Int = Int(lane_id())
+    var lane_group: Int = lane // 4
+    var lane_pair: Int = lane % 4
+
     var n_block: Int = Int(block_idx.x)
     var kv_head_idx: Int = Int(block_idx.y)
     var batch: Int = Int(block_idx.z)
-    # Number of Q-heads sharing this KV-head. Caller guarantees
-    # nheads_q % nheads_kv == 0.
     var group_size: Int = nheads_q // nheads_kv
 
     var kv_row_base: Int = n_block * BN
-    # Out-of-range KV block guard. Launcher rounds up the grid so seqlen
-    # padding tail is possible.
     if kv_row_base >= seq_len:
         return
 
     # ---- Dynamic smem carve-up.
-    # Order: K, V (bf16, BN*D each), Q, dO (bf16, BM*D each),
-    #        S (fp32, BM*BN), dP (fp32, BM*BN), LSE (fp32, BM), delta (fp32, BM).
-    var k_smem = external_memory[
-        Scalar[dtype], address_space=AddressSpace.SHARED, alignment=16
+    comptime buf_qd: Int = BM * D
+    comptime buf_kv: Int = BN * D
+    comptime buf_pt: Int = BN * BM
+
+    var smem_base = external_memory[
+        Scalar[dtype],
+        address_space=AddressSpace.SHARED,
+        alignment=alignment,
     ]()
-    var v_smem = k_smem + (BN * D)
-    var q_smem = v_smem + (BN * D)
-    var do_smem = q_smem + (BM * D)
-    var s_smem = (do_smem + (BM * D)).bitcast[Float32]()
-    var dp_smem = s_smem + (BM * BN)
-    # Softcap local-derivative factor is recomputed on the fly in the dS
-    # step from `log(p) + lse[m]` rather than stashed in a dedicated
-    # smem buffer — saves 16 KiB and brings hd=128 under the 99 KiB Ada
-    # dynamic-smem cap.
-    var lse_smem = dp_smem + (BM * BN)
+
+    var q_a_smem = smem_base
+    var q_b_smem = q_a_smem + buf_qd
+    var k_a_smem = q_b_smem + buf_qd
+    var k_b_smem = k_a_smem + buf_kv
+    var v_smem   = k_b_smem + buf_kv
+    var do_a_smem = v_smem + buf_kv
+    var do_b_smem = do_a_smem + buf_qd
+    var pt_smem  = do_b_smem + buf_qd
+    var dst_smem = pt_smem + buf_pt
+    var lse_smem = (dst_smem + buf_pt).bitcast[Float32]()
     var delta_smem = lse_smem + BM
 
-    # ---- Per-thread dK_acc, dV_acc register tiles.
-    # BN*D / nthreads = 4096 / 128 = 32 fp32 elements per thread for each.
-    # Linear flat layout: thread t owns flat indices [t*ELTS .. (t+1)*ELTS).
-    comptime ELTS_PER_THREAD: Int = (BN * D) // nthreads  # 32
+    # ---- Smem iterators. Each is parameterized by its element layout
+    # (one iter "step" worth) and walks the underlying buffer by
+    # layout.size() elements per `_incr()`.
+    comptime IterMK_BM = LayoutTensorIter[
+        dtype,
+        Layout.row_major(BM, BK),
+        _,
+        address_space=AddressSpace.SHARED,
+        alignment=alignment,
+        circular=True,
+    ]
+    comptime IterMK_BN = LayoutTensorIter[
+        dtype,
+        Layout.row_major(BN, BK),
+        _,
+        address_space=AddressSpace.SHARED,
+        alignment=alignment,
+        circular=True,
+    ]
+    comptime IterKM = LayoutTensorIter[
+        dtype,
+        Layout.row_major(BK, D),
+        _,
+        address_space=AddressSpace.SHARED,
+        alignment=alignment,
+        circular=True,
+    ]
 
-    var dk_acc = stack_allocation[ELTS_PER_THREAD, Float32]()
-    var dv_acc = stack_allocation[ELTS_PER_THREAD, Float32]()
-    comptime for i in range(ELTS_PER_THREAD):
-        dk_acc[i] = Float32(0)
-        dv_acc[i] = Float32(0)
+    var q_a_iter = IterMK_BM(q_a_smem, IterMK_BM.linear_uint_type(buf_qd))
+    var q_b_iter = IterKM(q_b_smem, IterKM.linear_uint_type(buf_qd))
+    var k_a_iter = IterMK_BN(k_a_smem, IterMK_BN.linear_uint_type(buf_kv))
+    var k_b_iter = IterKM(k_b_smem, IterKM.linear_uint_type(buf_kv))
+    var v_iter   = IterMK_BN(v_smem,    IterMK_BN.linear_uint_type(buf_kv))
+    var do_a_iter = IterMK_BM(do_a_smem, IterMK_BM.linear_uint_type(buf_qd))
+    var do_b_iter = IterKM(do_b_smem, IterKM.linear_uint_type(buf_qd))
+    var pt_iter  = IterMK_BN(pt_smem,  IterMK_BN.linear_uint_type(buf_pt))
+    var dst_iter = IterMK_BN(dst_smem, IterMK_BN.linear_uint_type(buf_pt))
 
-    # ---- Load K, V (cooperative, contiguous-in-D).
-    # K_gmem stride: batch, head, l, d. K/V are indexed by the
-    # KV-head, NOT the Q-head — multiple Q-heads share one KV-head
-    # under MQA/GQA.
-    var k_base_off: Int = batch * k_b_stride + kv_head_idx * k_h_stride
-    var v_base_off: Int = batch * v_b_stride + kv_head_idx * v_h_stride
-    # Each thread loads (BN*D)/nthreads bf16 elements.
-    comptime KV_PER_THREAD: Int = (BN * D) // nthreads  # 32
-    for i in range(KV_PER_THREAD):
-        var flat: Int = i * nthreads + tid
-        var row: Int = flat // D
-        var col: Int = flat - row * D
-        var g_row: Int = kv_row_base + row
-        var dst: Int = row * D + col
-        if g_row < seq_len:
-            k_smem[dst] = (k_ptr + k_base_off + g_row * k_l_stride + col)[0]
-            v_smem[dst] = (v_ptr + v_base_off + g_row * v_l_stride + col)[0]
-        else:
-            k_smem[dst] = Scalar[dtype](0)
-            v_smem[dst] = Scalar[dtype](0)
+    # ---- Register accumulators.
+    var dv_acc = (
+        LayoutTensor[
+            accum_type,
+            Layout.row_major(num_m_mmas_dv * num_n_mmas_dv, c_frag_size),
+            MutAnyOrigin,
+            address_space=AddressSpace.LOCAL,
+        ]
+        .stack_allocation[stack_alignment=c_frag_align]()
+        .fill(0)
+    )
+    var dk_acc = (
+        LayoutTensor[
+            accum_type,
+            Layout.row_major(num_m_mmas_dv * num_n_mmas_dv, c_frag_size),
+            MutAnyOrigin,
+            address_space=AddressSpace.LOCAL,
+        ]
+        .stack_allocation[stack_alignment=c_frag_align]()
+        .fill(0)
+    )
 
-    barrier()
+    var s_reg = LayoutTensor[
+        accum_type,
+        Layout.row_major(num_m_mmas_qk * num_n_mmas_qk, c_frag_size),
+        MutAnyOrigin,
+        address_space=AddressSpace.LOCAL,
+    ].stack_allocation[stack_alignment=c_frag_align]()
 
-    # ---- Outer loop over q_blocks.
+    var dp_reg = LayoutTensor[
+        accum_type,
+        Layout.row_major(num_m_mmas_qk * num_n_mmas_qk, c_frag_size),
+        MutAnyOrigin,
+        address_space=AddressSpace.LOCAL,
+    ].stack_allocation[stack_alignment=c_frag_align]()
+
+    var dq_contrib = LayoutTensor[
+        accum_type,
+        Layout.row_major(num_m_mmas_dv * num_n_mmas_dv, c_frag_size),
+        MutAnyOrigin,
+        address_space=AddressSpace.LOCAL,
+    ].stack_allocation[stack_alignment=c_frag_align]()
+
+    # ---- Causal / window block-skip bounds.
     var num_q_blocks: Int = (seq_len + BM - 1) // BM
-    # Causal block-skip lower bound: Q blocks with q_row < kv_row_base are
-    # entirely above the diagonal vs this KV block → P = 0 everywhere →
-    # contribute nothing to dK/dV/dQ. Skip them.
     var qb_start: Int = 0
     var qb_end: Int = num_q_blocks
     @parameter
     if causal:
         qb_start = (n_block * BN) // BM
-    # Sliding-window block-skip. For (q_row, kv_row) to be in window:
-    #   kv_row - right <= q_row <= kv_row + left   (when each side >= 0).
-    # kv_row spans [kv_row_base, kv_row_base + BN - 1] in this block,
-    # so the q-row range that can contribute is
-    #   [kv_row_base - right, (kv_row_base + BN - 1) + left]
-    # for the right and left sides respectively (when each >= 0).
+
     var has_window: Bool = window_left >= 0 or window_right >= 0
     if has_window:
         if window_right >= 0:
-            # Lower bound on q_row: q_row >= kv_row_base - window_right.
-            # Block qb contains q_rows [qb*BM, qb*BM+BM-1]; need
-            # qb*BM + BM - 1 >= kv_row_base - window_right, i.e.
-            # qb >= ceil((kv_row_base - window_right - BM + 1) / BM).
             var lo: Int = kv_row_base - window_right - BM + 1
             var qb_lo: Int = (lo + BM - 1) // BM if lo > 0 else 0
-            # Floor-div for negative numerators: lo <= 0 ⇒ qb_lo = 0.
             if qb_lo > qb_start:
                 qb_start = qb_lo
         if window_left >= 0:
-            # Upper bound on q_row: q_row <= kv_row_base + BN - 1 + window_left.
-            # Block qb contains q_rows [qb*BM, qb*BM+BM-1]; need
-            # qb*BM <= kv_row_base + BN - 1 + window_left, i.e.
-            # qb <= (kv_row_base + BN - 1 + window_left) // BM.
             var hi_inclusive: Int = (
                 kv_row_base + BN - 1 + window_left
             ) // BM
@@ -247,27 +322,28 @@ def bwd_kernel[
             if qb_hi < qb_end:
                 qb_end = qb_hi
 
-    var scale_f: Float32 = softmax_scale
-    var softcap_f: Float32 = softcap
-    var has_softcap: Bool = softcap_f > Float32(0)
-    var softcap_inv: Float32 = (
-        Float32(1) / softcap_f if has_softcap else Float32(0)
+    # ---- Scale / softcap / dropout runtime state.
+    # Cast Float32 inputs into accum_type once so the inner-loop math
+    # stays in a single arithmetic domain (avoids spurious cast chains).
+    var scale_a: Scalar[accum_type] = softmax_scale.cast[accum_type]()
+    var softcap_a: Scalar[accum_type] = softcap.cast[accum_type]()
+    var has_softcap: Bool = softcap > Float32(0)
+    var softcap_inv_a: Scalar[accum_type] = (
+        (Float32(1) / softcap).cast[accum_type]() if has_softcap
+        else Scalar[accum_type](0)
     )
 
-    # ---- Dropout setup. Mirrors fwd/kernel.mojo's setup exactly so the
-    # mask we recompute matches the one the fwd applied. `seed_mix` and
-    # the per-(batch, head) part of `rng_key` are loop-invariant; the
-    # per-head component is folded in inside the q-head loop.
     var has_dropout: Bool = dropout_p > Float32(0)
-    var keep_scale: Float32 = Float32(1)
-    var log_keep_scale: Float32 = Float32(0)
+    var keep_scale_a: Scalar[accum_type] = Scalar[accum_type](1)
+    var log_keep_scale_a: Scalar[accum_type] = Scalar[accum_type](0)
     var drop_threshold_u32: UInt32 = UInt32(0)
     if has_dropout:
-        keep_scale = Float32(1) / (Float32(1) - dropout_p)
-        # Used by the softcap dS-reconstruction path to recover s_post
-        # from the dropout-scaled survivor p:
-        #   p_survivor = p_orig * keep_scale  ⇒  log(p_orig) = log(p) - log(keep_scale).
-        log_keep_scale = log(keep_scale)
+        keep_scale_a = (
+            Float32(1) / (Float32(1) - dropout_p)
+        ).cast[accum_type]()
+        log_keep_scale_a = log(
+            keep_scale_a.cast[DType.float32]()
+        ).cast[accum_type]()
         var thr_f: Float32 = dropout_p * Float32(4294967296.0)
         if thr_f > Float32(4294967040.0):
             thr_f = Float32(4294967040.0)
@@ -277,37 +353,125 @@ def bwd_kernel[
         UInt32(seed_mix & UInt64(0xFFFFFFFF)) ^ UInt32(seed_mix >> UInt64(32))
     )
 
-    # ---- Outer Q-head-in-group loop (MQA/GQA). For non-MQA configs
-    # group_size == 1 so this collapses to a single pass — same flops
-    # as before. K/V smem tiles are loaded once before this loop and
-    # reused across every Q-head in the group; dK/dV registers
-    # accumulate across the full group.
-    # ---- ALiBi slope load. `alibi_ptr` is null (addr 0) when caller
-    # passes no slopes — the fast path stays zero-overhead. Slope is
-    # per (batch, q-head); we load it inside the q-head loop below.
     var has_alibi: Bool = Int(alibi_ptr) != 0
 
+    var neg_sentinel: Scalar[accum_type] = Scalar[accum_type](-1.0e30)
+
+    # ---- Load K (both layouts) and V into smem. Done once per block.
+    var k_base_off: Int = batch * k_b_stride + kv_head_idx * k_h_stride
+    var v_base_off: Int = batch * v_b_stride + kv_head_idx * v_h_stride
+    var kv_actual_rows: Int = min(BN, seq_len - kv_row_base)
+    if kv_actual_rows < 0:
+        kv_actual_rows = 0
+
+    # K → K_A (chunked) layout.
+    comptime kv_gmem_layout = Layout(
+        IntTuple(BN, D), IntTuple(UNKNOWN_VALUE, 1)
+    )
+    var k_gmem_block_a = LayoutTensor[
+        dtype,
+        kv_gmem_layout,
+        layout_int_type=DType.int32,
+        linear_idx_type=DType.int32,
+        masked=True,
+    ](
+        k_ptr + k_base_off + kv_row_base * k_l_stride,
+        RuntimeLayout[element_type=DType.int32, linear_idx_type=DType.int32](
+            RuntimeTuple[kv_gmem_layout.shape, element_type=DType.int32](
+                kv_actual_rows, D
+            ),
+            RuntimeTuple[kv_gmem_layout.stride, element_type=DType.int32](
+                k_l_stride, 1
+            ),
+        ),
+    )
+    var k_gmem_a_iter = k_gmem_block_a.tiled_iterator[BN, BK, axis=1](0, 0)
+    comptime async_copy_bn = Layout.row_major(BN, num_threads // BN)
+    comptime for k_id in range(D // BK):
+        var smem_tile = k_a_iter.next_unsafe(
+            k_a_iter.linear_uint_type(k_id)
+        )[]
+        copy_dram_to_sram_async[
+            thread_layout=async_copy_bn,
+            swizzle=True,
+            num_threads=num_threads,
+        ](
+            smem_tile.vectorize[1, simd_size](),
+            k_gmem_a_iter[].vectorize[1, simd_size](),
+        )
+        k_gmem_a_iter._incr()
+
+    # K → K_B (striped) layout.
+    var k_gmem_block_b = LayoutTensor[
+        dtype,
+        kv_gmem_layout,
+        layout_int_type=DType.int32,
+        linear_idx_type=DType.int32,
+        masked=True,
+    ](
+        k_ptr + k_base_off + kv_row_base * k_l_stride,
+        RuntimeLayout[element_type=DType.int32, linear_idx_type=DType.int32](
+            RuntimeTuple[kv_gmem_layout.shape, element_type=DType.int32](
+                kv_actual_rows, D
+            ),
+            RuntimeTuple[kv_gmem_layout.stride, element_type=DType.int32](
+                k_l_stride, 1
+            ),
+        ),
+    )
+    var k_gmem_b_iter = k_gmem_block_b.tiled_iterator[BK, D, axis=0](0, 0)
+    comptime async_copy_bk = Layout.row_major(BK, num_threads // BK)
+    comptime for m_id in range(BN // BK):
+        var smem_tile = k_b_iter.next_unsafe(
+            k_b_iter.linear_uint_type(m_id)
+        )[]
+        copy_dram_to_sram_async[
+            thread_layout=async_copy_bk,
+            swizzle=True,
+            num_threads=num_threads,
+        ](
+            smem_tile.vectorize[1, simd_size](),
+            k_gmem_b_iter[].vectorize[1, simd_size](),
+        )
+        k_gmem_b_iter._incr()
+
+    # V → V_smem (chunked) layout.
+    var v_gmem_block = LayoutTensor[
+        dtype,
+        kv_gmem_layout,
+        layout_int_type=DType.int32,
+        linear_idx_type=DType.int32,
+        masked=True,
+    ](
+        v_ptr + v_base_off + kv_row_base * v_l_stride,
+        RuntimeLayout[element_type=DType.int32, linear_idx_type=DType.int32](
+            RuntimeTuple[kv_gmem_layout.shape, element_type=DType.int32](
+                kv_actual_rows, D
+            ),
+            RuntimeTuple[kv_gmem_layout.stride, element_type=DType.int32](
+                v_l_stride, 1
+            ),
+        ),
+    )
+    var v_gmem_iter = v_gmem_block.tiled_iterator[BN, BK, axis=1](0, 0)
+    comptime for k_id in range(D // BK):
+        var smem_tile = v_iter.next_unsafe(
+            v_iter.linear_uint_type(k_id)
+        )[]
+        copy_dram_to_sram_async[
+            thread_layout=async_copy_bn,
+            swizzle=True,
+            num_threads=num_threads,
+        ](
+            smem_tile.vectorize[1, simd_size](),
+            v_gmem_iter[].vectorize[1, simd_size](),
+        )
+        v_gmem_iter._incr()
+
+    # ---- Per-q-head loop (MQA/GQA).
     for h_q_in_group in range(group_size):
         var q_head_idx: Int = kv_head_idx * group_size + h_q_in_group
         var q_base_off: Int = batch * q_b_stride + q_head_idx * q_h_stride
-        # Per-(batch, q-head) rng_key — mirrors fwd's `rng_key`
-        # computation bit-for-bit so the recomputed mask matches the
-        # fwd's applied mask at every (batch, q_head, q_idx, kv_idx).
-        var bh_mix: UInt64 = (
-            UInt64(batch) * UInt64(2654435761)
-            + UInt64(q_head_idx) * UInt64(40503)
-        )
-        var rng_key: UInt32 = (
-            seed_mix_xor32
-            ^ UInt32(bh_mix & UInt64(0xFFFFFFFF))
-            ^ UInt32(bh_mix >> UInt64(32))
-        )
-        var alibi_slope: Float32 = Float32(0)
-        if has_alibi:
-            var alibi_off: Int = (
-                batch * alibi_b_stride + q_head_idx * alibi_h_stride
-            )
-            alibi_slope = (alibi_ptr + alibi_off)[0]
         var do_base_off: Int = batch * do_b_stride + q_head_idx * do_h_stride
         var lse_base_off: Int = (
             batch * lse_b_stride + q_head_idx * lse_h_stride
@@ -319,266 +483,544 @@ def bwd_kernel[
             batch * dqa_b_stride + q_head_idx * dqa_h_stride
         )
 
+        var bh_mix: UInt64 = (
+            UInt64(batch) * UInt64(2654435761)
+            + UInt64(q_head_idx) * UInt64(40503)
+        )
+        var rng_key: UInt32 = (
+            seed_mix_xor32
+            ^ UInt32(bh_mix & UInt64(0xFFFFFFFF))
+            ^ UInt32(bh_mix >> UInt64(32))
+        )
+        var alibi_slope_a: Scalar[accum_type] = Scalar[accum_type](0)
+        if has_alibi:
+            var alibi_off: Int = (
+                batch * alibi_b_stride + q_head_idx * alibi_h_stride
+            )
+            alibi_slope_a = (alibi_ptr + alibi_off)[0].cast[accum_type]()
+
         for qb in range(qb_start, qb_end):
             var q_row_base: Int = qb * BM
+            var q_actual_rows: Int = min(BM, seq_len - q_row_base)
+            if q_actual_rows < 0:
+                q_actual_rows = 0
 
-            # ---- Load Q, dO into smem.
-            for i in range(KV_PER_THREAD):
-                var flat: Int = i * nthreads + tid
-                var row: Int = flat // D
-                var col: Int = flat - row * D
-                var g_row: Int = q_row_base + row
-                var dst: Int = row * D + col
-                if g_row < seq_len:
-                    q_smem[dst] = (
-                        q_ptr + q_base_off + g_row * q_l_stride + col
-                    )[0]
-                    do_smem[dst] = (
-                        do_ptr + do_base_off + g_row * do_l_stride + col
-                    )[0]
-                else:
-                    q_smem[dst] = Scalar[dtype](0)
-                    do_smem[dst] = Scalar[dtype](0)
+            _ = s_reg.fill(0)
+            _ = dp_reg.fill(0)
+            _ = dq_contrib.fill(0)
 
-            # ---- Load LSE, delta (BM elements each, 128 threads → 2 per thread
-            #      at BM=64 first thread of each pair does it).
-            if tid < BM:
-                var g_row: Int = q_row_base + tid
-                if g_row < seq_len:
-                    lse_smem[tid] = (lse_ptr + lse_base_off + g_row)[0]
-                    delta_smem[tid] = (delta_ptr + delta_base_off + g_row)[0]
-                else:
-                    # Padded rows: LSE = -inf, delta = 0 → P=0, contributes nothing.
-                    lse_smem[tid] = Float32(-1.0e30)
-                    delta_smem[tid] = Float32(0)
+            # ---- Load Q (both layouts).
+            comptime qd_gmem_layout = Layout(
+                IntTuple(BM, D), IntTuple(UNKNOWN_VALUE, 1)
+            )
+            var q_gmem_block_a = LayoutTensor[
+                dtype,
+                qd_gmem_layout,
+                layout_int_type=DType.int32,
+                linear_idx_type=DType.int32,
+                masked=True,
+            ](
+                q_ptr + q_base_off + q_row_base * q_l_stride,
+                RuntimeLayout[
+                    element_type=DType.int32, linear_idx_type=DType.int32
+                ](
+                    RuntimeTuple[
+                        qd_gmem_layout.shape, element_type=DType.int32
+                    ](q_actual_rows, D),
+                    RuntimeTuple[
+                        qd_gmem_layout.stride, element_type=DType.int32
+                    ](q_l_stride, 1),
+                ),
+            )
+            var q_gmem_a_iter = q_gmem_block_a.tiled_iterator[BM, BK, axis=1](0, 0)
+            comptime async_copy_bm = Layout.row_major(BM, num_threads // BM)
+            comptime for k_id in range(D // BK):
+                var smem_tile = q_a_iter.next_unsafe(
+                    q_a_iter.linear_uint_type(k_id)
+                )[]
+                copy_dram_to_sram_async[
+                    thread_layout=async_copy_bm,
+                    swizzle=True,
+                    num_threads=num_threads,
+                ](
+                    smem_tile.vectorize[1, simd_size](),
+                    q_gmem_a_iter[].vectorize[1, simd_size](),
+                )
+                q_gmem_a_iter._incr()
 
-            barrier()
+            var q_gmem_block_b = LayoutTensor[
+                dtype,
+                qd_gmem_layout,
+                layout_int_type=DType.int32,
+                linear_idx_type=DType.int32,
+                masked=True,
+            ](
+                q_ptr + q_base_off + q_row_base * q_l_stride,
+                RuntimeLayout[
+                    element_type=DType.int32, linear_idx_type=DType.int32
+                ](
+                    RuntimeTuple[
+                        qd_gmem_layout.shape, element_type=DType.int32
+                    ](q_actual_rows, D),
+                    RuntimeTuple[
+                        qd_gmem_layout.stride, element_type=DType.int32
+                    ](q_l_stride, 1),
+                ),
+            )
+            var q_gmem_b_iter = q_gmem_block_b.tiled_iterator[BK, D, axis=0](0, 0)
+            comptime for m_id in range(BM // BK):
+                var smem_tile = q_b_iter.next_unsafe(
+                    q_b_iter.linear_uint_type(m_id)
+                )[]
+                copy_dram_to_sram_async[
+                    thread_layout=async_copy_bk,
+                    swizzle=True,
+                    num_threads=num_threads,
+                ](
+                    smem_tile.vectorize[1, simd_size](),
+                    q_gmem_b_iter[].vectorize[1, simd_size](),
+                )
+                q_gmem_b_iter._incr()
 
-            # ---- S = Q · K^T  (BM × BN), fp32.
-            # Output layout S_smem[m, n] at index m*BN + n. 128 threads, BM*BN=4096
-            # cells → 32 cells per thread, flat-strided.
-            comptime SBN_PER_THREAD: Int = (BM * BN) // nthreads  # 32
-            for i in range(SBN_PER_THREAD):
-                var flat: Int = i * nthreads + tid
-                var m: Int = flat // BN
-                var n: Int = flat - m * BN
-                var acc: Float32 = Float32(0)
-                for d in range(D):
-                    var qv: Float32 = q_smem[m * D + d].cast[DType.float32]()
-                    var kv: Float32 = k_smem[n * D + d].cast[DType.float32]()
-                    acc = acc + qv * kv
-                s_smem[m * BN + n] = acc
+            # ---- Load dO (both layouts).
+            var do_gmem_block_a = LayoutTensor[
+                dtype,
+                qd_gmem_layout,
+                layout_int_type=DType.int32,
+                linear_idx_type=DType.int32,
+                masked=True,
+            ](
+                do_ptr + do_base_off + q_row_base * do_l_stride,
+                RuntimeLayout[
+                    element_type=DType.int32, linear_idx_type=DType.int32
+                ](
+                    RuntimeTuple[
+                        qd_gmem_layout.shape, element_type=DType.int32
+                    ](q_actual_rows, D),
+                    RuntimeTuple[
+                        qd_gmem_layout.stride, element_type=DType.int32
+                    ](do_l_stride, 1),
+                ),
+            )
+            var do_gmem_a_iter = do_gmem_block_a.tiled_iterator[BM, BK, axis=1](0, 0)
+            comptime for k_id in range(D // BK):
+                var smem_tile = do_a_iter.next_unsafe(
+                    do_a_iter.linear_uint_type(k_id)
+                )[]
+                copy_dram_to_sram_async[
+                    thread_layout=async_copy_bm,
+                    swizzle=True,
+                    num_threads=num_threads,
+                ](
+                    smem_tile.vectorize[1, simd_size](),
+                    do_gmem_a_iter[].vectorize[1, simd_size](),
+                )
+                do_gmem_a_iter._incr()
 
-            barrier()
+            var do_gmem_block_b = LayoutTensor[
+                dtype,
+                qd_gmem_layout,
+                layout_int_type=DType.int32,
+                linear_idx_type=DType.int32,
+                masked=True,
+            ](
+                do_ptr + do_base_off + q_row_base * do_l_stride,
+                RuntimeLayout[
+                    element_type=DType.int32, linear_idx_type=DType.int32
+                ](
+                    RuntimeTuple[
+                        qd_gmem_layout.shape, element_type=DType.int32
+                    ](q_actual_rows, D),
+                    RuntimeTuple[
+                        qd_gmem_layout.stride, element_type=DType.int32
+                    ](do_l_stride, 1),
+                ),
+            )
+            var do_gmem_b_iter = do_gmem_block_b.tiled_iterator[BK, D, axis=0](0, 0)
+            comptime for m_id in range(BM // BK):
+                var smem_tile = do_b_iter.next_unsafe(
+                    do_b_iter.linear_uint_type(m_id)
+                )[]
+                copy_dram_to_sram_async[
+                    thread_layout=async_copy_bk,
+                    swizzle=True,
+                    num_threads=num_threads,
+                ](
+                    smem_tile.vectorize[1, simd_size](),
+                    do_gmem_b_iter[].vectorize[1, simd_size](),
+                )
+                do_gmem_b_iter._incr()
 
-            # ---- Apply scale, subtract LSE, exponentiate to P. Store back in S_smem.
-            # P[m, n] = exp(S[m, n] * softmax_scale - LSE[m]).
-            # Use natural exp here (delta convention matches: dS = P * (dP - delta)
-            # with natural-log LSE — same as the pytorch fallback).
-            for i in range(SBN_PER_THREAD):
-                var flat: Int = i * nthreads + tid
-                var m: Int = flat // BN
-                var n: Int = flat - m * BN
-                var g_row: Int = q_row_base + m
-                var g_col: Int = kv_row_base + n
-                # s_pre = (Q · K^T) * softmax_scale.
-                var s_pre: Float32 = s_smem[m * BN + n] * scale_f
-                # Apply softcap (if enabled). s_post is the value that
-                # actually feeds softmax: s_post = softcap*tanh(s_pre/softcap).
-                # Local derivative ds_post/ds_pre = 1 - (s_post/softcap)^2
-                # is recomputed in the dS loop from `log(p) + lse[m]`
-                # rather than stashed here — saves 16 KiB of smem (lets
-                # hd=128 fit under the 99 KiB Ada dynamic-smem cap).
-                var s_post: Float32 = s_pre
-                if has_softcap:
-                    s_post = softcap_f * tanh(s_pre * softcap_inv)
-                # ALiBi bias is additive and matches the fwd kernel
-                # convention exactly: causal=+slope*col, non-causal=
-                # -slope*|row-col|. Composition order: scores_raw →
-                # softcap → alibi → mask → exp(... - LSE). Pure additive
-                # so dS/dS_pre_alibi = 1; doesn't affect softcap
-                # derivative below.
-                if has_alibi:
-                    @parameter
-                    if causal:
-                        s_post = s_post + alibi_slope * Float32(g_col)
+            # ---- Load LSE, delta.
+            comptime LSE_PER_THREAD: Int = (BM + num_threads - 1) // num_threads
+            comptime for li in range(LSE_PER_THREAD):
+                var i: Int = li * num_threads + tid
+                if i < BM:
+                    var g_row: Int = q_row_base + i
+                    if g_row < seq_len:
+                        lse_smem[i] = (lse_ptr + lse_base_off + g_row)[0]
+                        delta_smem[i] = (delta_ptr + delta_base_off + g_row)[0]
                     else:
-                        var d_rc: Int = g_col - g_row
-                        if d_rc < 0:
-                            d_rc = -d_rc
-                        s_post = s_post - alibi_slope * Float32(d_rc)
-                var p: Float32
-                var masked: Bool = g_row >= seq_len or g_col >= seq_len
-                @parameter
-                if causal:
-                    if g_row < g_col:
-                        masked = True
-                # Sliding-window mask: kv_col must lie in
-                # [g_row - window_left, g_row + window_right] when each
-                # bound is >= 0. -1 = unbounded.
-                if has_window:
-                    if window_left >= 0 and g_col < g_row - window_left:
-                        masked = True
-                    if window_right >= 0 and g_col > g_row + window_right:
-                        masked = True
-                if masked:
-                    p = Float32(0)
-                else:
-                    p = exp(s_post - lse_smem[m])
-                # ---- Dropout: replay the fwd's per-element mask. The
-                # mixer matches `fwd/kernel.mojo` bit-for-bit so the same
-                # `u` is produced at the same (b, h, q_idx, kv_idx) →
-                # dropped/kept decisions agree. Survivors get scaled by
-                # `1 / (1 - p)`. The chain that follows
-                # (dV += P^T·dO, dP = dO·V^T, dS = P*(dP-delta)) inherits
-                # the dropout naturally: dropped positions have P=0 and
-                # contribute nothing; survivor dS gets the `1/(1-p)`
-                # factor via the scaled P.
-                if has_dropout and not masked:
-                    var u: UInt32 = (
-                        rng_key
-                        ^ UInt32(g_row) * UInt32(0x9E3779B1)
-                        ^ UInt32(g_col) * UInt32(0x85EBCA77)
-                    )
-                    u = u ^ (u >> UInt32(16))
-                    u = u * UInt32(0x7FEB352D)
-                    u = u ^ (u >> UInt32(15))
-                    u = u * UInt32(0x846CA68B)
-                    u = u ^ (u >> UInt32(16))
-                    if u < drop_threshold_u32:
-                        p = Float32(0)
-                    else:
-                        p = p * keep_scale
-                s_smem[m * BN + n] = p
+                        lse_smem[i] = Float32(-1.0e30)
+                        delta_smem[i] = Float32(0)
 
+            async_copy_commit_group()
+            async_copy_wait_all()
             barrier()
 
-            # ---- dV_acc += P^T · dO   (BN × D), accumulate in registers.
-            # dV[n, d] += sum_m P[m, n] * dO[m, d].
-            # Thread t owns dv_acc indices [t*32 .. (t+1)*32). Flat → (n, d).
-            for i in range(ELTS_PER_THREAD):
-                var flat: Int = tid * ELTS_PER_THREAD + i
-                var n: Int = flat // D
-                var d: Int = flat - n * D
-                var acc: Float32 = Float32(0)
-                for m in range(BM):
-                    var pv: Float32 = s_smem[m * BN + n]
-                    var dov: Float32 = do_smem[m * D + d].cast[DType.float32]()
-                    acc = acc + pv * dov
-                dv_acc[i] = dv_acc[i] + acc
+            # ---- MMA 1: s_reg = Q · Kᵀ.
+            multistage_mma[
+                BM, BN, BK, WM, WN_qk,
+                num_threads, num_pipeline_stages,
+                True,
+                swizzle_a=True,
+                prefetch_init=False,
+                static_num_iters=num_iters_qk_k,
+                k_group_size=k_group_size,
+            ](
+                s_reg,
+                q_a_iter, k_a_iter,
+                q_a_iter, k_a_iter,
+                num_iters_qk_k,
+            )
 
-            # ---- dP = dO · V^T  (BM × BN), fp32.
-            for i in range(SBN_PER_THREAD):
-                var flat: Int = i * nthreads + tid
-                var m: Int = flat // BN
-                var n: Int = flat - m * BN
-                var acc: Float32 = Float32(0)
-                for d in range(D):
-                    var dov: Float32 = do_smem[m * D + d].cast[DType.float32]()
-                    var vv: Float32 = v_smem[n * D + d].cast[DType.float32]()
-                    acc = acc + dov * vv
-                dp_smem[m * BN + n] = acc
-
-            barrier()
-
-            # ---- dS = P * (dP - delta[m]) * softmax_scale. Overwrites P in S_smem.
-            # We fold softmax_scale into dS here (upstream FA2 splits the scale
-            # between the dQ and dK paths; the simplest correct accounting is to
-            # bake the full scale into dS once so the trailing matmuls' results
-            # are already scaled — matches the pytorch fallback in _fn.py which
-            # multiplies dq/dk by softmax_scale after a `ds_raw = ds_post * ...`
-            # step).
-            for i in range(SBN_PER_THREAD):
-                var flat: Int = i * nthreads + tid
-                var m: Int = flat // BN
-                var n: Int = flat - m * BN
-                var p: Float32 = s_smem[m * BN + n]
-                var dpv: Float32 = dp_smem[m * BN + n]
-                # dS_post = P * (dP - delta). Chain through softcap:
-                # dS_pre = dS_post * (1 - (s_post/softcap)^2). Then bake
-                # softmax_scale into dS so the trailing matmuls land
-                # dq/dk pre-scaled (matches the pytorch fallback order).
-                var ds: Float32 = p * (dpv - delta_smem[m])
-                if has_softcap:
-                    # Reconstruct the post-softcap (pre-alibi) s_post from
-                    # p and LSE: p = exp(s_post_with_alibi - lse[m]), so
-                    # s_post = log(p) + lse[m] - alibi_bias. ALiBi is
-                    # additive so we subtract it back out to get the
-                    # pre-alibi s_post that softcap saw. When p == 0
-                    # (masked) ds is already 0 — skip log(0).
-                    if p > Float32(0):
-                        var g_row: Int = q_row_base + m
-                        var g_col: Int = kv_row_base + n
-                        # Undo the dropout keep-scale before taking log to
-                        # recover the original post-softmax p — see the
-                        # `log_keep_scale` setup comment above.
-                        var s_post: Float32 = (
-                            log(p) - log_keep_scale + lse_smem[m]
+            # ---- Softmax → p_reg (overwrites s_reg).
+            var s_vec = s_reg.vectorize[1, c_frag_simdwidth]()
+            comptime for m_mma in range(num_m_mmas_qk):
+                comptime for n_mma in range(num_n_mmas_qk):
+                    comptime mma_id = n_mma * num_m_mmas_qk + m_mma
+                    var mma_col_base: Int = n_mma * MMA_N
+                    comptime for i in range(2):
+                        var row_in_warp: Int = (
+                            m_mma * MMA_M
+                            + lane_group
+                            + (8 if i == 1 else 0)
                         )
-                        if has_alibi:
+                        var lse_row: Int = warp_y * WM + row_in_warp
+                        var q_idx: Int = q_row_base + lse_row
+                        var lse_val: Scalar[accum_type] = (
+                            lse_smem[lse_row].cast[accum_type]()
+                        )
+                        comptime for j in range(c_frag_simdwidth):
+                            var col_off: Int = 2 * lane_pair + j
+                            var g_col: Int = (
+                                kv_row_base + mma_col_base + col_off
+                            )
+                            var s_pre: Scalar[accum_type] = (
+                                s_vec[mma_id, i][j] * scale_a
+                            )
+                            var s_post: Scalar[accum_type] = s_pre
+                            if has_softcap:
+                                s_post = softcap_a * tanh(
+                                    (s_pre * softcap_inv_a).cast[DType.float32]()
+                                ).cast[accum_type]()
+                            if has_alibi:
+                                @parameter
+                                if causal:
+                                    s_post = (
+                                        s_post
+                                        + alibi_slope_a
+                                        * Scalar[accum_type](g_col)
+                                    )
+                                else:
+                                    var d_rc: Int = g_col - q_idx
+                                    if d_rc < 0:
+                                        d_rc = -d_rc
+                                    s_post = (
+                                        s_post
+                                        - alibi_slope_a
+                                        * Scalar[accum_type](d_rc)
+                                    )
+                            var masked: Bool = (
+                                q_idx >= seq_len or g_col >= seq_len
+                            )
                             @parameter
                             if causal:
-                                s_post = s_post - alibi_slope * Float32(g_col)
+                                if q_idx < g_col:
+                                    masked = True
+                            if has_window:
+                                if (
+                                    window_left >= 0
+                                    and g_col < q_idx - window_left
+                                ):
+                                    masked = True
+                                if (
+                                    window_right >= 0
+                                    and g_col > q_idx + window_right
+                                ):
+                                    masked = True
+                            var p_val: Scalar[accum_type]
+                            if masked:
+                                p_val = Scalar[accum_type](0)
                             else:
-                                var d_rc: Int = g_col - g_row
-                                if d_rc < 0:
-                                    d_rc = -d_rc
-                                s_post = s_post + alibi_slope * Float32(d_rc)
-                        var t: Float32 = s_post * softcap_inv
-                        ds = ds * (Float32(1) - t * t)
-                ds = ds * scale_f
-                s_smem[m * BN + n] = ds
+                                p_val = exp(
+                                    (s_post - lse_val).cast[DType.float32]()
+                                ).cast[accum_type]()
+                            if has_dropout and not masked:
+                                var u: UInt32 = (
+                                    rng_key
+                                    ^ UInt32(q_idx) * UInt32(0x9E3779B1)
+                                    ^ UInt32(g_col) * UInt32(0x85EBCA77)
+                                )
+                                u = u ^ (u >> UInt32(16))
+                                u = u * UInt32(0x7FEB352D)
+                                u = u ^ (u >> UInt32(15))
+                                u = u * UInt32(0x846CA68B)
+                                u = u ^ (u >> UInt32(16))
+                                if u < drop_threshold_u32:
+                                    p_val = Scalar[accum_type](0)
+                                else:
+                                    p_val = p_val * keep_scale_a
+                            s_vec[mma_id, i][j] = p_val
 
-            barrier()
-
-            # ---- dQ_contrib (BM × D) = dS · K. Atomic-add into dqaccum.
-            # Thread layout: BM*D = 4096 cells / 128 threads = 32 per thread.
-            for i in range(ELTS_PER_THREAD):
-                var flat: Int = i * nthreads + tid
-                var m: Int = flat // D
-                var d: Int = flat - m * D
-                var g_row: Int = q_row_base + m
-                if g_row < seq_len:
-                    var acc: Float32 = Float32(0)
-                    for n in range(BN):
-                        var dsv: Float32 = s_smem[m * BN + n]
-                        var kv: Float32 = k_smem[n * D + d].cast[DType.float32]()
-                        acc = acc + dsv * kv
-                    var dqa_addr = (
-                        dqaccum_ptr
-                        + dqa_base_off
-                        + g_row * dqa_l_stride
-                        + d
+            # ---- Write p_reg → PT_smem in transposed layout.
+            comptime for m_mma in range(num_m_mmas_qk):
+                comptime for n_mma in range(num_n_mmas_qk):
+                    comptime mma_id_p = n_mma * num_m_mmas_qk + m_mma
+                    var mma_col_base_p: Int = n_mma * MMA_N
+                    var row_top: Int = (
+                        warp_y * WM + m_mma * MMA_M + lane_group
                     )
-                    _ = Atomic.fetch_add(dqa_addr, acc)
+                    var row_bot: Int = row_top + 8
+                    var col_a: Int = mma_col_base_p + 2 * lane_pair
+                    var col_b: Int = col_a + 1
+                    var top_chunk: Int = row_top // BK
+                    var top_off: Int = row_top - top_chunk * BK
+                    var bot_chunk: Int = row_bot // BK
+                    var bot_off: Int = row_bot - bot_chunk * BK
+                    pt_smem[top_chunk * BN * BK + col_a * BK + top_off] = (
+                        s_reg.ptr[mma_id_p * c_frag_size + 0].cast[dtype]()
+                    )
+                    pt_smem[top_chunk * BN * BK + col_b * BK + top_off] = (
+                        s_reg.ptr[mma_id_p * c_frag_size + 1].cast[dtype]()
+                    )
+                    pt_smem[bot_chunk * BN * BK + col_a * BK + bot_off] = (
+                        s_reg.ptr[mma_id_p * c_frag_size + 2].cast[dtype]()
+                    )
+                    pt_smem[bot_chunk * BN * BK + col_b * BK + bot_off] = (
+                        s_reg.ptr[mma_id_p * c_frag_size + 3].cast[dtype]()
+                    )
 
-            # ---- dK_acc += dS^T · Q  (BN × D). Accumulate in registers.
-            for i in range(ELTS_PER_THREAD):
-                var flat: Int = tid * ELTS_PER_THREAD + i
-                var n: Int = flat // D
-                var d: Int = flat - n * D
-                var acc: Float32 = Float32(0)
-                for m in range(BM):
-                    var dsv: Float32 = s_smem[m * BN + n]
-                    var qv: Float32 = q_smem[m * D + d].cast[DType.float32]()
-                    acc = acc + dsv * qv
-                dk_acc[i] = dk_acc[i] + acc
+            # ---- MMA 3: dp_reg = dO · Vᵀ.
+            _ = dp_reg.fill(0)
+            multistage_mma[
+                BM, BN, BK, WM, WN_qk,
+                num_threads, num_pipeline_stages,
+                True,
+                swizzle_a=True,
+                prefetch_init=False,
+                static_num_iters=num_iters_qk_k,
+                k_group_size=k_group_size,
+            ](
+                dp_reg,
+                do_a_iter, v_iter,
+                do_a_iter, v_iter,
+                num_iters_qk_k,
+            )
+
+            # ---- Combine: ds_reg = p_reg * (dp_reg - delta[m]) * scale.
+            var dp_vec = dp_reg.vectorize[1, c_frag_simdwidth]()
+            comptime for m_mma in range(num_m_mmas_qk):
+                comptime for n_mma in range(num_n_mmas_qk):
+                    comptime mma_id_ds = n_mma * num_m_mmas_qk + m_mma
+                    var mma_col_base_ds: Int = n_mma * MMA_N
+                    comptime for i in range(2):
+                        var row_in_warp: Int = (
+                            m_mma * MMA_M
+                            + lane_group
+                            + (8 if i == 1 else 0)
+                        )
+                        var lse_row: Int = warp_y * WM + row_in_warp
+                        var q_idx_ds: Int = q_row_base + lse_row
+                        var delta_v: Scalar[accum_type] = (
+                            delta_smem[lse_row].cast[accum_type]()
+                        )
+                        var lse_v: Scalar[accum_type] = (
+                            lse_smem[lse_row].cast[accum_type]()
+                        )
+                        comptime for j in range(c_frag_simdwidth):
+                            var col_off_ds: Int = 2 * lane_pair + j
+                            var g_col_ds: Int = (
+                                kv_row_base + mma_col_base_ds + col_off_ds
+                            )
+                            var p_v: Scalar[accum_type] = (
+                                s_vec[mma_id_ds, i][j]
+                            )
+                            var ds: Scalar[accum_type] = (
+                                p_v * (dp_vec[mma_id_ds, i][j] - delta_v)
+                            )
+                            if has_softcap:
+                                if p_v > Scalar[accum_type](0):
+                                    var s_post_r: Scalar[accum_type] = (
+                                        log(
+                                            p_v.cast[DType.float32]()
+                                        ).cast[accum_type]()
+                                        - log_keep_scale_a + lse_v
+                                    )
+                                    if has_alibi:
+                                        @parameter
+                                        if causal:
+                                            s_post_r = (
+                                                s_post_r
+                                                - alibi_slope_a
+                                                * Scalar[accum_type](g_col_ds)
+                                            )
+                                        else:
+                                            var d_rc_r: Int = (
+                                                g_col_ds - q_idx_ds
+                                            )
+                                            if d_rc_r < 0:
+                                                d_rc_r = -d_rc_r
+                                            s_post_r = (
+                                                s_post_r
+                                                + alibi_slope_a
+                                                * Scalar[accum_type](d_rc_r)
+                                            )
+                                    var t_r: Scalar[accum_type] = (
+                                        s_post_r * softcap_inv_a
+                                    )
+                                    ds = ds * (Scalar[accum_type](1) - t_r * t_r)
+                            ds = ds * scale_a
+                            s_vec[mma_id_ds, i][j] = ds
+
+            # ---- Write ds_reg → dST_smem (same transposed layout as PT).
+            comptime for m_mma in range(num_m_mmas_qk):
+                comptime for n_mma in range(num_n_mmas_qk):
+                    comptime mma_id_dst = n_mma * num_m_mmas_qk + m_mma
+                    var mma_col_base_dst: Int = n_mma * MMA_N
+                    var row_top: Int = (
+                        warp_y * WM + m_mma * MMA_M + lane_group
+                    )
+                    var row_bot: Int = row_top + 8
+                    var col_a: Int = mma_col_base_dst + 2 * lane_pair
+                    var col_b: Int = col_a + 1
+                    var top_chunk: Int = row_top // BK
+                    var top_off: Int = row_top - top_chunk * BK
+                    var bot_chunk: Int = row_bot // BK
+                    var bot_off: Int = row_bot - bot_chunk * BK
+                    dst_smem[top_chunk * BN * BK + col_a * BK + top_off] = (
+                        s_reg.ptr[mma_id_dst * c_frag_size + 0].cast[dtype]()
+                    )
+                    dst_smem[top_chunk * BN * BK + col_b * BK + top_off] = (
+                        s_reg.ptr[mma_id_dst * c_frag_size + 1].cast[dtype]()
+                    )
+                    dst_smem[bot_chunk * BN * BK + col_a * BK + bot_off] = (
+                        s_reg.ptr[mma_id_dst * c_frag_size + 2].cast[dtype]()
+                    )
+                    dst_smem[bot_chunk * BN * BK + col_b * BK + bot_off] = (
+                        s_reg.ptr[mma_id_dst * c_frag_size + 3].cast[dtype]()
+                    )
 
             barrier()
 
-    # ---- Write dK, dV back to gmem (cast to bf16). dK has softmax_scale
-    # already folded in (since we baked it into dS). dV does NOT have it.
+            # ---- MMA 2: dV_acc += Pᵀ · dO.
+            multistage_mma[
+                BN, D, BK, WM, WN_dv,
+                num_threads, num_pipeline_stages,
+                False,
+                swizzle_a=False,
+                prefetch_init=False,
+                static_num_iters=num_iters_bm_k,
+                k_group_size=k_group_size,
+            ](
+                dv_acc,
+                pt_iter, do_b_iter,
+                pt_iter, do_b_iter,
+                num_iters_bm_k,
+            )
+
+            # ---- MMA 4: dQ_contrib = dS · K  (A from registers).
+            var ds_reg_iter = s_reg.tiled_iterator[
+                MMA_K // MMA_N * num_m_mmas_qk, c_frag_size
+            ](0, 0)
+            multistage_mma[
+                BM, D, BK, WM, WN_dv,
+                num_threads, num_pipeline_stages,
+                False,
+                swizzle_a=False,
+                prefetch_init=False,
+                static_num_iters=num_iters_bn_k,
+                k_group_size=k_group_size,
+            ](
+                dq_contrib,
+                ds_reg_iter, k_b_iter,
+                pt_iter, k_b_iter,  # a_smem_iter placeholder (unused; A is LOCAL)
+                num_iters_bn_k,
+            )
+
+            # ---- Atomic-add dq_contrib c-frag into gmem dqaccum.
+            comptime for n_mma in range(num_n_mmas_dv):
+                var col_base_dq: Int = n_mma * MMA_N + 2 * lane_pair
+                var row_top: Int = warp_y * WM + lane_group
+                var row_bot: Int = row_top + 8
+                var g_row_top: Int = q_row_base + row_top
+                var g_row_bot: Int = q_row_base + row_bot
+                var c0_dq = dq_contrib.ptr[n_mma * c_frag_size + 0]
+                var c1_dq = dq_contrib.ptr[n_mma * c_frag_size + 1]
+                var c2_dq = dq_contrib.ptr[n_mma * c_frag_size + 2]
+                var c3_dq = dq_contrib.ptr[n_mma * c_frag_size + 3]
+                var base: Int = dqa_base_off
+                if g_row_top < seq_len:
+                    _ = Atomic.fetch_add(
+                        dqaccum_ptr + base + g_row_top * dqa_l_stride + col_base_dq,
+                        c0_dq.cast[DType.float32](),
+                    )
+                    _ = Atomic.fetch_add(
+                        dqaccum_ptr + base + g_row_top * dqa_l_stride + col_base_dq + 1,
+                        c1_dq.cast[DType.float32](),
+                    )
+                if g_row_bot < seq_len:
+                    _ = Atomic.fetch_add(
+                        dqaccum_ptr + base + g_row_bot * dqa_l_stride + col_base_dq,
+                        c2_dq.cast[DType.float32](),
+                    )
+                    _ = Atomic.fetch_add(
+                        dqaccum_ptr + base + g_row_bot * dqa_l_stride + col_base_dq + 1,
+                        c3_dq.cast[DType.float32](),
+                    )
+
+            # ---- MMA 5: dK_acc += dSᵀ · Q.
+            multistage_mma[
+                BN, D, BK, WM, WN_dv,
+                num_threads, num_pipeline_stages,
+                False,
+                swizzle_a=False,
+                prefetch_init=False,
+                static_num_iters=num_iters_bm_k,
+                k_group_size=k_group_size,
+            ](
+                dk_acc,
+                dst_iter, q_b_iter,
+                dst_iter, q_b_iter,
+                num_iters_bm_k,
+            )
+
+            barrier()  # ensure PT/dST smem is free for next qb's writes
+
+    # ---- Write dK_acc, dV_acc to gmem.
     var dk_base_off: Int = batch * dk_b_stride + kv_head_idx * dk_h_stride
     var dv_base_off: Int = batch * dv_b_stride + kv_head_idx * dv_h_stride
-    for i in range(ELTS_PER_THREAD):
-        var flat: Int = tid * ELTS_PER_THREAD + i
-        var n: Int = flat // D
-        var d: Int = flat - n * D
-        var g_row: Int = kv_row_base + n
-        if g_row < seq_len:
-            (dk_ptr + dk_base_off + g_row * dk_l_stride + d)[0] = (
-                dk_acc[i].cast[dtype]()
-            )
-            (dv_ptr + dv_base_off + g_row * dv_l_stride + d)[0] = (
-                dv_acc[i].cast[dtype]()
-            )
+    comptime for n_mma in range(num_n_mmas_dv):
+        var col_base_kv: Int = n_mma * MMA_N + 2 * lane_pair
+        var row_top: Int = warp_y * WM + lane_group
+        var row_bot: Int = row_top + 8
+        var g_row_top: Int = kv_row_base + row_top
+        var g_row_bot: Int = kv_row_base + row_bot
+        var c0_dk = dk_acc.ptr[n_mma * c_frag_size + 0].cast[dtype]()
+        var c1_dk = dk_acc.ptr[n_mma * c_frag_size + 1].cast[dtype]()
+        var c2_dk = dk_acc.ptr[n_mma * c_frag_size + 2].cast[dtype]()
+        var c3_dk = dk_acc.ptr[n_mma * c_frag_size + 3].cast[dtype]()
+        var c0_dv = dv_acc.ptr[n_mma * c_frag_size + 0].cast[dtype]()
+        var c1_dv = dv_acc.ptr[n_mma * c_frag_size + 1].cast[dtype]()
+        var c2_dv = dv_acc.ptr[n_mma * c_frag_size + 2].cast[dtype]()
+        var c3_dv = dv_acc.ptr[n_mma * c_frag_size + 3].cast[dtype]()
+        if g_row_top < seq_len:
+            (dk_ptr + dk_base_off + g_row_top * dk_l_stride + col_base_kv)[0] = c0_dk
+            (dk_ptr + dk_base_off + g_row_top * dk_l_stride + col_base_kv + 1)[0] = c1_dk
+            (dv_ptr + dv_base_off + g_row_top * dv_l_stride + col_base_kv)[0] = c0_dv
+            (dv_ptr + dv_base_off + g_row_top * dv_l_stride + col_base_kv + 1)[0] = c1_dv
+        if g_row_bot < seq_len:
+            (dk_ptr + dk_base_off + g_row_bot * dk_l_stride + col_base_kv)[0] = c2_dk
+            (dk_ptr + dk_base_off + g_row_bot * dk_l_stride + col_base_kv + 1)[0] = c3_dk
+            (dv_ptr + dv_base_off + g_row_bot * dv_l_stride + col_base_kv)[0] = c2_dv
+            (dv_ptr + dv_base_off + g_row_bot * dv_l_stride + col_base_kv + 1)[0] = c3_dv

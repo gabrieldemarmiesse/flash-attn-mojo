@@ -84,18 +84,26 @@ def launch_bwd[
     )
 
     # Smem budget — see kernel.mojo header for the breakdown.
+    # Tensor-core (multistage_mma) bwd uses 9 smem buffers:
+    #   Q_A, Q_B, dO_A, dO_B: BM * D each.
+    #   K_A, K_B, V: BN * D each.
+    #   PT, dST: BN * BM each.
+    #   LSE, delta: BM each fp32.
+    # At BM=BN=64, D=64 → 9 × 8 KiB + 0.5 KiB ≈ 72.5 KiB. At D=128 → ~144.5 KiB.
     comptime D: Int = head_dim
-    comptime k_bytes: Int = kBwdBlockN * D * size_of[dtype]()
-    comptime v_bytes: Int = kBwdBlockN * D * size_of[dtype]()
-    comptime q_bytes: Int = kBwdBlockM * D * size_of[dtype]()
-    comptime do_bytes: Int = kBwdBlockM * D * size_of[dtype]()
-    comptime s_bytes: Int = kBwdBlockM * kBwdBlockN * 4  # fp32
-    comptime dp_bytes: Int = kBwdBlockM * kBwdBlockN * 4
+    comptime qd_bytes: Int = kBwdBlockM * D * size_of[dtype]()
+    comptime kv_bytes: Int = kBwdBlockN * D * size_of[dtype]()
+    comptime pt_bytes: Int = kBwdBlockN * kBwdBlockM * size_of[dtype]()
     comptime lse_bytes: Int = kBwdBlockM * 4
     comptime delta_bytes: Int = kBwdBlockM * 4
     comptime smem_bytes: Int = (
-        k_bytes + v_bytes + q_bytes + do_bytes
-        + s_bytes + dp_bytes + lse_bytes + delta_bytes
+        2 * qd_bytes      # Q_A, Q_B
+        + 2 * qd_bytes    # dO_A, dO_B
+        + 2 * kv_bytes    # K_A, K_B
+        + kv_bytes        # V
+        + 2 * pt_bytes    # PT, dST
+        + lse_bytes
+        + delta_bytes
     )
 
     var compiled = ctx.compile_function[
