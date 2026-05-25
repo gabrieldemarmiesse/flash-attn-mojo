@@ -1,17 +1,25 @@
 """Launch helper for the FA3 (sm_90+) fwd kernel.
 
 MVP: bf16, head_dim=64, no causal, no MQA, no softcap, no ALiBi,
-no window, no dropout, no LSE. Padding is also out of scope — the
-MVP requires seqlen to be a multiple of kFa3BlockN (caller checks
-this and routes elsewhere if not). All these features land via
-follow-up commits.
+no window, no dropout, no LSE. Requires contiguous (B, L, H, D)
+inputs. Seqlen must be a multiple of kFa3BlockN.
+
+Builds 3D TMA descriptors that view the (B, L, H, D) tensors as
+(B*L, H, D) row-major. Each block selects its (b, q_block, h) tile
+by passing TMA coords (b * L + q_block * BM, h, 0). H and D are
+runtime in the gmem layout; only the smem tile shape is comptime.
 """
 
 from std.gpu.host import DeviceContext, FuncAttribute
 from std.gpu.host.device_context import _DeviceContextPtr, _DeviceContextCpp
+from std.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.math import ceildiv
 from std.memory import OpaquePointer
 from std.sys import size_of
+from std.utils.index import IndexList
+
+from layout import UNKNOWN_VALUE
+from layout.tma_async import create_split_tma
 
 from kernel import fwd_fa3_kernel
 from common import kFa3NThreads, kFa3BlockM, kFa3BlockN
@@ -53,26 +61,22 @@ def launch_fwd_fa3[
         unsafe_from_address=stream_handle_addr
     )
 
-    # Smem budget (bf16, head_dim=64, BM=128, BN=128):
-    #   Q tile:   BM * head_dim * 2 = 128 * 64 * 2 = 16 KiB
-    #   K tile:   BN * head_dim * 2 = 128 * 64 * 2 = 16 KiB  (×N_STAGES pipeline)
-    #   V tile:   BN * head_dim * 2 = 128 * 64 * 2 = 16 KiB  (×N_STAGES)
-    # With N_STAGES=2: 16 + 32 + 32 = 80 KiB. Plus 16 B for the
-    # mbarrier(s). H100 dynamic-smem cap is 228 KiB so plenty of room.
-    comptime N_STAGES: Int = 2
-    comptime q_bytes: Int = kFa3BlockM * head_dim * size_of[dtype]()
-    comptime kv_stage_bytes: Int = kFa3BlockN * head_dim * size_of[dtype]()
-    comptime mbar_bytes: Int = 64  # generous mbarrier scratch (8 barriers × 8 B)
-    comptime smem_bytes: Int = (
-        q_bytes
-        + 2 * N_STAGES * kv_stage_bytes  # K and V pipelines
-        + mbar_bytes
-    )
+    # Swizzle: SWIZZLE_64B for head_dim*sizeof(bf16) = 128B = 64B*2.
+    # Actually 64 bf16 = 128 bytes, so SWIZZLE_128B matches one row.
+    # Pick SWIZZLE_64B because it matches the WGMMA tile_layout_k_major
+    # K-major atom for D=64 head_dim.
+    comptime swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B
 
-    var compiled = ctx.compile_function[
-        fwd_fa3_kernel[dtype, head_dim],
-        fwd_fa3_kernel[dtype, head_dim],
-    ](func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(smem_bytes))
+    # Smem budget: Q + K + V tiles plus mbarriers.
+    #   Q: BM × D  bf16 = 128 × 64 × 2 = 16 KiB
+    #   K: BN × D  bf16 = 128 × 64 × 2 = 16 KiB
+    #   V: BN × D  bf16 = 128 × 64 × 2 = 16 KiB
+    # Total: 48 KiB + small mbarrier scratch (well under H100's 228 KiB).
+    comptime q_bytes: Int = kFa3BlockM * head_dim * size_of[dtype]()
+    comptime k_bytes: Int = kFa3BlockN * head_dim * size_of[dtype]()
+    comptime v_bytes: Int = kFa3BlockN * head_dim * size_of[dtype]()
+    comptime mbar_bytes: Int = 64
+    comptime smem_bytes: Int = q_bytes + k_bytes + v_bytes + mbar_bytes
 
     var q_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=q_addr
@@ -87,28 +91,54 @@ def launch_fwd_fa3[
         unsafe_from_address=o_addr
     )
 
+    # 3D TMA descriptors over the (B*L, H, D) gmem view. Tile = one
+    # (BM/BN rows from a single head_idx, D cols).
+    comptime gmem_shape = IndexList[3](
+        UNKNOWN_VALUE, UNKNOWN_VALUE, head_dim
+    )
+    comptime q_smem_shape = IndexList[3](kFa3BlockM, 1, head_dim)
+    comptime kv_smem_shape = IndexList[3](kFa3BlockN, 1, head_dim)
+
+    var rows: Int = batch_int * seqlen_int
+    var q_tma = create_split_tma[
+        q_smem_shape, gmem_shape, swizzle_mode=swizzle
+    ](ctx, q_ptr, rows, nheads_int)
+    var k_tma = create_split_tma[
+        kv_smem_shape, gmem_shape, swizzle_mode=swizzle
+    ](ctx, k_ptr, rows, nheads_int)
+    var v_tma = create_split_tma[
+        kv_smem_shape, gmem_shape, swizzle_mode=swizzle
+    ](ctx, v_ptr, rows, nheads_int)
+
+    comptime kernel_inst = fwd_fa3_kernel[
+        dtype,
+        head_dim,
+        type_of(q_tma).tile_shape,
+        type_of(q_tma).desc_shape,
+        type_of(k_tma).tile_shape,
+        type_of(k_tma).desc_shape,
+    ]
+
+    var compiled = ctx.compile_function[
+        kernel_inst,
+        kernel_inst,
+    ](func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
+        UInt32(smem_bytes)
+    ))
+
     var grid = (ceildiv(seqlen_int, Int(kFa3BlockM)), nheads_int, batch_int)
 
     comptime if use_external_stream:
         var stream = ctx.create_external_stream(stream_opaque)
         stream.enqueue_function(
             compiled,
+            q_tma,
+            k_tma,
+            v_tma,
+            o_ptr,
             seqlen_int,
             nheads_int,
             softmax_scale,
-            q_ptr,
-            k_ptr,
-            v_ptr,
-            o_ptr,
-            q_b_stride,
-            q_l_stride,
-            q_h_stride,
-            k_b_stride,
-            k_l_stride,
-            k_h_stride,
-            v_b_stride,
-            v_l_stride,
-            v_h_stride,
             o_b_stride,
             o_l_stride,
             o_h_stride,
@@ -119,22 +149,13 @@ def launch_fwd_fa3[
     else:
         ctx.enqueue_function(
             compiled,
+            q_tma,
+            k_tma,
+            v_tma,
+            o_ptr,
             seqlen_int,
             nheads_int,
             softmax_scale,
-            q_ptr,
-            k_ptr,
-            v_ptr,
-            o_ptr,
-            q_b_stride,
-            q_l_stride,
-            q_h_stride,
-            k_b_stride,
-            k_l_stride,
-            k_h_stride,
-            v_b_stride,
-            v_l_stride,
-            v_h_stride,
             o_b_stride,
             o_l_stride,
             o_h_stride,
