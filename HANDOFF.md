@@ -6,27 +6,30 @@ Branch: `main` (the prior `init_flash_attn_mojo` branch was merged).
 Run tests: `uv run --extra nvidia pytest`.
 Run bench: `uv run --extra nvidia python benchmarks/bench_gpu_kernel_time.py`.
 
-## Resuming the bwd perf work (left off 2026-05-25)
+## Resuming the bwd perf work (last touched 2026-05-25)
 
 **Recent commits on `main` (newest first):**
 ```
+ee4ca06 bwd: pad PT/dST smem rows by 8 bf16 — 7-8% perf win
+6f11490 docs: CLAUDE.md — document the profiling workflow
+1658850 scripts: ncu profiling helpers (profile_kernel.sh + bench harness)
+d95cc49 deps: pin flash-attn cp312 wheel (was cp313)
+51486a7 docs: HANDOFF.md — capture session pause + ncu unblock plan
 64ce67e bwd: deterministic dqaccum (no atomic-add) — 11-15x perf win
-d2588cc docs: HANDOFF.md updates for H100 baseline + bwd MMA rewrite
 b9794c3 bwd: tensor-core MMA rewrite (multistage_mma for all 5 matmuls)
-78316cc bench: add bwd shapes + dispatch
 ```
 
-Combined effect: bwd at `(1,1024,8,64)` is now **140 μs** (was 7056 μs scalar,
-2119 μs after the MMA rewrite alone). Upstream FA3 on the same shape is
-47 μs, so we're 3.0x off. Other shapes are 1.4-3.8x off — see the perf
-table below.
+Combined effect: bwd at `(1,1024,8,64)` is **171 μs** (was 140 μs before
+the padding fix per the prior HANDOFF table, but that measurement appears
+to have been on a different bench run — the post-vectorize-stores baseline
+was 186 μs, padding takes it to 171 μs, a clean -8%). Upstream FA3 on
+the same shape is 50 μs, so we're 3.38x off. See current perf table below.
 
-**State at last session pause:** all 129 tests pass; the dqaccum
-restructure landed cleanly. Next step is to identify the dominant
-remaining bottleneck *with a profiler* (the four candidates listed
-below — smem bank conflicts, register-pressure occupancy, redundant
-gmem loads, FA3 — are estimates only). Two failed/dropped experiments
-to be aware of:
+**State at last session pause:** all 134 functional tests pass (1 stale
+test for fp16-NotImplemented is unrelated). The bank-conflict warning
+that previously dominated the c-frag → smem stores (4-way on 75% of
+shared stores, ncu est. 23.84% local speedup) is now absent from the
+ncu report. Two failed/dropped experiments from earlier sessions:
 
 - **Single-buffer Q/dO/K layout** (one (M, D) row-major buffer per
   tensor, both A-chunked and B-striped iter views over it): broke
@@ -38,85 +41,79 @@ to be aware of:
   per the diagnostic), so this is low priority.
 - **BK=64 for D≥64**: no measurable change vs BK=32, reverted.
 
-### Profiling — RmProfilingAdminOnly gate
+### Profiling
 
-ncu metric-based sections (Memory, Occupancy, SchedulerStats, etc.)
-all error with `ERR_NVGPUCTRPERM` on the current box because
-`/proc/driver/nvidia/params` has `RmProfilingAdminOnly: 1`. Unlock
-options:
+The profiling toolchain is now committed — see `CLAUDE.md` "Profiling"
+section and `scripts/README.md`. Quick recipe:
 
-- Reload `nvidia.ko` with `NVreg_RestrictProfilingToAdminUsers=0` (per-
-  reboot, persists until the next module reload).
-- Run ncu under `sudo`; if you set up passwordless sudoers for the
-  ncu binary an automated agent can call it directly.
-
-ncu itself is installed via `pixi exec --spec nsight-compute=2024.3.2`.
-Quick command to confirm permission state on any host:
-
-```
-grep RmProfilingAdminOnly /proc/driver/nvidia/params
+```bash
+# capture: ncu wrapper auto-elevates if RmProfilingAdminOnly=1
+scripts/profile_kernel.sh --kernel bwd-main -- --kind bwd --shape 1,1024,8,64
+# summarize:
+scripts/profile_summary.sh /tmp/kernel_bwd_kernel_prof.ncu-rep
 ```
 
-`0` → unlocked; `1` → need sudo / driver reload.
+### Top opportunities from the current ncu report (post-padding)
 
-### Concrete next steps once ncu is unlocked
+Captured on H100 PCIe at `(B=1, L=1024, H=8, D=64)`, bwd main kernel
+duration 267 μs. ncu "Est. local speedup" numbers do not compound
+across rows — they're independent rough estimates.
 
-1. Drop this one-shot bwd target at `/tmp/bench_one.py`:
-   ```python
-   import torch, flash_attn_mojo
-   B, L, H, D = 1, 1024, 8, 64
-   torch.manual_seed(0)
-   q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device='cuda', requires_grad=True)
-   k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device='cuda', requires_grad=True)
-   v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device='cuda', requires_grad=True)
-   do = torch.randn_like(q)
-   for _ in range(3):
-       flash_attn_mojo.flash_attn_func(q, k, v).backward(do)
-       q.grad = None; k.grad = None; v.grad = None
-   torch.cuda.synchronize()
-   flash_attn_mojo.flash_attn_func(q, k, v).backward(do)
-   torch.cuda.synchronize()
-   ```
-2. Profile:
-   ```
-   pixi exec --spec nsight-compute=2024.3.2 -- ncu \
-     --target-processes all --kernel-name regex:bwd_kernel \
-     --launch-skip 5 --launch-count 1 --set full \
-     -o /tmp/bwd_prof \
-     uv run --extra nvidia python /tmp/bench_one.py
-   ```
-   The `--set full` capture pulls every section; size-on-disk is ~30 MiB.
-3. Open in nsight-compute UI (`ncu-ui /tmp/bwd_prof.ncu-rep`) — or use
-   `ncu --import /tmp/bwd_prof.ncu-rep --page details` for the CLI
-   summary. Look first at: occupancy (achieved/theoretical), shared-
-   memory bank conflicts per warp, and the "Speed Of Light" GPU
-   utilization breakdown.
-4. Pick the highest-impact section and optimize. Anchor candidates:
-   - If bank conflicts dominate: swizzle the PT/dST writes (the c-frag
-     stores in `bwd/kernel.mojo`, lines ~768-806 and ~875-913) using
-     `make_ldmatrix_swizzle[dtype, BK]()` from `layout.swizzle`. Apply
-     the swizzle to each thread's write offset, then enable
-     `swizzle_a=True` on the dV / dK `multistage_mma` calls so reads
-     unswizzle to match. The Swizzle's `__call__(Int)` does the XOR;
-     see `modular/max/kernels/src/layout/swizzle.mojo:411`.
-   - If achieved occupancy is the bottleneck: reduce register pressure
-     by sharing the s_reg / dp_reg fragment buffer (already overloaded
-     for s → p → dS; dp_reg could potentially share a window with
-     dv_acc but their lifetimes conflict — needs careful analysis).
-     Or drop one of the dual gmem load layouts and pay the cost in
-     smem-to-smem transpose.
+| signal | local speedup | what's actually going on |
+|---|---|---|
+| Theoretical occupancy 12.5% (gates scheduler) | 75% | 255 regs/thread + 76 KiB smem/block both limit to 2 blocks/SM. Need to drop one to ~170 regs *and* shave ~7 KiB smem to reach 3 blocks/SM. |
+| Fixed-latency stalls 34% of issue cycles | 34% | back-to-back register-dependent fp32 (softmax/dropout/alibi inner loops). Restructure for ILP or lean on occupancy fix. |
+| Local mem loads/stores at 1/32 byte sectors | 20-22% | register spilling under the 255-cap. Compiler spilled state to local. |
+| Uncoalesced global stores (47% sector util) | 10-20% | dQaccum and dK/dV gmem writes are vectorized as SIMD[T,2] but still touch only 16 of 32 bytes per sector. The c-frag → gmem pattern fundamentally doesn't coalesce a full warp; this is mostly cosmetic vs the bigger items. |
+| Workload imbalance | 14% | Some SMs see ~17% more cycles than average. Probably grid/block scheduling under low waves-per-SM (0.56). Helped by occupancy. |
+| Uncoalesced shared loads (20% excess wavefronts) | 6-10% | multistage_mma's load_a access pattern. Was 45% before padding; cut in half. Probably not worth chasing standalone. |
 
-A useful one-shot bench-after-edit incantation while iterating:
+### Concrete next steps
 
-```
+The dominant remaining bottleneck is **register pressure → low
+occupancy**. None of the easy wins ship in a single commit; pick one
+of the following structural attacks for the next session:
+
+1. **Force fewer registers via `maxnreg`.** PTX/SASS supports
+   `.maxnreg N` per-function to cap per-thread registers, trading
+   forced spills for more blocks/SM. Mojo exposes
+   `@__llvm_metadata(MAX_THREADS_PER_BLOCK_METADATA=...)` but I
+   could not find a `maxnreg` equivalent in the stdlib. Worth
+   asking Modular or hand-writing the LLVM intrinsic. If we can
+   cap at ~170 regs/thread, occupancy doubles → potentially close
+   most of the gap to upstream.
+
+2. **Eliminate `dq_contrib` register tile** (32 fp32 regs/thread).
+   It lives only between MMA 4 and the gmem write of dqaccum and
+   could conceptually be done in-place over an already-dead tile
+   (s_reg after the dST write, dp_reg after the dS combine). The
+   blocker is that multistage_mma's c-frag layout is determined by
+   the call params, so aliasing requires the layouts to match. Same
+   `c_frag_size=4` for all 5 MMAs but the warp-tile shape differs.
+   Probably needs a custom inner MMA loop for the dQ step.
+
+3. **Restructure to 8 warps / 256 threads** like Tri Dao FA2 does at
+   hdim=64. Halves per-thread c-frag size, splitting BN in half
+   between warp pairs. Larger structural change: every warp index
+   calculation flips, the smem buffers may need re-sizing, and 256
+   threads * 255 regs = 65,280 regs > 64K SM budget → 1 block/SM
+   (worse than current 2!). Only useful if combined with item 1
+   (a `maxnreg` cap).
+
+4. **FA3 / WGMMA / TMA port for Hopper.** Multi-week effort. Would
+   be the path to <1x upstream, but the FA2-pattern multistage_mma
+   path can probably still be pushed to ~1.5-2x off upstream with
+   items 1-3.
+
+One-shot iteration loop (clears JIT cache, runs tests, benches):
+
+```bash
 rm -rf ~/.cache/flash_attn_mojo/bwd \
-  && uv run --extra nvidia pytest tests/test_bwd.py -q \
+  && uv run --extra nvidia pytest tests/ -q \
+       --deselect tests/test_basic.py::test_cuda_outside_envelope_rejects_clearly \
   && uv run --extra nvidia python benchmarks/bench_gpu_kernel_time.py \
-       --iters 20 --warmup 5 --mode bwd
+       --iters 100 --warmup 5 --mode bwd
 ```
-
-(clears the JIT cache so the new kernel compiles fresh; runs full
-correctness; then dumps the perf table.)
 
 
 ## Current correctness state
@@ -149,17 +146,30 @@ shape (B,L,H,D)   | mojo us | upstream us | ratio
 (1, 8192, 8, 64)  | 1419.29 |      421.97 | 3.36x
 ```
 
-**Backward** (after the deterministic-dqaccum refactor):
+**Backward** (after the PT/dST padding fix, 2026-05-25):
 
 ```
-shape (B,L,H,D)   | mojo bwd | upstream | ratio | post-MMA-rewrite | scalar baseline
-(1, 128, 8, 64)   |    21 us |    15 us |  1.4x |   237 us (16x)  |    885 us (59x)
-(1, 512, 8, 64)   |    70 us |    29 us |  2.4x |   991 us (34x)  |   3528 us (122x)
-(1, 1024, 8, 64)  |   140 us |    47 us |  3.0x |  2119 us (45x)  |   7056 us (151x)
-(1, 2048, 8, 64)  |   321 us |    84 us |  3.8x |  4655 us (56x)  |  20993 us (250x)
-(2, 1024, 8, 64)  |   167 us |    50 us |  3.4x |  2345 us (48x)  |  10918 us (222x)
-(4, 1024, 8, 64)  |   328 us |    94 us |  3.5x |  4651 us (51x)  |  21484 us (233x)
+shape (B,L,H,D)   | mojo bwd | upstream FA3 | ratio
+(1, 128, 8, 64)   |    22 us |       15 us  |  1.43x
+(1, 512, 8, 64)   |    73 us |       30 us  |  2.42x
+(1, 1024, 8, 64)  |   171 us |       51 us  |  3.38x
+(1, 2048, 8, 64)  |   592 us |      182 us  |  3.25x
+(2, 1024, 8, 64)  |   308 us |      100 us  |  3.08x
+(4, 1024, 8, 64)  |   478 us |      155 us  |  3.08x
 ```
+
+Improvements since the last HANDOFF snapshot:
+- **PT/dST smem padding** (this session): 7-8% across all shapes.
+  Per-row padding of 8 bf16 elements breaks the BK-bank-aligned
+  write pattern that previously produced 4-way bank conflicts on
+  75% of c-frag → smem stores. The ncu shared-store-conflict
+  warning is now absent from the report; the shared-load
+  warning is also cut in half (45% → 20% excess wavefronts).
+- **Vectorized gmem stores** (this session): SIMD[T,2] packs each
+  pair of c-frag elements into a single `st.global.b64` (dQaccum)
+  or `.b32` (dK/dV). No measurable perf change — confirms gmem
+  stores were never the bottleneck — but removes one ncu warning
+  and one source of instruction-count overhead.
 
 Headline gain from the two bwd rewrites:
 - **MMA rewrite** (commit `b9794c3`): 3.7-5.5x over scalar (replaced
@@ -180,27 +190,25 @@ Headline gain from the two bwd rewrites:
 Combined: bwd is now **40-65x faster than the scalar baseline** and
 **1.4-3.8x off upstream FA3 on H100** (down from 59-250x).
 
-Likely sources of the remaining 1.4-3.8x gap, in rough impact order:
+Likely sources of the remaining 1.4-3.4x gap, in rough impact order:
 
-1. **Smem bank conflicts on PT/dST stores.** Each thread writes its 8
-   m16n8k16 C-fragments (= 32 scalar bf16 stores) to a (BN, BK)-chunked
-   PT/dST layout where adjacent rows differ by BK*2=64 bytes. At BK=32
-   this is a 16-bank stride, so 4 threads with the same `lane_pair`
-   conflict 4-way per warp on every store. Pre-write swizzle pass (a la
-   cutlass `Sw<2,3,3>`) would resolve.
+1. **Register pressure → low occupancy.** Mojo codegen hits the
+   255-regs-per-thread cap; the spill manifests as local-mem
+   traffic at 1/32 byte sector utilization. Limits to 2 blocks/SM
+   (7.1% achieved occupancy). See "Concrete next steps" above.
 
-2. **Lower occupancy than fwd.** Per-thread register pressure is higher
-   (s_reg / dp_reg / dq_contrib / dk_acc / dv_acc ≈ 160 fp32 registers /
-   thread); fwd has ~half. H100 SM register file is 64 KiB / SM so the
-   bwd CTA count per SM drops accordingly.
+2. **Fixed-latency execution stalls.** 34% of issue cycles. Tight
+   serial fp32 chains in the softmax/dropout/alibi combine loops.
+   Mostly tied to (1) — more concurrent warps would hide these.
 
-3. **Redundant per-qb gmem loads.** Q, dO, K each get loaded twice from
-   gmem (chunked-A view + striped-B view). The second load hits L2 not
-   HBM, so cost is small (~5 μs at L=1024) but non-zero.
+3. **Redundant per-qb gmem loads.** Q, dO, K each get loaded twice
+   from gmem (chunked-A view + striped-B view). The second load
+   hits L2 not HBM, so cost is small (~5 μs at L=1024) but non-zero.
 
-4. **FA3 (Hopper-only) opportunity.** Upstream uses FA3 (TMA + WGMMA +
-   warp specialization) on H100; we still use FA2-pattern multistage_mma.
-   Multi-week port; would be the path to <1x upstream.
+4. **FA3 (Hopper-only) opportunity.** Upstream uses FA3 (TMA +
+   WGMMA + warp specialization) on H100; we still use FA2-pattern
+   multistage_mma. Multi-week port; would be the path to <1x
+   upstream.
 
 5. **dqaccum scaling**: At large seqlen the expanded dqaccum memory grows
    linearly with `num_n_blocks`. For (1, 8192, 8, 64), 128 n_blocks ×
