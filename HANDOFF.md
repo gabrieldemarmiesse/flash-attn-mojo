@@ -488,6 +488,25 @@ Q=0, K=rand, V=ones:    1.0 exactly      (S = 0)
 Q=K=rand, V=ones:       1.78, 1.92, 1.70, 2.17 (broken; per-row variance)
 ```
 
+**Decisive probe (skipped normalization, V=ones, Q=K=rand):** mojo
+output per row was 2.19, 2.09, 2.16, 2.19 (constant across cols
+within each row, std=0 across the 64 cols). Python-computed true
+unnormalized rowsum for the same Q is ~1.0-1.3 — so the wgmma_pv
+is producing **~2× the expected rowsum**. The factor is close to
+2 but not exactly constant across rows.
+
+This rules out:
+- a per-element layout bug (would not produce constant-across-cols)
+- a missing reduction (would produce row-varying, but probably
+  not a ~2× factor)
+
+This suggests:
+- a wgmma accumulation that double-counts somehow (running the
+  inner k-loop twice, or accumulating m_mma=0 and m_mma=1 into
+  the wrong output slot), OR
+- the c-frag of QK being applied to the PV wgmma in a way that
+  duplicates parts of P along the K axis.
+
 So the kernel is correct whenever S is uniformly 0. Per-row variation
 in S → per-row error in O. This rules out static structure issues
 (c-frag walk, c→a reshape, output store, warp/lane mapping all
