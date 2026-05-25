@@ -28,7 +28,7 @@ nvidia = [
     # Upstream flash-attn for cross-validation. Pin a specific prebuilt
     # wheel to avoid the source-build that needs CUDA toolchain + a few
     # minutes of nvcc time.
-    "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux'",
+    "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux'",
 ]
 rocm = [
     "torch==2.8.0 ; sys_platform == 'linux'",
