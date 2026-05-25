@@ -37,24 +37,38 @@ shape (B,L,H,D)   | mojo us | upstream us | ratio
 (1, 8192, 8, 64)  | 1419.29 |      421.97 | 3.36x
 ```
 
-**Backward** (after the multistage_mma rewrite — commit `b9794c3`):
+**Backward** (after the deterministic-dqaccum refactor):
 
 ```
-shape (B,L,H,D)   | mojo bwd us | upstream bwd us | ratio | prev (scalar)
-(1, 128, 8, 64)   |       237   |              15 |    16x |    885 us (59x)
-(1, 512, 8, 64)   |       991   |              29 |    34x |   3528 us (122x)
-(1, 1024, 8, 64)  |      2119   |              47 |    45x |   7056 us (151x)
-(1, 2048, 8, 64)  |      4655   |              84 |    56x |  20993 us (250x)
-(2, 1024, 8, 64)  |      2345   |              49 |    48x |  10918 us (222x)
-(4, 1024, 8, 64)  |      4651   |              92 |    51x |  21484 us (233x)
+shape (B,L,H,D)   | mojo bwd | upstream | ratio | post-MMA-rewrite | scalar baseline
+(1, 128, 8, 64)   |    21 us |    15 us |  1.4x |   237 us (16x)  |    885 us (59x)
+(1, 512, 8, 64)   |    70 us |    29 us |  2.4x |   991 us (34x)  |   3528 us (122x)
+(1, 1024, 8, 64)  |   140 us |    47 us |  3.0x |  2119 us (45x)  |   7056 us (151x)
+(1, 2048, 8, 64)  |   321 us |    84 us |  3.8x |  4655 us (56x)  |  20993 us (250x)
+(2, 1024, 8, 64)  |   167 us |    50 us |  3.4x |  2345 us (48x)  |  10918 us (222x)
+(4, 1024, 8, 64)  |   328 us |    94 us |  3.5x |  4651 us (51x)  |  21484 us (233x)
 ```
 
-The MMA rewrite (commit `b9794c3`) gave a 3.7-5.5x kernel-time speedup over
-the scalar-loop baseline. Remaining gap vs upstream FA2-bwd is ~16-56x;
-upstream itself is also memory-bound on H100 (~10x off bf16 peak), so the
-gap is in microarchitectural efficiency, not FLOPs.
+Headline gain from the two bwd rewrites:
+- **MMA rewrite** (commit `b9794c3`): 3.7-5.5x over scalar (replaced
+  5 scalar matmul inner loops with `multistage_mma` tensor-core calls).
+- **Deterministic dqaccum**: another **11-15x** on top (this commit).
+  Diagnostic-traced finding: under the prior atomic-add design, each
+  (q_row, d) cell of dqaccum was atomic-added concurrently by every
+  n_block in the grid (16-way contention at L=1024). Replacing atomic
+  add with a per-n_block slot in an expanded dqaccum (shape
+  (num_n_blocks, B, H, L, D), zeroed via torch.zeros) plus a sum-then-
+  cast in the convert_dq kernel completely removes that contention.
+  Verified by replacing the atomic-add with a no-op: 1024-shape kernel
+  time dropped from 2119 μs → 116 μs, validating that the atomics were
+  ~95% of kernel time. The proper implementation lands at 140 μs (an
+  extra ~24 μs vs the no-op upper bound: write traffic to the expanded
+  dqaccum + the convert_dq reduction).
 
-Likely sources of the remaining gap, in rough impact order:
+Combined: bwd is now **40-65x faster than the scalar baseline** and
+**1.4-3.8x off upstream FA3 on H100** (down from 59-250x).
+
+Likely sources of the remaining 1.4-3.8x gap, in rough impact order:
 
 1. **Smem bank conflicts on PT/dST stores.** Each thread writes its 8
    m16n8k16 C-fragments (= 32 scalar bf16 stores) to a (BN, BK)-chunked
@@ -63,20 +77,25 @@ Likely sources of the remaining gap, in rough impact order:
    conflict 4-way per warp on every store. Pre-write swizzle pass (a la
    cutlass `Sw<2,3,3>`) would resolve.
 
-2. **Atomic-add contention on dqaccum.** Each block atomic-adds dQ
-   contributions for its (n_block) into a shared dqaccum that's also
-   touched by every other n_block at the same q_row. At L=1024 there
-   are 16 n_blocks contending per cell. Sequential-q (Tri Dao's
-   non-atomic path) sidesteps this but requires a multi-kernel pipeline.
-
-3. **Lower occupancy than fwd.** Per-thread register pressure is higher
+2. **Lower occupancy than fwd.** Per-thread register pressure is higher
    (s_reg / dp_reg / dq_contrib / dk_acc / dv_acc ≈ 160 fp32 registers /
    thread); fwd has ~half. H100 SM register file is 64 KiB / SM so the
    bwd CTA count per SM drops accordingly.
 
-4. **Redundant per-qb gmem loads.** Q, dO, K each get loaded twice from
+3. **Redundant per-qb gmem loads.** Q, dO, K each get loaded twice from
    gmem (chunked-A view + striped-B view). The second load hits L2 not
    HBM, so cost is small (~5 μs at L=1024) but non-zero.
+
+4. **FA3 (Hopper-only) opportunity.** Upstream uses FA3 (TMA + WGMMA +
+   warp specialization) on H100; we still use FA2-pattern multistage_mma.
+   Multi-week port; would be the path to <1x upstream.
+
+5. **dqaccum scaling**: At large seqlen the expanded dqaccum memory grows
+   linearly with `num_n_blocks`. For (1, 8192, 8, 64), 128 n_blocks ×
+   2 MB = 256 MB — fine for typical workloads but a concern at extreme
+   shapes. Tri Dao caps the deterministic factor (typically at 128 or
+   `min(num_n_blocks, K)`); we currently use full N. A bounded variant
+   would trade some atomic contention back for memory.
 
 ## Prior perf state (RTX 2000 Ada, sm89, pre-H100)
 

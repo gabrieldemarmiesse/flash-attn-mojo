@@ -227,7 +227,12 @@ def test_bwd_preprocess_correctness():
     out = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda", generator=g)
 
     delta_mojo = torch.empty(B, H, L, dtype=torch.float32, device="cuda")
-    dqaccum = torch.empty(B, H, L, D, dtype=torch.float32, device="cuda")
+    # Native bwd uses (num_n_blocks, B, H, L, D) deterministic-slot
+    # dqaccum; native_bwd_preprocess validates the 5D shape.
+    num_n_blocks = (L + 63) // 64
+    dqaccum = torch.empty(
+        num_n_blocks, B, H, L, D, dtype=torch.float32, device="cuda"
+    )
     native_bwd_preprocess(dout, out, delta_mojo, dqaccum)
 
     # Reference: dO * O summed over the head_dim, in fp32, then
@@ -249,7 +254,10 @@ def test_bwd_preprocess_head_dims(D):
     out = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda", generator=g)
 
     delta_mojo = torch.empty(B, H, L, dtype=torch.float32, device="cuda")
-    dqaccum = torch.empty(B, H, L, D, dtype=torch.float32, device="cuda")
+    num_n_blocks = (L + 63) // 64
+    dqaccum = torch.empty(
+        num_n_blocks, B, H, L, D, dtype=torch.float32, device="cuda"
+    )
     native_bwd_preprocess(dout, out, delta_mojo, dqaccum)
 
     delta_ref = (dout.float() * out.float()).sum(dim=-1).transpose(1, 2).contiguous()
@@ -257,51 +265,46 @@ def test_bwd_preprocess_head_dims(D):
     assert max_err < 1e-3, f"D={D}: delta max-abs err {max_err} >= 1e-3"
 
 
-@pytest.mark.parametrize("D", [32, 64, 128])
-@pytest.mark.parametrize("L", [64, 96, 128, 192])
-def test_bwd_preprocess_clears_dqaccum(D, L):
-    """The preprocess kernel must zero every element of the dqaccum
-    workspace it's given. Pre-fill with garbage, call preprocess, assert
-    everything is zero. Includes a non-BM-aligned seqlen (96, 192) to
-    cover the tile-tail bounds-check path."""
-    from flash_attn_mojo.bwd import native_bwd_preprocess
-
-    B, H = 2, 3
-    g = torch.Generator(device="cuda").manual_seed(0)
-    dout = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda", generator=g)
-    out = torch.randn(B, L, H, D, dtype=torch.bfloat16, device="cuda", generator=g)
-
-    delta = torch.empty(B, H, L, dtype=torch.float32, device="cuda")
-    # Fill with NaN/garbage so a missed write is loud.
-    dqaccum = torch.full(
-        (B, H, L, D), float("nan"), dtype=torch.float32, device="cuda"
-    )
-    native_bwd_preprocess(dout, out, delta, dqaccum)
-    assert torch.all(dqaccum == 0).item(), (
-        f"dqaccum has non-zero entries after preprocess "
-        f"(D={D}, L={L}): "
-        f"nonzero count={(dqaccum != 0).sum().item()}"
-    )
+# NOTE: `test_bwd_preprocess_clears_dqaccum` was removed when the bwd
+# switched to a deterministic-slot dqaccum (shape (num_n_blocks, B, H,
+# L, D) zeroed by the Python caller via `torch.zeros`). The preprocess
+# kernel no longer touches dqaccum; that responsibility moved to
+# `_fn.py` to keep the kernel grid (q-tiles, B, H) decoupled from
+# `num_n_blocks`. See the convert-dq reduction path for how the slots
+# are summed.
 
 
 def test_bwd_convert_dq_correctness():
-    """The Mojo convert-dQ kernel casts fp32 dqaccum (B, H, L, D) to
-    bf16 dq (B, L, H, D). Comparison is to pytorch's
-    `dqaccum.transpose(1, 2).to(bf16)` — both perform per-element
-    fp32->bf16 casts, so the result must be bit-identical."""
+    """The Mojo convert-dQ kernel sums the deterministic-slot fp32
+    dqaccum (num_n_blocks, B, H, L, D) across the n_block dim and casts
+    to bf16 dq (B, L, H, D). Comparison is to pytorch's
+    `dqaccum.sum(dim=0).transpose(1, 2).to(bf16)` — both perform
+    sum-and-cast at the same precision so the result must be
+    bit-identical when num_n_blocks==1, and very close at higher
+    slot counts (limited by fp32 sum reassociation)."""
     from flash_attn_mojo.bwd import native_bwd_convert_dq
 
     B, L, H, D = 2, 192, 3, 64
+    num_n_blocks = (L + 63) // 64  # = 3 at L=192
     g = torch.Generator(device="cuda").manual_seed(0)
-    dqaccum = torch.randn(B, H, L, D, dtype=torch.float32, device="cuda", generator=g)
+    dqaccum = torch.randn(
+        num_n_blocks, B, H, L, D, dtype=torch.float32, device="cuda", generator=g
+    )
 
     dq_mojo = torch.empty(B, L, H, D, dtype=torch.bfloat16, device="cuda")
     native_bwd_convert_dq(dqaccum, dq_mojo)
 
-    dq_ref = dqaccum.transpose(1, 2).contiguous().to(torch.bfloat16)
-    assert torch.equal(dq_mojo, dq_ref), (
-        "convert_dq output not bit-equal to pytorch cast: "
-        f"max diff {(dq_mojo.float() - dq_ref.float()).abs().max().item()}"
+    dq_ref = (
+        dqaccum.sum(dim=0).transpose(1, 2).contiguous().to(torch.bfloat16)
+    )
+    # Sequential summation in our kernel vs pytorch's tree reduction
+    # can differ by ~1 bf16 ULP after the post-sum cast. Tolerance is
+    # set to capture that (max abs diff observed empirically ≈ 8e-3 at
+    # typical magnitudes).
+    max_diff = (dq_mojo.float() - dq_ref.float()).abs().max().item()
+    assert max_diff < 1e-2, (
+        f"convert_dq output diverges too far from pytorch cast: "
+        f"max diff {max_diff}"
     )
 
 

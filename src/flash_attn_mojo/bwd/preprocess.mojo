@@ -132,25 +132,13 @@ def bwd_preprocess_kernel[
             if lane == UInt32(0):
                 (delta_ptr + delta_bh_base + q_row)[0] = row_sum
 
-    # Zero-fill the dQaccum slice at [batch, head_idx, q_tile_row_base
-    # : q_tile_row_base + BM, :]. All 128 threads cooperate over the
-    # BM*head_dim fp32 elements with stride 128, so each thread writes
-    # head_dim/2 zeros (head_dim is a multiple of 32 ⇒ also even). Rows
-    # past seq_len in the tile-tail are skipped via the bounds check.
-    var dqaccum_bh_base: Int = (
-        Int(batch) * dqaccum_b_stride + Int(head_idx) * dqaccum_h_stride
-    )
-    comptime total_elts: Int = kPreprocBM * head_dim
-    comptime elts_per_thread: Int = total_elts // kPreprocNThreads
-    for i in range(elts_per_thread):
-        var flat: Int = i * Int(kPreprocNThreads) + Int(tid)
-        var row_in_tile: Int = flat // head_dim
-        var col: Int = flat - row_in_tile * head_dim
-        var q_row: Int = q_tile_row_base + row_in_tile
-        if q_row < seq_len:
-            (
-                dqaccum_ptr
-                + dqaccum_bh_base
-                + q_row * dqaccum_l_stride
-                + col
-            )[0] = Float32(0)
+    # NOTE: dqaccum is now zeroed by the caller (via torch.zeros) since
+    # the deterministic-slot layout — shape (num_n_blocks, B, H, L, D) —
+    # is too large to zero piecewise inside this preprocess kernel
+    # without growing the grid. Kernel-side zeroing dropped; the
+    # `dqaccum_ptr` / `dqaccum_*_stride` parameters are kept in the
+    # signature for ABI stability but unused. Suppress unused warnings.
+    _ = dqaccum_ptr
+    _ = dqaccum_b_stride
+    _ = dqaccum_h_stride
+    _ = dqaccum_l_stride

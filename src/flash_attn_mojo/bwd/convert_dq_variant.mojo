@@ -36,17 +36,19 @@ def bwd_convert_dq_variant(
     var batch_int: Int = Int(py=args[2])
     var seqlen_int: Int = Int(py=args[3])
     var nheads_int: Int = Int(py=args[4])
-    var dqaccum_b_stride: Int = Int(py=args[5])
-    var dqaccum_h_stride: Int = Int(py=args[6])
-    var dqaccum_l_stride: Int = Int(py=args[7])
-    var dq_b_stride: Int = Int(py=args[8])
-    var dq_l_stride: Int = Int(py=args[9])
-    var dq_h_stride: Int = Int(py=args[10])
-    var stream_handle_addr: Int = Int(py=args[11])
-    # args[12..14] are comptime defines (dtype, head_dim, use_ext_stream);
+    var num_n_blocks: Int = Int(py=args[5])
+    var dqaccum_n_stride: Int = Int(py=args[6])
+    var dqaccum_b_stride: Int = Int(py=args[7])
+    var dqaccum_h_stride: Int = Int(py=args[8])
+    var dqaccum_l_stride: Int = Int(py=args[9])
+    var dq_b_stride: Int = Int(py=args[10])
+    var dq_l_stride: Int = Int(py=args[11])
+    var dq_h_stride: Int = Int(py=args[12])
+    var stream_handle_addr: Int = Int(py=args[13])
+    # args[14..16] are comptime defines (dtype, head_dim, use_ext_stream);
     # skipped here, read at module level via get_defined_*. ctx_handle is
-    # appended by `call_bwd_convert_dq` as the 16th positional (index 15).
-    var ctx_handle_addr: Int = Int(py=args[15])
+    # appended by `call_bwd_convert_dq` as the 18th positional (index 17).
+    var ctx_handle_addr: Int = Int(py=args[17])
 
     if batch_int == 0 or seqlen_int == 0 or nheads_int == 0:
         return PythonObject(None)
@@ -55,8 +57,10 @@ def bwd_convert_dq_variant(
         batch_int,
         seqlen_int,
         nheads_int,
+        num_n_blocks,
         dqaccum_addr,
         dq_addr,
+        dqaccum_n_stride,
         dqaccum_b_stride,
         dqaccum_h_stride,
         dqaccum_l_stride,

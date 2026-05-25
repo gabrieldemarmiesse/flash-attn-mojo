@@ -52,8 +52,15 @@ def native_bwd_preprocess(
     assert tuple(delta.shape) == (batch, nheads, seqlen), (
         "delta shape must be (batch, nheads, seqlen)"
     )
-    assert tuple(dqaccum.shape) == (batch, nheads, seqlen, head_dim), (
-        "dqaccum shape must be (batch, nheads, seqlen, head_dim)"
+    # dqaccum is now the (num_n_blocks, B, H, L, D) deterministic-slot
+    # workspace; preprocess no longer touches it (caller zero-fills via
+    # torch.zeros). Just sanity-check the (B, H, L, D) tail.
+    assert dqaccum.dim() == 5, (
+        f"dqaccum must be 5D (num_n_blocks, B, H, L, D); got {dqaccum.dim()}D"
+    )
+    assert tuple(dqaccum.shape[1:]) == (batch, nheads, seqlen, head_dim), (
+        f"dqaccum tail shape {tuple(dqaccum.shape[1:])} must match"
+        f" (B, H, L, D) = ({batch}, {nheads}, {seqlen}, {head_dim})"
     )
 
     call_bwd_preprocess(
@@ -73,9 +80,12 @@ def native_bwd_preprocess(
             out.stride(2),
             delta.stride(0),
             delta.stride(1),
-            dqaccum.stride(0),
+            # dqaccum strides are unused by preprocess now (no zero-fill);
+            # pass the (B, H, L) strides for the slot-0 view to keep the
+            # ABI well-defined.
             dqaccum.stride(1),
             dqaccum.stride(2),
+            dqaccum.stride(3),
             torch.cuda.current_stream().cuda_stream,
             _DTYPE_CODE[dout.dtype],
             head_dim,
@@ -117,7 +127,11 @@ def native_bwd_main(
     k, v:          (B, L, Hkv, D) bf16. Hq % Hkv == 0.
     lse, delta:    (B, Hq, L) fp32.
     dk, dv:        (B, L, Hkv, D) bf16 — same shape as k, v.
-    dqaccum:       (B, Hq, L, D) fp32 — pre-zeroed by preprocess kernel.
+    dqaccum:       (num_n_blocks, B, Hq, L, D) fp32 — pre-zeroed by the
+                   caller. The bwd kernel writes per-(n_block) slots
+                   (no atomics, no cross-block contention); convert_dq
+                   sums across the n_block dim before casting to dq's
+                   dtype.
     """
     from flash_attn_mojo.bwd._main_jit import call_bwd_main
 
@@ -126,6 +140,9 @@ def native_bwd_main(
     )
     assert lse.dtype == torch.float32 and delta.dtype == torch.float32
     assert dqaccum.dtype == torch.float32
+    assert dqaccum.dim() == 5, (
+        f"dqaccum must be (num_n_blocks, B, Hq, L, D); got dim {dqaccum.dim()}"
+    )
     assert lse.is_contiguous() and delta.is_contiguous()
 
     batch, seqlen, nheads_q, head_dim = q.shape
@@ -184,6 +201,7 @@ def native_bwd_main(
             dqaccum.stride(0),
             dqaccum.stride(1),
             dqaccum.stride(2),
+            dqaccum.stride(3),
             torch.cuda.current_stream().cuda_stream,
             _DTYPE_CODE[q.dtype],
             head_dim,
@@ -199,10 +217,12 @@ def native_bwd_convert_dq(
 ) -> None:
     """JIT-compile (if needed) and dispatch the bwd convert-dQ kernel.
 
-    Casts ``dqaccum`` (fp32, (B, H, L, D)) to ``dq``'s dtype (bf16 or
-    fp16) and writes into ``dq`` ((B, L, H, D)) — mirrors Tri Dao's
-    flash_bwd_convert_dq_kernel. Rows past ``seq_len`` in any q-tile
-    tail are skipped.
+    Sums the deterministic-slot ``dqaccum`` (fp32,
+    (num_n_blocks, B, H, L, D)) across the n_block dim and casts to
+    ``dq``'s dtype (bf16 or fp16), writing into ``dq`` ((B, L, H, D))
+    with the H/L transpose. Mirrors Tri Dao's
+    flash_bwd_convert_dq_kernel reduction path. Rows past ``seq_len``
+    in any q-tile tail are skipped.
     """
     from flash_attn_mojo.bwd._convert_dq_jit import call_bwd_convert_dq
 
@@ -212,8 +232,13 @@ def native_bwd_convert_dq(
     )
 
     batch, seqlen, nheads, head_dim = dq.shape
-    assert tuple(dqaccum.shape) == (batch, nheads, seqlen, head_dim), (
-        "dqaccum shape must be (batch, nheads, seqlen, head_dim)"
+    assert dqaccum.dim() == 5, (
+        f"dqaccum must be 5D (num_n_blocks, B, H, L, D); got {dqaccum.dim()}D"
+    )
+    num_n_blocks = dqaccum.shape[0]
+    assert tuple(dqaccum.shape[1:]) == (batch, nheads, seqlen, head_dim), (
+        f"dqaccum tail shape {tuple(dqaccum.shape[1:])} must match"
+        f" (B, H, L, D) = ({batch}, {nheads}, {seqlen}, {head_dim})"
     )
 
     call_bwd_convert_dq(
@@ -223,9 +248,11 @@ def native_bwd_convert_dq(
             batch,
             seqlen,
             nheads,
+            int(num_n_blocks),
             dqaccum.stride(0),
             dqaccum.stride(1),
             dqaccum.stride(2),
+            dqaccum.stride(3),
             dq.stride(0),
             dq.stride(1),
             dq.stride(2),

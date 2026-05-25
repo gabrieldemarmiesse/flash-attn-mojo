@@ -37,9 +37,9 @@ def call_bwd_convert_dq(args: tuple) -> None:
 
 
 def _config_from_args(args: tuple) -> tuple:
-    dtype_code = args[12]
-    head_dim = args[13]
-    use_external_stream = bool(args[14])
+    dtype_code = args[14]
+    head_dim = args[15]
+    use_external_stream = bool(args[16])
     return (dtype_code, head_dim, use_external_stream)
 
 

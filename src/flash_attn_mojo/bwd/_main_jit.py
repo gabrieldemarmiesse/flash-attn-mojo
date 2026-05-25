@@ -35,10 +35,10 @@ def call_bwd_main(args: tuple) -> None:
 
 
 def _config_from_args(args: tuple) -> tuple:
-    dtype_code = args[49]
-    head_dim = args[50]
-    causal = bool(args[51])
-    use_external_stream = bool(args[52])
+    dtype_code = args[50]
+    head_dim = args[51]
+    causal = bool(args[52])
+    use_external_stream = bool(args[53])
     return (dtype_code, head_dim, causal, use_external_stream)
 
 

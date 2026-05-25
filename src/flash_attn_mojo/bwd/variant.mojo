@@ -76,14 +76,15 @@ def bwd_main_variant(
     var lse_h_stride: Int = Int(py=args[42])
     var delta_b_stride: Int = Int(py=args[43])
     var delta_h_stride: Int = Int(py=args[44])
-    var dqa_b_stride: Int = Int(py=args[45])
-    var dqa_h_stride: Int = Int(py=args[46])
-    var dqa_l_stride: Int = Int(py=args[47])
-    var stream_handle_addr: Int = Int(py=args[48])
-    # args[49..52] are comptime defines (dtype, head_dim, causal,
+    var dqa_n_stride: Int = Int(py=args[45])
+    var dqa_b_stride: Int = Int(py=args[46])
+    var dqa_h_stride: Int = Int(py=args[47])
+    var dqa_l_stride: Int = Int(py=args[48])
+    var stream_handle_addr: Int = Int(py=args[49])
+    # args[50..53] are comptime defines (dtype, head_dim, causal,
     # use_ext_stream); ctx_handle is appended by `call_bwd_main` as the
-    # 54th positional (index 53).
-    var ctx_handle_addr: Int = Int(py=args[53])
+    # 55th positional (index 54).
+    var ctx_handle_addr: Int = Int(py=args[54])
 
     if batch_int == 0 or seqlen_int == 0 or nheads_q_int == 0 or nheads_kv_int == 0:
         return PythonObject(None)
@@ -134,6 +135,7 @@ def bwd_main_variant(
         lse_h_stride,
         delta_b_stride,
         delta_h_stride,
+        dqa_n_stride,
         dqa_b_stride,
         dqa_h_stride,
         dqa_l_stride,

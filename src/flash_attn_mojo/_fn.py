@@ -322,7 +322,16 @@ def _bwd_dispatch_native_mvp(
         alibi_addr = slopes.data_ptr()
 
     delta = torch.empty(B, H, L, dtype=torch.float32, device=q_k.device)
-    dqaccum = torch.empty(B, H, L, D, dtype=torch.float32, device=q_k.device)
+    # Deterministic dqaccum: shape (num_n_blocks, B, H, L, D) fp32.
+    # The main bwd kernel writes per-(n_block) slots without atomics
+    # (each kv-block-grid block owns its own slot); convert_dq sums
+    # across the n_block dim. torch.zeros (= cudaMemsetAsync) replaces
+    # the preprocess kernel's old per-slot zeroing pass.
+    _BWD_BN = 64  # matches kBwdBlockN; one n_block per BN K-rows.
+    num_n_blocks = (L + _BWD_BN - 1) // _BWD_BN
+    dqaccum = torch.zeros(
+        num_n_blocks, B, H, L, D, dtype=torch.float32, device=q_k.device
+    )
     native_bwd_preprocess(dout_k, out_k, delta, dqaccum)
 
     dk = torch.empty_like(k_k)
@@ -511,15 +520,18 @@ def _bwd_dispatch(
             dtype=torch.float32,
             device=dout.device,
         )
-        # dQaccum workspace: (B, H, L, D) fp32. The main bwd kernel
-        # (not yet implemented) atomically accumulates dQ contributions
-        # into this tensor across KV blocks; preprocess clears it. For
-        # this commit it's allocated and zeroed but otherwise unused —
-        # the pytorch fallback below still computes dQ directly. This
-        # mirrors Tri Dao's flash_bwd_preprocess_kernel pipeline so the
-        # GPU bwd kernel (subsequent commit) can drop in without
-        # touching the allocator.
-        dqaccum = torch.empty(
+        # dQaccum workspace — deterministic-slot shape
+        # (num_n_blocks, B, H, L, D) fp32 — see the main-bwd path. The
+        # pytorch fallback here computes dQ directly so the workspace
+        # is allocated but unused; we still pass it through preprocess
+        # to keep the same ABI (preprocess no longer zeros it now that
+        # we use torch.zeros, but the wrapper still validates shape).
+        _BWD_BN = 64
+        num_n_blocks = (
+            (dout.shape[1] + _BWD_BN - 1) // _BWD_BN
+        )
+        dqaccum = torch.zeros(
+            num_n_blocks,
             dout.shape[0],
             dout.shape[2],
             dout.shape[1],

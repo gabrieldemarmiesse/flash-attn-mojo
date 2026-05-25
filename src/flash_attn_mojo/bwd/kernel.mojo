@@ -58,7 +58,6 @@ from std.gpu.memory import (
     external_memory,
 )
 from std.memory import stack_allocation
-from std.atomic import Atomic
 
 from layout import (
     IntTuple,
@@ -139,6 +138,7 @@ def bwd_kernel[
     lse_h_stride: Int,
     delta_b_stride: Int,
     delta_h_stride: Int,
+    dqa_n_stride: Int,
     dqa_b_stride: Int,
     dqa_h_stride: Int,
     dqa_l_stride: Int,
@@ -950,7 +950,16 @@ def bwd_kernel[
                 num_iters_bn_k,
             )
 
-            # ---- Atomic-add dq_contrib c-frag into gmem dqaccum.
+            # ---- Write dq_contrib c-frag into the n_block's slot of
+            # the expanded dqaccum (shape (num_n_blocks, B, H, L, D)).
+            # Each block owns its slot exclusively → plain stores, no
+            # atomics, no cross-block contention. The convert_dq kernel
+            # reduces across the n_block dim before casting to bf16.
+            #
+            # Diagnostic: under the previous (B, H, L, D) atomic-add
+            # design, atomic contention dominated ~95% of kernel time
+            # (L=1024 → 2119 μs with atomics, 116 μs without).
+            var dqa_slot_off: Int = n_block * dqa_n_stride + dqa_base_off
             comptime for n_mma in range(num_n_mmas_dv):
                 var col_base_dq: Int = n_mma * MMA_N + 2 * lane_pair
                 var row_top: Int = warp_y * WM + lane_group
@@ -961,24 +970,19 @@ def bwd_kernel[
                 var c1_dq = dq_contrib.ptr[n_mma * c_frag_size + 1]
                 var c2_dq = dq_contrib.ptr[n_mma * c_frag_size + 2]
                 var c3_dq = dq_contrib.ptr[n_mma * c_frag_size + 3]
-                var base: Int = dqa_base_off
                 if g_row_top < seq_len:
-                    _ = Atomic.fetch_add(
-                        dqaccum_ptr + base + g_row_top * dqa_l_stride + col_base_dq,
-                        c0_dq.cast[DType.float32](),
+                    (dqaccum_ptr + dqa_slot_off + g_row_top * dqa_l_stride + col_base_dq)[0] = (
+                        c0_dq.cast[DType.float32]()
                     )
-                    _ = Atomic.fetch_add(
-                        dqaccum_ptr + base + g_row_top * dqa_l_stride + col_base_dq + 1,
-                        c1_dq.cast[DType.float32](),
+                    (dqaccum_ptr + dqa_slot_off + g_row_top * dqa_l_stride + col_base_dq + 1)[0] = (
+                        c1_dq.cast[DType.float32]()
                     )
                 if g_row_bot < seq_len:
-                    _ = Atomic.fetch_add(
-                        dqaccum_ptr + base + g_row_bot * dqa_l_stride + col_base_dq,
-                        c2_dq.cast[DType.float32](),
+                    (dqaccum_ptr + dqa_slot_off + g_row_bot * dqa_l_stride + col_base_dq)[0] = (
+                        c2_dq.cast[DType.float32]()
                     )
-                    _ = Atomic.fetch_add(
-                        dqaccum_ptr + base + g_row_bot * dqa_l_stride + col_base_dq + 1,
-                        c3_dq.cast[DType.float32](),
+                    (dqaccum_ptr + dqa_slot_off + g_row_bot * dqa_l_stride + col_base_dq + 1)[0] = (
+                        c3_dq.cast[DType.float32]()
                     )
 
             # ---- MMA 5: dK_acc += dSᵀ · Q.
