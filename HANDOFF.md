@@ -447,3 +447,87 @@ modular/                 # vendored modular/MAX source at tag max/v26.3.0
   runs (numbers will differ vs Ada — H100 is much faster).
 - Clear the JIT cache if anything looks off:
   `rm -rf ~/.cache/flash_attn_mojo/`.
+
+## fwd_fa3 — Hopper FA3 fwd port (in progress)
+
+**Recent commits on `main` (newest first):**
+```
+4364577 fwd_fa3: revert PV transpose_b experiment (broke shape interpretation)
+db69e94 fwd_fa3: online softmax via lane_group reductions
+d21980e fwd_fa3: TMA + WGMMA pipeline runs end-to-end (correctness pending)
+da986a3 fwd_fa3: scaffold (sm_90+ Hopper subpackage, kernel is a no-op stub)
+```
+
+**Status:** scaffold + TMA + WGMMA × 2 + online softmax + gmem write are all
+landed and the kernel compiles and runs on H100. Output is wrong by a
+per-row factor:
+
+```
+mojo[i, 0, 0, 0] for i=0..3: [1.78, 1.92, 1.70, 2.17]
+ref[i, 0, 0, 0]  for i=0..3: [1.00, 1.00, 1.00, 1.00]   (V = ones probe)
+```
+
+Mean across all rows = 1.0 (correct on average) but per-row variance is real.
+Not a bf16-precision issue (upstream FA3 matches fp32 to 2e-3). Not a
+swizzle issue (SWIZZLE_NONE produces bit-identical output to SWIZZLE_128B).
+
+**Diagnosis:** the per-row rowsum (sum of P over 128 cols, reduced across
+4 lanes via `warp.lane_group_sum[num_lanes=4]`) is wrong by a different
+factor per row. Most likely cause: the c-frag → (row, col) mapping I use
+for the online softmax misses or duplicates elements within the c-frag.
+
+The mapping I use for WGMMA m64n128 c-frag index `c ∈ [0, 64)`:
+- `n_unit = c / 4`
+- `in_unit = c % 4`
+- `in_unit ∈ {0, 1}` → top row; `in_unit ∈ {2, 3}` → bot row
+- col = `n_unit * 8 + (lane % 4) * 2 + (1 if in_unit is odd else 0)`
+
+Either this mapping is wrong, or the LayoutTensor of s_reg doesn't actually
+store the c-frag in element-order matching my assumption. The reshape from
+`(num_m_mmas, c_frag_size) = (2, 64)` to a-frag `(num_m_mmas * num_k_mmas,
+a_frag_size) = (16, 8)` is byte-wise identical (no shuffle) — modular's
+mha.mojo does the same `p_frag.copy_from(p_reg_tile.reshape(...))`.
+
+**Concrete next steps:**
+
+1. Drop a device-side print of `s_reg.ptr[0..7]` for thread 0 after the
+   wgmma_qk and check whether the actual stored values match the
+   (top, col=0), (top, col=1), (bot, col=0), (bot, col=1), (top, col=8),
+   (top, col=9), (bot, col=8), (bot, col=9) positions I expect. If the
+   actual row/col mapping differs, fix the softmax c-frag walk.
+
+2. Alternative: use Mojo's `vectorize` + a known c-frag row-col helper
+   (see `wgmma_c_thread_layout` / `wgmma_c_layout` in
+   `modular/max/kernels/src/layout/tensor_core_async.mojo`) instead of
+   hand-rolling the indexing.
+
+3. After softmax is correct, the PV WGMMA + output store should "just
+   work" since they use the same c-frag indexing assumption (output
+   diff is currently ~0.75 max, ~0.11 mean, but the magnitudes are
+   close, suggesting the layout assumption is mostly right at the
+   bottleneck).
+
+**Key files:**
+- `src/flash_attn_mojo/fwd_fa3/kernel.mojo` — softmax c-frag walk at
+  lines 293-322 (rowmax) and 339-352 (rowsum).
+- `src/flash_attn_mojo/fwd_fa3/launch.mojo` — TMA descriptor setup
+  and kernel launch.
+
+**Debug recipe:**
+```bash
+rm -rf ~/.cache/flash_attn_mojo/fwd_fa3
+uv run --extra nvidia python -c "
+import torch
+from flash_attn_mojo.fwd_fa3 import native_fwd_fa3
+from flash_attn import flash_attn_func
+B,L,H,D = 1,128,1,64
+torch.manual_seed(0)
+q = torch.randn(B,L,H,D,dtype=torch.bfloat16,device='cuda').contiguous()
+k = q.clone(); v = torch.ones_like(q)
+out = torch.zeros_like(q); native_fwd_fa3(q,k,v,out,softmax_scale=1.0/(D**0.5))
+ref = flash_attn_func(q,k,v)
+print('mojo[:4,0,0]:', out[0,:4,0,0].tolist())
+print('ref [:4,0,0]:', ref[0,:4,0,0].tolist())
+"
+# Target: both show all 1.0
+```
