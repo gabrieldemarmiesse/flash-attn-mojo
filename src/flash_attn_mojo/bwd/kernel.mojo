@@ -81,7 +81,9 @@ from common import kBwdNThreads, kBwdBlockM, kBwdBlockN
 
 # BK chunk size along the K axis of every MMA. Picked to be a multiple
 # of MMA_K (=16 for bf16 m16n8k16) and to divide BM, BN, and head_dim
-# cleanly at the supported head_dims (32, 64, 128).
+# cleanly at the supported head_dims (32, 64, 128). Tried BK=64 at D≥64
+# (fewer K-iters per MMA) and observed no measurable change in kernel
+# time, so kept at 32 for uniformity with D=32.
 comptime kBwdBlockK: Int = 32
 
 

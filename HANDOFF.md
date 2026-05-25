@@ -16,9 +16,71 @@ stale — it expects fp16 to raise NotImplementedError, but fp16 now
 works via the API-boundary cast. Update the assertion or delete the
 test.
 
-## Current perf state (RTX 2000 Ada, sm89)
+## Current perf state (H100, sm90)
 
-**Forward** is at perf parity with upstream flash-attn 2:
+Captured 2026-05-25 with `bench_gpu_kernel_time.py --iters 20`. Upstream
+on H100 dispatches the FA3 (sm90) kernel for fwd, so the fwd ratio is
+no longer at parity — that's the FA3-port work item (item 3 below).
+
+**Forward** vs upstream FA3 (H100):
+
+```
+shape (B,L,H,D)   | mojo us | upstream us | ratio
+(1, 128, 8, 64)   |    8.76 |        5.25 | 1.67x
+(1, 512, 8, 64)   |   22.81 |       10.05 | 2.27x
+(1, 1024, 8, 64)  |   41.44 |       16.66 | 2.49x
+(1, 2048, 8, 64)  |   81.86 |       37.48 | 2.18x
+(2, 1024, 8, 64)  |   46.00 |       20.87 | 2.20x
+(4, 1024, 8, 64)  |   87.22 |       31.77 | 2.75x
+(8, 1024, 8, 64)  |  193.04 |       61.10 | 3.16x
+(1, 4096, 8, 64)  |  308.10 |      110.14 | 2.80x
+(1, 8192, 8, 64)  | 1419.29 |      421.97 | 3.36x
+```
+
+**Backward** (after the multistage_mma rewrite — commit `b9794c3`):
+
+```
+shape (B,L,H,D)   | mojo bwd us | upstream bwd us | ratio | prev (scalar)
+(1, 128, 8, 64)   |       237   |              15 |    16x |    885 us (59x)
+(1, 512, 8, 64)   |       991   |              29 |    34x |   3528 us (122x)
+(1, 1024, 8, 64)  |      2119   |              47 |    45x |   7056 us (151x)
+(1, 2048, 8, 64)  |      4655   |              84 |    56x |  20993 us (250x)
+(2, 1024, 8, 64)  |      2345   |              49 |    48x |  10918 us (222x)
+(4, 1024, 8, 64)  |      4651   |              92 |    51x |  21484 us (233x)
+```
+
+The MMA rewrite (commit `b9794c3`) gave a 3.7-5.5x kernel-time speedup over
+the scalar-loop baseline. Remaining gap vs upstream FA2-bwd is ~16-56x;
+upstream itself is also memory-bound on H100 (~10x off bf16 peak), so the
+gap is in microarchitectural efficiency, not FLOPs.
+
+Likely sources of the remaining gap, in rough impact order:
+
+1. **Smem bank conflicts on PT/dST stores.** Each thread writes its 8
+   m16n8k16 C-fragments (= 32 scalar bf16 stores) to a (BN, BK)-chunked
+   PT/dST layout where adjacent rows differ by BK*2=64 bytes. At BK=32
+   this is a 16-bank stride, so 4 threads with the same `lane_pair`
+   conflict 4-way per warp on every store. Pre-write swizzle pass (a la
+   cutlass `Sw<2,3,3>`) would resolve.
+
+2. **Atomic-add contention on dqaccum.** Each block atomic-adds dQ
+   contributions for its (n_block) into a shared dqaccum that's also
+   touched by every other n_block at the same q_row. At L=1024 there
+   are 16 n_blocks contending per cell. Sequential-q (Tri Dao's
+   non-atomic path) sidesteps this but requires a multi-kernel pipeline.
+
+3. **Lower occupancy than fwd.** Per-thread register pressure is higher
+   (s_reg / dp_reg / dq_contrib / dk_acc / dv_acc ≈ 160 fp32 registers /
+   thread); fwd has ~half. H100 SM register file is 64 KiB / SM so the
+   bwd CTA count per SM drops accordingly.
+
+4. **Redundant per-qb gmem loads.** Q, dO, K each get loaded twice from
+   gmem (chunked-A view + striped-B view). The second load hits L2 not
+   HBM, so cost is small (~5 μs at L=1024) but non-zero.
+
+## Prior perf state (RTX 2000 Ada, sm89, pre-H100)
+
+**Forward** was at perf parity with upstream flash-attn 2:
 
 ```
 shape (B,L,H,D)   | mojo us | upstream us | ratio
@@ -75,40 +137,26 @@ second — the perf rewrite is the headline remaining work item.
 
 ## Remaining work
 
-### 1. bwd perf rewrite — the biggest item
+### 1. bwd perf rewrite — DONE (commit `b9794c3`)
 
-Convert the bwd's 5 matmuls from scalar loops to `multistage_mma`
-+ tensor cores. A prior agent attempt converting just one matmul
-(S=Q·K^T) regressed perf because the swizzled-smem cost wasn't
-amortized; **all 5 matmuls must convert together** to share the
-swizzled buffers.
+All 5 bwd matmuls converted from scalar fp32 inner loops to
+`multistage_mma` tensor-core MMAs. Smem layout uses 9 buffers (each
+of Q, K, dO gets an A-chunked view AND a B-striped view because they
+play both transpose_b roles across the 5 matmuls; PT and dST get
+dedicated transposed-layout buffers written from m16n8k16 C-fragments
+after softmax / dS combine; V is single-layout). dQ MMA uses A-from-
+registers (same trick fwd uses for P·V), atomic-adding c-fragments to
+dqaccum.
 
-Key pieces (`src/flash_attn_mojo/bwd/kernel.mojo`):
-- Q smem: row_major(BM, D), swizzled. Used by S=Q·K^T and dK+=dS^T·Q.
-- K smem: row_major(BN, D), swizzled. Used by S=Q·K^T and dQ+=dS·K.
-- V smem: row_major(BN, D), swizzled. Used by dP=dO·V^T.
-- dO smem: row_major(BM, D), swizzled. Used by dV+=P^T·dO and dP=dO·V^T.
-- P smem: row_major(BM, BN), bf16 cast from fp32 S after softmax/mask.
-  Consumed by dV (as A operand) and dQ (as part of dS).
-- dS smem: row_major(BM, BN), bf16 cast from fp32 dS. Consumed by dK.
+Smem at hd=64: ~72.5 KiB; hd=128: ~144.5 KiB (fits H100, exceeds Ada
+99 KiB cap — would need a smaller-block path for Ada D=128, not yet
+implemented since H100 is the current target).
 
-Smem budget at hd=64: Q+K+V+dO = 32 KiB, P+dS = 16 KiB → 48 KiB.
-Plus pipeline staging adds another ~16 KiB → ~64 KiB total. Fits Ada
-and H100. At hd=128: doubles to ~96 KiB on Ada (right at the cap);
-H100 has 228 KiB available so it fits easily.
-
-Reference: study `src/flash_attn_mojo/fwd/kernel.mojo`'s
-`multistage_mma` invocations — same template params, same swizzle
-patterns. The bwd has 5 matmuls instead of 2 but the per-matmul
-pattern is identical.
-
-Expected speedup: from ~89-384x upstream down to ~1-2x upstream
-(based on fwd parity). 100-300x perf gain.
-
-This is M-H session work. Plan it as one big commit (all 5 matmuls
-together) OR a sequence: one commit per matmul where each commit
-keeps the rest scalar but the smem layout is already set up for the
-full conversion.
+Delivered speedup: 3.7-5.5x over scalar; brought from ~60-250x to
+~16-56x upstream. The remaining gap to upstream is documented under
+"Current perf state" above. Next-step optimization ideas there are
+estimates only — none have been profiled with ncu (no permission for
+GPU perf counters on this box; only nsys-level timing available).
 
 ### 2. head_dim ∈ {96, 160, 192, 224, 256}
 
