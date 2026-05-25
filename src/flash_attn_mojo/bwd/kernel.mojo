@@ -75,15 +75,11 @@ from layout.tensor_core import get_fragment_size, get_mma_shape
 
 from linalg.matmul.gpu._multistage_gemm_gpu import multistage_mma
 
-from common import kBwdNThreads, kBwdBlockM, kBwdBlockN
+from common import kBwdNThreads, kBwdBlockM, kBwdBlockN, kBwdBlockK, kBwdPtPad
 
 
-# BK chunk size along the K axis of every MMA. Picked to be a multiple
-# of MMA_K (=16 for bf16 m16n8k16) and to divide BM, BN, and head_dim
-# cleanly at the supported head_dims (32, 64, 128). Tried BK=64 at D≥64
-# (fewer K-iters per MMA) and observed no measurable change in kernel
-# time, so kept at 32 for uniformity with D=32.
-comptime kBwdBlockK: Int = 32
+# BK chunk size along the K axis of every MMA. Imported from common.mojo
+# so launch.mojo can size the padded PT/dST smem correctly.
 
 
 @__llvm_metadata(
@@ -198,9 +194,16 @@ def bwd_kernel[
         return
 
     # ---- Dynamic smem carve-up.
+    # PT/dST chunks pad each (BN, BK) row by kBwdPtPad bf16 elements
+    # (16 bytes) to break the bank-aligned write pattern. Without padding,
+    # adjacent BN-cols hit the same banks (BK=32 bf16 = 64 bytes = exactly
+    # 16 banks), giving 4-way conflicts on 75% of c-frag stores per ncu.
+    # PT_ROW = BK + 8 keeps the row 16-byte aligned for ldmatrix while
+    # shifting bank residues by 4 banks per consecutive BN-col.
+    comptime PT_ROW: Int = kBwdBlockK + kBwdPtPad
     comptime buf_qd: Int = BM * D
     comptime buf_kv: Int = BN * D
-    comptime buf_pt: Int = BN * BM
+    comptime buf_pt: Int = BN * PT_ROW * (BM // kBwdBlockK)
 
     var smem_base = external_memory[
         Scalar[dtype],
@@ -239,6 +242,14 @@ def bwd_kernel[
         alignment=alignment,
         circular=True,
     ]
+    comptime IterMK_BN_PT = LayoutTensorIter[
+        dtype,
+        Layout.row_major(BN, PT_ROW),
+        _,
+        address_space=AddressSpace.SHARED,
+        alignment=alignment,
+        circular=True,
+    ]
     comptime IterKM = LayoutTensorIter[
         dtype,
         Layout.row_major(BK, D),
@@ -255,8 +266,8 @@ def bwd_kernel[
     var v_iter   = IterMK_BN(v_smem,    IterMK_BN.linear_uint_type(buf_kv))
     var do_a_iter = IterMK_BM(do_a_smem, IterMK_BM.linear_uint_type(buf_qd))
     var do_b_iter = IterKM(do_b_smem, IterKM.linear_uint_type(buf_qd))
-    var pt_iter  = IterMK_BN(pt_smem,  IterMK_BN.linear_uint_type(buf_pt))
-    var dst_iter = IterMK_BN(dst_smem, IterMK_BN.linear_uint_type(buf_pt))
+    var pt_iter  = IterMK_BN_PT(pt_smem,  IterMK_BN_PT.linear_uint_type(buf_pt))
+    var dst_iter = IterMK_BN_PT(dst_smem, IterMK_BN_PT.linear_uint_type(buf_pt))
 
     # ---- Register accumulators.
     var dv_acc = (
@@ -790,16 +801,16 @@ def bwd_kernel[
                     var top_off: Int = row_top - top_chunk * BK
                     var bot_chunk: Int = row_bot // BK
                     var bot_off: Int = row_bot - bot_chunk * BK
-                    pt_smem[top_chunk * BN * BK + col_a * BK + top_off] = (
+                    pt_smem[top_chunk * BN * PT_ROW + col_a * PT_ROW + top_off] = (
                         s_reg.ptr[mma_id_p * c_frag_size + 0].cast[dtype]()
                     )
-                    pt_smem[top_chunk * BN * BK + col_b * BK + top_off] = (
+                    pt_smem[top_chunk * BN * PT_ROW + col_b * PT_ROW + top_off] = (
                         s_reg.ptr[mma_id_p * c_frag_size + 1].cast[dtype]()
                     )
-                    pt_smem[bot_chunk * BN * BK + col_a * BK + bot_off] = (
+                    pt_smem[bot_chunk * BN * PT_ROW + col_a * PT_ROW + bot_off] = (
                         s_reg.ptr[mma_id_p * c_frag_size + 2].cast[dtype]()
                     )
-                    pt_smem[bot_chunk * BN * BK + col_b * BK + bot_off] = (
+                    pt_smem[bot_chunk * BN * PT_ROW + col_b * PT_ROW + bot_off] = (
                         s_reg.ptr[mma_id_p * c_frag_size + 3].cast[dtype]()
                     )
 
@@ -900,16 +911,16 @@ def bwd_kernel[
                     var top_off: Int = row_top - top_chunk * BK
                     var bot_chunk: Int = row_bot // BK
                     var bot_off: Int = row_bot - bot_chunk * BK
-                    dst_smem[top_chunk * BN * BK + col_a * BK + top_off] = (
+                    dst_smem[top_chunk * BN * PT_ROW + col_a * PT_ROW + top_off] = (
                         s_reg.ptr[mma_id_dst * c_frag_size + 0].cast[dtype]()
                     )
-                    dst_smem[top_chunk * BN * BK + col_b * BK + top_off] = (
+                    dst_smem[top_chunk * BN * PT_ROW + col_b * PT_ROW + top_off] = (
                         s_reg.ptr[mma_id_dst * c_frag_size + 1].cast[dtype]()
                     )
-                    dst_smem[bot_chunk * BN * BK + col_a * BK + bot_off] = (
+                    dst_smem[bot_chunk * BN * PT_ROW + col_a * PT_ROW + bot_off] = (
                         s_reg.ptr[mma_id_dst * c_frag_size + 2].cast[dtype]()
                     )
-                    dst_smem[bot_chunk * BN * BK + col_b * BK + bot_off] = (
+                    dst_smem[bot_chunk * BN * PT_ROW + col_b * PT_ROW + bot_off] = (
                         s_reg.ptr[mma_id_dst * c_frag_size + 3].cast[dtype]()
                     )
 
@@ -959,6 +970,11 @@ def bwd_kernel[
             # Diagnostic: under the previous (B, H, L, D) atomic-add
             # design, atomic contention dominated ~95% of kernel time
             # (L=1024 → 2119 μs with atomics, 116 μs without).
+            # 2-wide vector stores: col_base_dq is always even (lane_pair
+            # in [0,4), MMA_N=8 → 2*lane_pair in {0,2,4,6}). Each pair is
+            # 8-byte aligned, so packing c0/c1 (and c2/c3) into SIMD[fp32,2]
+            # emits a single st.global.b64 instead of two .b32. Fixes the
+            # uncoalesced-global-store warning ncu flags on this site.
             var dqa_slot_off: Int = n_block * dqa_n_stride + dqa_base_off
             comptime for n_mma in range(num_n_mmas_dv):
                 var col_base_dq: Int = n_mma * MMA_N + 2 * lane_pair
@@ -966,24 +982,18 @@ def bwd_kernel[
                 var row_bot: Int = row_top + 8
                 var g_row_top: Int = q_row_base + row_top
                 var g_row_bot: Int = q_row_base + row_bot
-                var c0_dq = dq_contrib.ptr[n_mma * c_frag_size + 0]
-                var c1_dq = dq_contrib.ptr[n_mma * c_frag_size + 1]
-                var c2_dq = dq_contrib.ptr[n_mma * c_frag_size + 2]
-                var c3_dq = dq_contrib.ptr[n_mma * c_frag_size + 3]
+                var c01_dq = SIMD[DType.float32, 2](
+                    dq_contrib.ptr[n_mma * c_frag_size + 0].cast[DType.float32](),
+                    dq_contrib.ptr[n_mma * c_frag_size + 1].cast[DType.float32](),
+                )
+                var c23_dq = SIMD[DType.float32, 2](
+                    dq_contrib.ptr[n_mma * c_frag_size + 2].cast[DType.float32](),
+                    dq_contrib.ptr[n_mma * c_frag_size + 3].cast[DType.float32](),
+                )
                 if g_row_top < seq_len:
-                    (dqaccum_ptr + dqa_slot_off + g_row_top * dqa_l_stride + col_base_dq)[0] = (
-                        c0_dq.cast[DType.float32]()
-                    )
-                    (dqaccum_ptr + dqa_slot_off + g_row_top * dqa_l_stride + col_base_dq + 1)[0] = (
-                        c1_dq.cast[DType.float32]()
-                    )
+                    (dqaccum_ptr + dqa_slot_off + g_row_top * dqa_l_stride + col_base_dq).bitcast[SIMD[DType.float32, 2]]()[0] = c01_dq
                 if g_row_bot < seq_len:
-                    (dqaccum_ptr + dqa_slot_off + g_row_bot * dqa_l_stride + col_base_dq)[0] = (
-                        c2_dq.cast[DType.float32]()
-                    )
-                    (dqaccum_ptr + dqa_slot_off + g_row_bot * dqa_l_stride + col_base_dq + 1)[0] = (
-                        c3_dq.cast[DType.float32]()
-                    )
+                    (dqaccum_ptr + dqa_slot_off + g_row_bot * dqa_l_stride + col_base_dq).bitcast[SIMD[DType.float32, 2]]()[0] = c23_dq
 
             # ---- MMA 5: dK_acc += dSᵀ · Q.
             multistage_mma[
@@ -1006,27 +1016,33 @@ def bwd_kernel[
     # ---- Write dK_acc, dV_acc to gmem.
     var dk_base_off: Int = batch * dk_b_stride + kv_head_idx * dk_h_stride
     var dv_base_off: Int = batch * dv_b_stride + kv_head_idx * dv_h_stride
+    # 2-wide vector stores for dK/dV: same even-col argument as dQaccum;
+    # one .b32 per pair instead of two .b16.
     comptime for n_mma in range(num_n_mmas_dv):
         var col_base_kv: Int = n_mma * MMA_N + 2 * lane_pair
         var row_top: Int = warp_y * WM + lane_group
         var row_bot: Int = row_top + 8
         var g_row_top: Int = kv_row_base + row_top
         var g_row_bot: Int = kv_row_base + row_bot
-        var c0_dk = dk_acc.ptr[n_mma * c_frag_size + 0].cast[dtype]()
-        var c1_dk = dk_acc.ptr[n_mma * c_frag_size + 1].cast[dtype]()
-        var c2_dk = dk_acc.ptr[n_mma * c_frag_size + 2].cast[dtype]()
-        var c3_dk = dk_acc.ptr[n_mma * c_frag_size + 3].cast[dtype]()
-        var c0_dv = dv_acc.ptr[n_mma * c_frag_size + 0].cast[dtype]()
-        var c1_dv = dv_acc.ptr[n_mma * c_frag_size + 1].cast[dtype]()
-        var c2_dv = dv_acc.ptr[n_mma * c_frag_size + 2].cast[dtype]()
-        var c3_dv = dv_acc.ptr[n_mma * c_frag_size + 3].cast[dtype]()
+        var c01_dk = SIMD[dtype, 2](
+            dk_acc.ptr[n_mma * c_frag_size + 0].cast[dtype](),
+            dk_acc.ptr[n_mma * c_frag_size + 1].cast[dtype](),
+        )
+        var c23_dk = SIMD[dtype, 2](
+            dk_acc.ptr[n_mma * c_frag_size + 2].cast[dtype](),
+            dk_acc.ptr[n_mma * c_frag_size + 3].cast[dtype](),
+        )
+        var c01_dv = SIMD[dtype, 2](
+            dv_acc.ptr[n_mma * c_frag_size + 0].cast[dtype](),
+            dv_acc.ptr[n_mma * c_frag_size + 1].cast[dtype](),
+        )
+        var c23_dv = SIMD[dtype, 2](
+            dv_acc.ptr[n_mma * c_frag_size + 2].cast[dtype](),
+            dv_acc.ptr[n_mma * c_frag_size + 3].cast[dtype](),
+        )
         if g_row_top < seq_len:
-            (dk_ptr + dk_base_off + g_row_top * dk_l_stride + col_base_kv)[0] = c0_dk
-            (dk_ptr + dk_base_off + g_row_top * dk_l_stride + col_base_kv + 1)[0] = c1_dk
-            (dv_ptr + dv_base_off + g_row_top * dv_l_stride + col_base_kv)[0] = c0_dv
-            (dv_ptr + dv_base_off + g_row_top * dv_l_stride + col_base_kv + 1)[0] = c1_dv
+            (dk_ptr + dk_base_off + g_row_top * dk_l_stride + col_base_kv).bitcast[SIMD[dtype, 2]]()[0] = c01_dk
+            (dv_ptr + dv_base_off + g_row_top * dv_l_stride + col_base_kv).bitcast[SIMD[dtype, 2]]()[0] = c01_dv
         if g_row_bot < seq_len:
-            (dk_ptr + dk_base_off + g_row_bot * dk_l_stride + col_base_kv)[0] = c2_dk
-            (dk_ptr + dk_base_off + g_row_bot * dk_l_stride + col_base_kv + 1)[0] = c3_dk
-            (dv_ptr + dv_base_off + g_row_bot * dv_l_stride + col_base_kv)[0] = c2_dv
-            (dv_ptr + dv_base_off + g_row_bot * dv_l_stride + col_base_kv + 1)[0] = c3_dv
+            (dk_ptr + dk_base_off + g_row_bot * dk_l_stride + col_base_kv).bitcast[SIMD[dtype, 2]]()[0] = c23_dk
+            (dv_ptr + dv_base_off + g_row_bot * dv_l_stride + col_base_kv).bitcast[SIMD[dtype, 2]]()[0] = c23_dv

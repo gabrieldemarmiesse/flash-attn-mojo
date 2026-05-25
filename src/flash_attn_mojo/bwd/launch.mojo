@@ -15,7 +15,7 @@ from std.memory import OpaquePointer
 from std.sys import size_of
 
 from kernel import bwd_kernel
-from common import kBwdNThreads, kBwdBlockM, kBwdBlockN
+from common import kBwdNThreads, kBwdBlockM, kBwdBlockN, kBwdBlockK, kBwdPtPad
 
 
 def launch_bwd[
@@ -88,13 +88,17 @@ def launch_bwd[
     # Tensor-core (multistage_mma) bwd uses 9 smem buffers:
     #   Q_A, Q_B, dO_A, dO_B: BM * D each.
     #   K_A, K_B, V: BN * D each.
-    #   PT, dST: BN * BM each.
+    #   PT, dST: BN * (BK + PT_PAD) * (BM // BK) each — padded by PT_PAD bf16
+    #             per row to break BK-bank-aligned conflicts on c-frag writes.
     #   LSE, delta: BM each fp32.
-    # At BM=BN=64, D=64 → 9 × 8 KiB + 0.5 KiB ≈ 72.5 KiB. At D=128 → ~144.5 KiB.
+    # At BM=BN=64, D=64, PT_PAD=8 → 9× ~ + 0.5 KiB ≈ 76.5 KiB.
     comptime D: Int = head_dim
     comptime qd_bytes: Int = kBwdBlockM * D * size_of[dtype]()
     comptime kv_bytes: Int = kBwdBlockN * D * size_of[dtype]()
-    comptime pt_bytes: Int = kBwdBlockN * kBwdBlockM * size_of[dtype]()
+    comptime pt_bytes: Int = (
+        kBwdBlockN * (kBwdBlockK + kBwdPtPad) * (kBwdBlockM // kBwdBlockK)
+        * size_of[dtype]()
+    )
     comptime lse_bytes: Int = kBwdBlockM * 4
     comptime delta_bytes: Int = kBwdBlockM * 4
     comptime smem_bytes: Int = (
