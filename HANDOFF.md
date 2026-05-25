@@ -452,6 +452,7 @@ modular/                 # vendored modular/MAX source at tag max/v26.3.0
 
 **Recent commits on `main` (newest first):**
 ```
+fa1e496 fwd_fa3: cleaner output store loop; isolate bug to per-row variation
 4364577 fwd_fa3: revert PV transpose_b experiment (broke shape interpretation)
 db69e94 fwd_fa3: online softmax via lane_group reductions
 d21980e fwd_fa3: TMA + WGMMA pipeline runs end-to-end (correctness pending)
@@ -471,45 +472,74 @@ Mean across all rows = 1.0 (correct on average) but per-row variance is real.
 Not a bf16-precision issue (upstream FA3 matches fp32 to 2e-3). Not a
 swizzle issue (SWIZZLE_NONE produces bit-identical output to SWIZZLE_128B).
 
-**Diagnosis:** the per-row rowsum (sum of P over 128 cols, reduced across
-4 lanes via `warp.lane_group_sum[num_lanes=4]`) is wrong by a different
-factor per row. Most likely cause: the c-frag → (row, col) mapping I use
-for the online softmax misses or duplicates elements within the c-frag.
+**Diagnosis:** the c-frag scalar layout was verified via modular's
+`p_vec_output_layout` (mha.mojo:1086): scalar order per thread is
+`(top, top, bot, bot)` per col-chunk, repeating across 16 col-chunks
+for m64n128, totaling 64 elements. My current row mapping
+`m_mma*2 + (1 if (c % 4) >= 2 else 0)` matches this. (A mid-session
+experiment using `(c // NC) & 1` was wrong and has been reverted.)
 
-The mapping I use for WGMMA m64n128 c-frag index `c ∈ [0, 64)`:
-- `n_unit = c / 4`
-- `in_unit = c % 4`
-- `in_unit ∈ {0, 1}` → top row; `in_unit ∈ {2, 3}` → bot row
-- col = `n_unit * 8 + (lane % 4) * 2 + (1 if in_unit is odd else 0)`
+Bug is therefore NOT in c-frag indexing. Further probes narrowed it:
 
-Either this mapping is wrong, or the LayoutTensor of s_reg doesn't actually
-store the c-frag in element-order matching my assumption. The reshape from
-`(num_m_mmas, c_frag_size) = (2, 64)` to a-frag `(num_m_mmas * num_k_mmas,
-a_frag_size) = (16, 8)` is byte-wise identical (no shuffle) — modular's
-mha.mojo does the same `p_frag.copy_from(p_reg_tile.reshape(...))`.
+```
+Q=K=zero,   V=ones:  output = 1.0 exactly (perfect)
+Q=rand, K=zero, V=ones: 1.0 exactly      (S = 0, identical to above)
+Q=0, K=rand, V=ones:    1.0 exactly      (S = 0)
+Q=K=rand, V=ones:       1.78, 1.92, 1.70, 2.17 (broken; per-row variance)
+```
 
-**Concrete next steps:**
+So the kernel is correct whenever S is uniformly 0. Per-row variation
+in S → per-row error in O. This rules out static structure issues
+(c-frag walk, c→a reshape, output store, warp/lane mapping all
+behave identically whether S is constant or not). What changes between
+the two cases is the *per-row state flow* through the softmax:
+rowmax / rowsum / scale_old correction. At L=128 there is only 1
+KV block so scale_old can't be the issue — leaving:
 
-1. Drop a device-side print of `s_reg.ptr[0..7]` for thread 0 after the
-   wgmma_qk and check whether the actual stored values match the
-   (top, col=0), (top, col=1), (bot, col=0), (bot, col=1), (top, col=8),
-   (top, col=9), (bot, col=8), (bot, col=9) positions I expect. If the
-   actual row/col mapping differs, fix the softmax c-frag walk.
+1. The `warp.lane_group_max[num_lanes=4]` / `lane_group_sum[num_lanes=4]`
+   reductions. These should broadcast to all 4 participating lanes, but
+   maybe not in the configuration we use. Worth verifying by computing
+   a known reduction (e.g., set local_max[0] = lane_id and check the
+   post-reduce value on each lane equals max of lane_ids in the group).
 
-2. Alternative: use Mojo's `vectorize` + a known c-frag row-col helper
-   (see `wgmma_c_thread_layout` / `wgmma_c_layout` in
-   `modular/max/kernels/src/layout/tensor_core_async.mojo`) instead of
-   hand-rolling the indexing.
+2. The wgmma_pv accumulation under bf16-cast P with varying magnitudes.
+   When P values span many orders of magnitude (because S values do),
+   the bf16 representation loses precision for small values and the
+   wgmma sum may behave differently per row. But the magnitude of the
+   error (~0.75) is far larger than expected bf16 noise.
 
-3. After softmax is correct, the PV WGMMA + output store should "just
-   work" since they use the same c-frag indexing assumption (output
-   diff is currently ~0.75 max, ~0.11 mean, but the magnitudes are
-   close, suggesting the layout assumption is mostly right at the
-   bottleneck).
+3. Most plausible: an interaction between the wgmma_pv's K-direction
+   slicing of P (8 k_iters of 16 cols each) and the c-frag → a-frag
+   "view" — even though the byte order matches, maybe the WGMMA
+   expects the A operand to have specific REGISTER FILE positions
+   (not just memory positions) for the wgmma.descriptor calc. The
+   LayoutTensor's stack_allocation might not give registers in the
+   contiguous order WGMMA expects across k_iters.
+
+**Concrete next steps for the next session:**
+
+1. **Device-side print probe.** Set s_reg to a known per-(row, col)
+   pattern (e.g. `s_reg.ptr[i] = lane * 100 + i`) immediately *after*
+   the wgmma_qk, then read it back and confirm the stored values
+   correspond to the (row, col) positions you expect. This unambiguously
+   verifies the c-frag layout assumption.
+
+2. **Replace `p_reg.copy_from(s_reg.reshape(...))` with an explicit
+   per-element walk** that computes (row, col) for each c-frag index
+   and writes to the corresponding a-frag slot. If this fixes
+   correctness, the issue is element ordering; if not, look at the
+   wgmma_pv descriptor.
+
+3. **Sanity-check by setting P = constant 1/128 (skip the actual
+   softmax)** — then with V=ones, O should equal 1.0 regardless of
+   the c-frag/a-frag mapping (since all P values are identical). If
+   this gives 1.0, the bug is definitively in the per-row softmax
+   path; if not, the bug is in the wgmma_pv → output flow.
 
 **Key files:**
 - `src/flash_attn_mojo/fwd_fa3/kernel.mojo` — softmax c-frag walk at
-  lines 293-322 (rowmax) and 339-352 (rowsum).
+  lines 293-322 (rowmax) and 339-352 (rowsum); output store at
+  lines ~390-440.
 - `src/flash_attn_mojo/fwd_fa3/launch.mojo` — TMA descriptor setup
   and kernel launch.
 
