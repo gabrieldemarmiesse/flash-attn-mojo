@@ -1,8 +1,57 @@
 # CLAUDE.md
 
-Guidance for working on this repo: a Mojo port of Tri Dao's CUDA
-`flash-attn`. The benchmark we care about is "GPU kernel time vs
-upstream flash-attn 2 CUDA", with upstream as the moving target.
+Guidance for working on this repo: a Mojo port of Tri Dao's
+`flash-attn`.
+
+## Current focus: matching FlashAttention-4 on H100 (2026-06)
+
+The active work is `src/flash_attn_mojo/fwd_fa4/`: a from-scratch
+Hopper forward kernel racing Tri Dao's **FlashAttention-4**
+(`flash_attn.cute`, CuTe DSL) at one minimalist config — bf16,
+head_dim=128, non-causal, contiguous, seqlen % 128 == 0, Hq == Hk.
+Canonical benchmark shape: **B=2, S=8192, H=16, D=128**. Everything
+below the "Legacy" line is the earlier FA2-vs-mojo work and can be
+treated as throwaway reference.
+
+- **Master iteration script: `scripts/master_bench.sh`** — clears
+  the flash_attn_mojo JIT cache (not the mojo compiler cache),
+  recompiles, benches mojo vs FA4 (CUPTI kernel-only time +
+  correctness), dumps the mojo kernel's PTX to
+  `ptx/mojo_fwd_fa4.ptx`, prints a PTX instruction-mix diff vs the
+  committed FA4 reference, and (unless `--no-ncu`) side-by-side ncu
+  stats. The loop: edit `fwd_fa4/kernel.mojo`, run the script, read
+  the summary, repeat.
+- **FA4 reference PTX**: `reference_ptx/` (committed; see its
+  README for the target numbers and how to regenerate).
+- **PTX dump plumbing**: set `MOJO_DUMP_PTX=<path>` in the env; the
+  `_jit.py` forwards it as a `-D` define and `launch.mojo` passes it
+  to `compile_function(dump_asm=...)`.
+- **`./modular` checkout**: the modular repo pinned at `d86df2b645`
+  (`mojo/v1.0.0b1` == `max/v26.3.0` release tags) — matches the
+  pinned `mojo-compiler==1.0.0b1` / `max-mojo-libs==26.3.0` wheels,
+  so stdlib/kernel sources there are exactly what we compile
+  against. Key references inside: `mojo/stdlib/std/gpu/`,
+  `max/kernels/src/layout/{tma_async,tensor_core_async}.mojo`,
+  `max/kernels/src/nn/attention/gpu/nvidia/sm90/` (modular's own
+  warp-specialized MHA — API usage reference; its algorithm is
+  slower than FA4, don't follow it blindly).
+- **FA4 source**: `flash-attention/flash_attn/cute/` (gitignored
+  clone) — `flash_fwd_sm90.py` is the algorithm we mirror
+  (warp-specialized producer + 2 MMA warpgroups, intra-warpgroup
+  overlap, pingpong scheduler barriers, PV-RS).
+
+Status (2026-06-10): fwd_fa4 v7 is correct (bf16 noise floor vs fp32
+SDPA and vs FA4) and at **~1.02-1.05x FA4 kernel time** on this
+H100 PCIe (~2280-2440 us vs FA4's ~2240-2350 us depending on
+sustained-load clocks; ~480 vs ~490 TFLOPS). ncu: identical
+tensor-pipe work, regs/thread (168), occupancy and launch shape;
+remaining gap is a few % more ALU/FMA instructions + 'wait' stalls.
+Ideas not yet tried: L2 cache hints on TMA loads (FA4's
+`cp.async.bulk.tensor...L2::cache_hint`), 32-bit smem index types,
+further softmax dependency-chain tuning (naive 4-way tree made it
+*slower*; revisit with PTX in hand).
+
+## Legacy (FA2-vs-mojo work below)
 
 **Status: fwd kernel at perf parity, bwd kernel feature-complete (correctness first; perf optimization pending).**
 
