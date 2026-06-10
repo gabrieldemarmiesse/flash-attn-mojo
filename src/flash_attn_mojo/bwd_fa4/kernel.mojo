@@ -556,6 +556,46 @@ def bwd_main_kernel[
             alignment=128,
         ](ring_base + (slot + 1) * q_slot_size)
 
+        # Launder the K/V tile pointers through a no-op asm so the
+        # A-operand wgmma descriptors are REBUILT here every
+        # iteration instead of being hoisted as 24 loop-invariant
+        # 64-bit k-step variants (which overflow the 63-UR/warp
+        # uniform file and spill to local — the long_scoreboard
+        # wall; FA4 rematerializes per iteration, ptxas folds the
+        # rebuild into UR immediates).
+        var k_lnd: Int32 = inlined_assembly[
+            "mov.b32 $0, $1;",
+            Int32,
+            constraints="=r,r",
+            has_side_effect=True,
+        ](Int32(Int(k_base)))
+        var k_base_l = k_base + (
+            (Int(k_lnd) >> 1) - (Int(k_base) >> 1)
+        )
+        var v_lnd: Int32 = inlined_assembly[
+            "mov.b32 $0, $1;",
+            Int32,
+            constraints="=r,r",
+            has_side_effect=True,
+        ](Int32(Int(v_base)))
+        var v_base_l = v_base + (
+            (Int(v_lnd) >> 1) - (Int(v_base) >> 1)
+        )
+        var k_smem_l = LayoutTensor[
+            dtype,
+            kv_smem_layout,
+            MutAnyOrigin,
+            address_space=AddressSpace.SHARED,
+            alignment=128,
+        ](k_base_l)
+        var v_smem_l = LayoutTensor[
+            dtype,
+            kv_smem_layout,
+            MutAnyOrigin,
+            address_space=AddressSpace.SHARED,
+            alignment=128,
+        ](v_base_l)
+
         # S^T = K · Q^T
         full[slot].wait(phase)
         # lse_log2/dpsum stay in smem (published with the Q slot) and
@@ -566,7 +606,7 @@ def bwd_main_kernel[
         warpgroup_fence(s_reg)
         wgmma_sdp.arrive()
         wgmma_sdp.wgmma[num_warp_groups=NWG, scale_c=0](
-            k_smem, q_view, s_reg, wg
+            k_smem_l, q_view, s_reg, wg
         )
         wgmma_sdp.commit_group()
 
@@ -575,7 +615,7 @@ def bwd_main_kernel[
         warpgroup_fence(dp_reg)
         wgmma_sdp.arrive()
         wgmma_sdp.wgmma[num_warp_groups=NWG, scale_c=0](
-            v_smem, do_view, dp_reg, wg
+            v_smem_l, do_view, dp_reg, wg
         )
         wgmma_sdp.commit_group()
 
@@ -652,9 +692,11 @@ def bwd_main_kernel[
             )
             var sds_ba: Int = Int(sds_stage_base) + 2 * sds_elems
             var sds_sw: Int = sds_ba ^ ((sds_ba >> 3) & 112)
+            # shifts, not // 2: Int floor-div emits a 17-op signed
+            # rounding-correction chain per address (see HANDOFF).
             var sds_ptr = sds_stage_base + (
-                sds_sw - Int(sds_stage_base)
-            ) // 2
+                (sds_sw >> 1) - (Int(sds_stage_base) >> 1)
+            )
             comptime for i in range(c_frag_sdp // 8):
                 var packed = SIMD[DType.float32, 4](0)
                 comptime for jm in range(4):
@@ -699,7 +741,7 @@ def bwd_main_kernel[
                 wgmma_sdp.arrive()
                 var a_desc = _wgmma_descriptor[
                     kt_canonical, False, swizzle
-                ](k_base) + wg * a_wg_stride
+                ](k_base_l) + wg * a_wg_stride
                 var b_desc = _wgmma_descriptor[
                     sds_canonical, True, swizzle
                 ](sds_stage_base)
@@ -815,8 +857,9 @@ def bwd_main_kernel[
         # XOR per call: the 32-B column steps live in the swizzled
         # bits, so the fold must apply to each logical address.
         var raw_i: Int = dv_raw + (i % 4) * 32 + (i // 4) * (BN * 128)
+        var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
         st_matrix[simd_width=4](
-            v_base + ((raw_i ^ ((raw_i >> 3) & 112)) - Int(v_base)) // 2,
+            v_base + ((sw_i >> 1) - (Int(v_base) >> 1)),
             packed,
         )
     fence_async_view_proxy()
@@ -846,8 +889,9 @@ def bwd_main_kernel[
                 ).cast[dtype]()
             )
         var raw_i: Int = dk_raw + (i % 4) * 32 + (i // 4) * (BN * 128)
+        var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
         st_matrix[simd_width=4](
-            k_base + ((raw_i ^ ((raw_i >> 3) & 112)) - Int(k_base)) // 2,
+            k_base + ((sw_i >> 1) - (Int(k_base) >> 1)),
             packed,
         )
     fence_async_view_proxy()
