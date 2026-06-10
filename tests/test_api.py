@@ -28,10 +28,11 @@ def _qkv(device="cpu", seqlen=128, head_dim=128, dtype=torch.bfloat16):
     return q, torch.randn_like(q), torch.randn_like(q)
 
 
-def test_causal_not_implemented():
+def test_causal_cpu_reference():
     q, k, v = _qkv()
-    with pytest.raises(NotImplementedError, match="non-causal"):
-        flash_attn_func(q, k, v, causal=True)
+    out = flash_attn_func(q, k, v, causal=True)
+    ref = flash_attn_ref(q, k, v, causal=True)
+    assert torch.equal(out, ref)
 
 
 def test_envelope_errors():

@@ -115,3 +115,55 @@ def test_vs_fa4_when_available():
     ref_out, ref_lse = fa4_func(q, k, v, return_lse=True)
     assert (out - ref_out).abs().max().item() < 5e-3
     assert (lse - ref_lse).abs().max().item() < 1e-5
+
+
+@requires_cuda
+@pytest.mark.parametrize("seqlen", SEQLENS)
+def test_causal_fwd(seqlen):
+    q, k, v = _make(seqlen)
+    with torch.no_grad():
+        out, lse = flash_attn_func(q, k, v, causal=True, return_lse=True)
+    import torch.nn.functional as F
+
+    ref = (
+        F.scaled_dot_product_attention(
+            q.transpose(1, 2).float(),
+            k.transpose(1, 2).float(),
+            v.transpose(1, 2).float(),
+            is_causal=True,
+        )
+        .transpose(1, 2)
+    )
+    assert (out.float() - ref).abs().max().item() < 2e-2
+
+    scale = q.shape[-1] ** -0.5
+    scores = (
+        torch.einsum("bshd,bthd->bhst", q.float(), k.float()) * scale
+    )
+    tri = torch.ones(
+        seqlen, seqlen, dtype=torch.bool, device="cuda"
+    ).triu(1)
+    ref_lse = torch.logsumexp(scores.masked_fill(tri, float("-inf")), dim=-1)
+    assert (lse - ref_lse).abs().max().item() < LSE_TOL
+
+
+@requires_cuda
+def test_causal_backward_raises():
+    q, k, v = _make(256, requires_grad=True)
+    with pytest.raises(NotImplementedError, match="inference only"):
+        flash_attn_func(q, k, v, causal=True)
+
+
+@requires_cuda
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_causal_vs_fa4_when_available():
+    try:
+        from flash_attn.cute import flash_attn_func as fa4_func
+    except ImportError:
+        pytest.skip("flash_attn.cute not importable")
+    q, k, v = _make(1024)
+    with torch.no_grad():
+        out, lse = flash_attn_func(q, k, v, causal=True, return_lse=True)
+    ref_out, ref_lse = fa4_func(q, k, v, causal=True, return_lse=True)
+    assert (out - ref_out).abs().max().item() < 2e-2
+    assert (lse - ref_lse).abs().max().item() < 1e-5

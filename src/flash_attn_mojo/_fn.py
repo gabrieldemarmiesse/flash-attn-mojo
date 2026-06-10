@@ -7,7 +7,8 @@ errors):
     * bf16 q/k/v, contiguous (B, S, H, D)
     * head_dim == 128
     * seqlen % 128 == 0
-    * non-causal, no dropout/window/alibi
+    * causal supported forward/inference-only (causal backward
+      pending); no dropout/window/alibi
     * Hq == Hk (no MQA/GQA)
     * CUDA sm90 (Hopper)
 
@@ -36,12 +37,6 @@ def _check_envelope(
     v: torch.Tensor,
     causal: bool,
 ) -> None:
-    if causal:
-        raise NotImplementedError(
-            "flash-attn-mojo's FA4 kernels are non-causal only (the "
-            "FA4 race scope). Use flash_attn_ref for a slow causal "
-            "reference."
-        )
     if q.dim() != 4:
         raise ValueError(
             f"q must be (batch, seqlen, nheads, head_dim), got "
@@ -108,7 +103,8 @@ def flash_attn_func(
             (head_dim=128, seqlen % 128 == 0, Hq == Hk). Non-CUDA
             tensors run the pure-PyTorch reference instead.
         softmax_scale: defaults to head_dim**-0.5.
-        causal: must be False (kept for signature compatibility).
+        causal: causal masking (forward/inference only for now —
+            the causal backward raises NotImplementedError).
         return_lse: also return the (batch, nheads, seqlen) fp32
             natural-log row logsumexp.
 
@@ -120,13 +116,42 @@ def flash_attn_func(
         softmax_scale = q.shape[-1] ** -0.5
 
     if not q.is_cuda:
-        out = flash_attn_ref(q, k, v, softmax_scale=softmax_scale)
+        out = flash_attn_ref(
+            q, k, v, softmax_scale=softmax_scale, causal=causal
+        )
         if return_lse:
-            lse = torch.logsumexp(
+            scores = (
                 torch.einsum("bshd,bthd->bhst", q.float(), k.float())
-                * softmax_scale,
-                dim=-1,
+                * softmax_scale
             )
+            if causal:
+                s_q = scores.shape[-2]
+                tri = torch.ones(
+                    s_q, s_q, dtype=torch.bool, device=scores.device
+                ).triu(1)
+                scores = scores.masked_fill(tri, float("-inf"))
+            return out, torch.logsumexp(scores, dim=-1)
+        return out
+
+    if causal:
+        # Causal backward not yet ported: causal=True is
+        # forward/inference-only for now.
+        needs_grad = torch.is_grad_enabled() and (
+            q.requires_grad or k.requires_grad or v.requires_grad
+        )
+        if needs_grad:
+            raise NotImplementedError(
+                "causal=True currently supports inference only (the "
+                "causal backward kernel is not yet ported). Call "
+                "under torch.no_grad() or detach q/k/v."
+            )
+        from flash_attn_mojo.fwd_fa4 import fa4_fwd
+
+        out, lse = fa4_fwd(
+            q.contiguous(), k.contiguous(), v.contiguous(),
+            softmax_scale, causal=True,
+        )
+        if return_lse:
             return out, lse
         return out
 
