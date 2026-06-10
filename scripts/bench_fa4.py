@@ -241,6 +241,16 @@ def main() -> None:
         f"RESULT impl={args.impl} kind={args.kind} shape={B},{S},{H},{D} "
         f"us={us:.1f} tflops={tflops:.1f}"
     )
+    for e in sorted(
+        prof.key_averages(), key=lambda e: -e.device_time_total
+    ):
+        name = e.key.lower()
+        if e.device_time_total > 0 and "memcpy" not in name and "memset" not in name:
+            short = e.key.split("(")[0][:60]
+            print(
+                f"KERNEL impl={args.impl} name={short} "
+                f"us={e.device_time_total / args.iters:.1f}"
+            )
 
 
 if __name__ == "__main__":

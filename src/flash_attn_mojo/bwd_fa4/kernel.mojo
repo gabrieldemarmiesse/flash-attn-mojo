@@ -290,10 +290,10 @@ def bwd_main_kernel[
             var phase: UInt32 = 0
             var wrap: Int = 0
             var q_row: Int = b_idx * seq_len
-            var lse_row: Int = (
-                b_idx * Int(grid_dim.y) + h_idx
-            ) * seq_len
             for _ in range(num_m_blocks):
+                # Tight TMA-issue loop: lse/dpsum staging lives on
+                # warp 2 so no synchronous gmem load sits between
+                # the Q and dO issues.
                 empty[slot].wait(phase)
                 if lane == 0:
                     var q_st = LayoutTensor[
@@ -309,23 +309,6 @@ def bwd_main_kernel[
                     q_tma.async_copy_3d(
                         q_st, full[slot], (0, h_idx, q_row)
                     )
-                # Stage this tile's lse_log2/dpsum (2 f32 each per
-                # lane) into the slot-pair's buffer, then publish via
-                # the Q slot's second arrival.
-                var lse_buf = lse_smem + (slot // 2) * BM
-                var dps_buf = dps_smem + (slot // 2) * BM
-                comptime for j in range(BM // 64):
-                    var idx: Int = j * 64 + lane * 2
-                    (lse_buf + idx).store[width=2](
-                        (lse_log2_ptr + lse_row + idx).load[width=2]()
-                    )
-                    (dps_buf + idx).store[width=2](
-                        (dpsum_ptr + lse_row + idx).load[width=2]()
-                    )
-                fence_async_view_proxy()
-                syncwarp()
-                if lane == 0:
-                    _ = full[slot].arrive()
 
                 empty[slot + 1].wait(phase)
                 if lane == 0:
@@ -344,7 +327,6 @@ def bwd_main_kernel[
                     )
 
                 q_row += BM
-                lse_row += BM
                 slot += 2
                 wrap += 1
                 if wrap == 3:
@@ -385,6 +367,40 @@ def bwd_main_kernel[
                     cp_async_bulk_commit_group()
                 dq_byte_base += 2 * DQ_MAIL_F32 * 4
             cp_async_bulk_wait_group[0]()
+        elif thread_idx.x < 96:
+            # ---- lse/dpsum stager (warp 2). Rides the Q slot's
+            # full barrier as its second arrival (init(2): TMA
+            # expect + this warp's lane 0).
+            var lane_s: Int = Int(lane_id())
+            var slot: Int = 0
+            var phase: UInt32 = 0
+            var wrap: Int = 0
+            var lse_row: Int = (
+                b_idx * Int(grid_dim.y) + h_idx
+            ) * seq_len
+            for _ in range(num_m_blocks):
+                empty[slot].wait(phase)
+                var lse_buf = lse_smem + (slot // 2) * BM
+                var dps_buf = dps_smem + (slot // 2) * BM
+                comptime for j in range(BM // 64):
+                    var idx: Int = j * 64 + lane_s * 2
+                    (lse_buf + idx).store[width=2](
+                        (lse_log2_ptr + lse_row + idx).load[width=2]()
+                    )
+                    (dps_buf + idx).store[width=2](
+                        (dpsum_ptr + lse_row + idx).load[width=2]()
+                    )
+                fence_async_view_proxy()
+                syncwarp()
+                if lane_s == 0:
+                    _ = full[slot].arrive()
+                lse_row += BM
+                slot += 2
+                wrap += 1
+                if wrap == 3:
+                    wrap = 0
+                    slot = 0
+                    phase ^= 1
         return
 
     # ================= MMA warpgroups =================
@@ -650,6 +666,12 @@ def bwd_main_kernel[
             )
         wgmma_sdp.commit_group()
 
+        # Queue [dV, dQ]: wait ≤1 retires dV -> dO(n) reusable now,
+        # one GEMM earlier than waiting on dQ (FA4's release point).
+        wgmma_dkv.wait_group[1]()
+        warpgroup_fence(dv_acc)
+        _ = empty[slot + 1].arrive()
+
         # dK += dS^T · Q — committed AFTER dQ (FA4's order) so the
         # dQ drain below overlaps the dK GEMM on the tensor core.
         warpgroup_fence(dk_acc)
@@ -657,12 +679,10 @@ def bwd_main_kernel[
         wgmma_dkv.wgmma(ds_reg, qt_view, dk_acc)
         wgmma_dkv.commit_group()
 
-        # Queue [dV, dQ, dK]: wait ≤1 retires dV and dQ; dK still
-        # runs while we hand dQ off. dO(n) consumed by dV -> release.
+        # Queue [dQ, dK]: wait ≤1 retires dQ; dK still runs while we
+        # hand dQ off.
         wgmma_dkv.wait_group[1]()
-        warpgroup_fence(dv_acc)
         warpgroup_fence(dq_reg)
-        _ = empty[slot + 1].arrive()
 
         # Hand dQ^T to the drain warp: raw c-frag dump into this
         # wg's mailbox (8 x st.shared.v4, fully coalesced), under
