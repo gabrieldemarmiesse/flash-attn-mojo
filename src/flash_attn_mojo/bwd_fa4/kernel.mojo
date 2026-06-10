@@ -786,60 +786,83 @@ def bwd_main_kernel[
     # arrival) must not still be reading kt_view -> sync first.
     named_barrier[Int32(NWG * 128)](Int32(4))
 
-    # dK *= scale; stage + TMA store dV then dK.
+    # FA4's epilogue: stage each output via 8x stmatrix.x4
+    # (non-trans) into the dead K/V SW128 tiles — the layout the
+    # tiles were TMA-loaded with — and issue 2 big TMA stores per
+    # output (SWIZZLE_128B descriptors), dV's store overlapping
+    # dK's scale + staging. Same absolute-address XOR fold as the
+    # sdS store; the term is invariant across i (steps 32 B and
+    # 16384 B never touch addr bits 7-9).
     var scale_acc: Scalar[accum_type] = softmax_scale.cast[accum_type]()
-    comptime for c in range(c_frag_dkv):
-        dk_acc.ptr[c] *= scale_acc
 
-    var row_warp_base: Int = wg * WGMMA_M + warp_in_wg * 16
+    var st_lane: Int = lane
+    var st_row: Int = (
+        wg * WGMMA_M + warp_in_wg * 16 + ((st_lane // 8) % 2) * 8
+        + (st_lane % 8)
+    )
+    var st_off_raw: Int = st_row * 64 + (st_lane // 16) * 8
 
-    # dV via the V smem area (dead), 16B-chunk-major for the
-    # unswizzled store descriptor.
-    comptime for c2 in range(c_frag_dkv // 2):
-        comptime col_chunk: Int = c2 // 2
-        comptime is_bot: Int = c2 % 2
-        var row: Int = row_warp_base + lane_group + (8 if is_bot == 1 else 0)
-        var pair = SIMD[dtype, 2](
-            dv_acc.ptr[2 * c2].cast[dtype](),
-            dv_acc.ptr[2 * c2 + 1].cast[dtype](),
+    var dv_raw: Int = Int(v_base) + 2 * st_off_raw
+    comptime for i in range(c_frag_dkv // 8):
+        var packed = SIMD[DType.float32, 4](0)
+        comptime for jm in range(4):
+            comptime p: Int = 4 * i + jm
+            packed[jm] = bitcast[DType.float32, 1](
+                SIMD[accum_type, 2](
+                    dv_acc.ptr[2 * p], dv_acc.ptr[2 * p + 1]
+                ).cast[dtype]()
+            )
+        # XOR per call: the 32-B column steps live in the swizzled
+        # bits, so the fold must apply to each logical address.
+        var raw_i: Int = dv_raw + (i % 4) * 32 + (i // 4) * (BN * 128)
+        st_matrix[simd_width=4](
+            v_base + ((raw_i ^ ((raw_i >> 3) & 112)) - Int(v_base)) // 2,
+            packed,
         )
-        (
-            v_base + col_chunk * (BN * 8) + row * 8 + 2 * lane_pair
-        ).store[width=2, alignment=4](pair)
-    # dK via the K smem area (dead).
-    comptime for c2 in range(c_frag_dkv // 2):
-        comptime col_chunk: Int = c2 // 2
-        comptime is_bot: Int = c2 % 2
-        var row: Int = row_warp_base + lane_group + (8 if is_bot == 1 else 0)
-        var pair = SIMD[dtype, 2](
-            dk_acc.ptr[2 * c2].cast[dtype](),
-            dk_acc.ptr[2 * c2 + 1].cast[dtype](),
-        )
-        (
-            k_base + col_chunk * (BN * 8) + row * 8 + 2 * lane_pair
-        ).store[width=2, alignment=4](pair)
-
     fence_async_view_proxy()
     named_barrier[Int32(NWG * 128)](Int32(4))
     if thread_idx.x == 128:
         var dv_st = LayoutTensor[
             dtype,
-            Layout.row_major(BN, D),
+            kv_smem_layout,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
         ](v_base)
+        dv_tma.async_store_3d(dv_st, (0, h_idx, kv_row))
+        dv_tma.commit_group()
+
+    # dK *= scale; staged under dV's in-flight TMA store.
+    comptime for c in range(c_frag_dkv):
+        dk_acc.ptr[c] *= scale_acc
+    var dk_raw: Int = Int(k_base) + 2 * st_off_raw
+    comptime for i in range(c_frag_dkv // 8):
+        var packed = SIMD[DType.float32, 4](0)
+        comptime for jm in range(4):
+            comptime p: Int = 4 * i + jm
+            packed[jm] = bitcast[DType.float32, 1](
+                SIMD[accum_type, 2](
+                    dk_acc.ptr[2 * p], dk_acc.ptr[2 * p + 1]
+                ).cast[dtype]()
+            )
+        var raw_i: Int = dk_raw + (i % 4) * 32 + (i // 4) * (BN * 128)
+        st_matrix[simd_width=4](
+            k_base + ((raw_i ^ ((raw_i >> 3) & 112)) - Int(k_base)) // 2,
+            packed,
+        )
+    fence_async_view_proxy()
+    named_barrier[Int32(NWG * 128)](Int32(4))
+    if thread_idx.x == 128:
         var dk_st = LayoutTensor[
             dtype,
-            Layout.row_major(BN, D),
+            kv_smem_layout,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
         ](k_base)
-        dv_tma.async_store_3d(dv_st, (0, h_idx, kv_row))
         dk_tma.async_store_3d(dk_st, (0, h_idx, kv_row))
-        dv_tma.commit_group()
-        dv_tma.wait_group()
+        dk_tma.commit_group()
+        dk_tma.wait_group()
 
 
 # ===================================================================

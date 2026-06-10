@@ -240,10 +240,10 @@ def launch_bwd_main[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
     ](ctx, v_ptr, rows, nheads_int)
     var dk_tma = create_split_tma[
-        kv_smem_shape, gmem_shape, swizzle_mode = TensorMapSwizzle.SWIZZLE_NONE
+        kv_smem_shape, gmem_shape, swizzle_mode=swizzle
     ](ctx, dk_ptr, rows, nheads_int)
     var dv_tma = create_split_tma[
-        kv_smem_shape, gmem_shape, swizzle_mode = TensorMapSwizzle.SWIZZLE_NONE
+        kv_smem_shape, gmem_shape, swizzle_mode=swizzle
     ](ctx, dv_ptr, rows, nheads_int)
 
     comptime kernel_inst = bwd_main_kernel[
