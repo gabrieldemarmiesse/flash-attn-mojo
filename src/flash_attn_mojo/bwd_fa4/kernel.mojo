@@ -87,6 +87,7 @@ from layout.tma_async import SharedMemBarrier, TMATensorTile
 from common import (
     kBwdBlockM,
     kBwdBlockN,
+    kBwdCvtThreads,
     kBwdNMmaWarpgroups,
     kBwdNThreads,
     kBwdQdOStages,
@@ -870,7 +871,7 @@ def bwd_preprocess_kernel[
 # ===================================================================
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
-        Int32(kBwdPreThreads)
+        Int32(kBwdCvtThreads)
     )
 )
 def bwd_convert_kernel[
@@ -883,11 +884,17 @@ def bwd_convert_kernel[
     nheads: Int,
     softmax_scale: Float32,
 ):
-    """dq[b,s,h,d] = scale * dq_accum[b,h,d,s] via a 128x128 smem
-    transpose tile (both gmem sides coalesced)."""
+    """dq[b,s,h,d] = scale * decode(dq_accum) via a (q, d) smem tile.
+
+    256 threads. Phase 1 reads the fragment dump coalesced (16B per
+    thread per cell) and scatters single f32s into tile[q][d] — the
+    scatter is bank-conflict-free (banks = lane_group + 8*lane_pair
+    cover all 32). Phase 2: each thread emits one contiguous 64-elem
+    half-row of dq (both gmem sides fully coalesced/vectorized)."""
     comptime D: Int = head_dim
     comptime BM: Int = kBwdPreBlockM
     comptime PAD: Int = 4  # pad smem rows to dodge bank conflicts
+    comptime NT: Int = kBwdCvtThreads  # 256
 
     var m_block: Int = Int(block_idx.x)
     var h_idx: Int = Int(block_idx.y)
@@ -902,42 +909,53 @@ def bwd_convert_kernel[
 
     # Phase 1: decode the fragment dump (see bwd_main_kernel's
     # docstring): per main m-block (kBwdBlockM=64 rows), layout
-    # [wg(2)][chunk(8)][tid(128)][4] f32. Thread t reads its own
-    # cells (consecutive t -> consecutive 16B: fully coalesced) and
-    # scatters the decoded (d, q) into the transpose tile.
+    # [wg(2)][chunk(8)][tid(128)][4] f32. Thread (sub, ft) reads the
+    # cells (combo = i*2 + sub, ft) — consecutive ft -> consecutive
+    # 16B: fully coalesced.
     comptime MBM: Int = kBwdBlockM  # 64
     comptime WG_F32: Int = (D // 2) * MBM  # 4096
+    comptime NCOMBO: Int = (BM // MBM) * 2 * 8  # blk x wg x ch = 32
+    var sub: Int = tid // 128
+    var ft: Int = tid % 128
     var frag_base: Int = (
         (b_idx * nheads + h_idx) * (seq_len // MBM)
         + m_block * (BM // MBM)
     ) * (2 * WG_F32)
-    var d_wl: Int = (tid // 32) * 16 + (tid % 32) // 4
-    var q_lp: Int = 2 * (tid % 4)
-    comptime for blk in range(BM // MBM):
-        comptime for wg in range(2):
-            comptime for ch in range(8):
-                var v = (
-                    dq_accum_ptr
-                    + frag_base
-                    + (blk * 2 + wg) * WG_F32
-                    + ch * (kBwdPreThreads * 4)
-                    + tid * 4
-                ).load[width=4]()
-                comptime for e in range(4):
-                    var d: Int = wg * 64 + d_wl + 8 * (e // 2)
-                    var q: Int = blk * MBM + ch * 8 + q_lp + (e % 2)
-                    tile[d * (BM + PAD) + q] = v[e]
+    var d_wl: Int = (ft // 32) * 16 + (ft % 32) // 4
+    var q_lp: Int = 2 * (ft % 4)
+    comptime for i in range(NCOMBO // 2):
+        var c: Int = i * 2 + sub
+        var blk: Int = c // 16
+        var wg: Int = (c // 8) % 2
+        var ch: Int = c % 8
+        var v = (
+            dq_accum_ptr
+            + frag_base
+            + (blk * 2 + wg) * WG_F32
+            + ch * (128 * 4)
+            + ft * 4
+        ).load[width=4]()
+        comptime for e in range(4):
+            var d: Int = wg * 64 + d_wl + 8 * (e // 2)
+            var q: Int = blk * MBM + ch * 8 + q_lp + (e % 2)
+            tile[q * (D + PAD) + d] = v[e]
     barrier()
 
-    # Phase 2: thread t writes output row s = m*BM + t (contiguous
-    # in d), reading the smem column s_local = t.
-    comptime OV: Int = 8
-    var s: Int = m_block * BM + tid
-    var dq_off: Int = ((b_idx * seq_len + s) * nheads + h_idx) * D
-    comptime for i in range(D // OV):
-        var out = SIMD[dtype, OV]()
-        comptime for j in range(OV):
-            out[j] = (
-                tile[(i * OV + j) * (BM + PAD) + tid] * softmax_scale
-            ).cast[dtype]()
-        (dq_ptr + dq_off + i * OV).store[width=OV](out)
+    # Phase 2: 8 lanes per row, 16 d (32B bf16) per lane, so every
+    # warp store covers 4 full 256B rows — full 32B sectors, fully
+    # coalesced (the previous 16B-per-lane scatter hit 32 half-used
+    # sectors per request: 16x write amplification at L2).
+    comptime OV: Int = 16
+    var row_in_pass: Int = tid // 8
+    var d_base: Int = (tid % 8) * OV
+    comptime for p in range(BM // (NT // 8)):
+        var s_local: Int = p * (NT // 8) + row_in_pass
+        var s: Int = m_block * BM + s_local
+        var dq_off: Int = (
+            (b_idx * seq_len + s) * nheads + h_idx
+        ) * D + d_base
+        var fv = (
+            tile + s_local * (D + PAD) + d_base
+        ).load[width=OV, alignment=16]()
+        var out = (fv * softmax_scale).cast[dtype]()
+        (dq_ptr + dq_off).store[width=OV, alignment=32](out)

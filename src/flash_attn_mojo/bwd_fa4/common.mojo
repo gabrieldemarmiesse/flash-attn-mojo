@@ -18,3 +18,5 @@ comptime kBwdQdOStages: Int = 6
 # Preprocess / convert kernels: one Q-row per thread, 128 threads.
 comptime kBwdPreBlockM: Int = 128
 comptime kBwdPreThreads: Int = 128
+# Convert kernel runs 256 threads (one 64-elem dq half-row each).
+comptime kBwdCvtThreads: Int = 256

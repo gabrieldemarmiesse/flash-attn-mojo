@@ -28,6 +28,7 @@ from kernel import bwd_main_kernel, bwd_preprocess_kernel, bwd_convert_kernel
 from common import (
     kBwdBlockM,
     kBwdBlockN,
+    kBwdCvtThreads,
     kBwdNThreads,
     kBwdQdOStages,
     kBwdPreBlockM,
@@ -328,8 +329,8 @@ def launch_bwd_convert[
         unsafe_from_address=dq_addr
     )
 
-    # 128 x (128+4) f32 transpose tile.
-    comptime cvt_smem_bytes: Int = head_dim * (kBwdPreBlockM + 4) * 4
+    # (128 q) x (128+4 d) f32 decode tile.
+    comptime cvt_smem_bytes: Int = kBwdPreBlockM * (head_dim + 4) * 4
 
     comptime kernel_inst = bwd_convert_kernel[dtype, head_dim]
     var compiled = ctx.compile_function[kernel_inst, kernel_inst](
@@ -353,7 +354,7 @@ def launch_bwd_convert[
             nheads_int,
             softmax_scale,
             grid_dim=grid,
-            block_dim=(kBwdPreThreads,),
+            block_dim=(kBwdCvtThreads,),
             shared_mem_bytes=cvt_smem_bytes,
         )
     else:
@@ -365,7 +366,7 @@ def launch_bwd_convert[
             nheads_int,
             softmax_scale,
             grid_dim=grid,
-            block_dim=(kBwdPreThreads,),
+            block_dim=(kBwdCvtThreads,),
             shared_mem_bytes=cvt_smem_bytes,
         )
         ctx.synchronize()
