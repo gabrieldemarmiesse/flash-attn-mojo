@@ -55,7 +55,7 @@ from std.gpu.memory import (
     external_memory,
     fence_async_view_proxy,
 )
-from std.gpu.sync import named_barrier
+from std.gpu.sync import named_barrier, named_barrier_arrive
 from std.memory import stack_allocation
 
 from layout import Layout, LayoutTensor
@@ -214,6 +214,14 @@ def fwd_fa4_kernel[
     comptime for s in range(STAGES):
         _ = empty[s].arrive()
 
+    # Warp-scheduler pingpong (FA4's use_scheduler_barrier): named
+    # barrier 1+wg gates each warpgroup's GEMM-issue phase; a
+    # warpgroup arrives at the *other* one's barrier after committing
+    # its GEMM pair, so issue phases alternate and each warpgroup's
+    # softmax overlaps the other's GEMMs. WG0 self-arms its barrier.
+    if wg == 0:
+        named_barrier_arrive[Int32(NWG * 128)](Int32(1))
+
     var wgmma_qk = TensorCoreAsync[
         accum_type,
         dtype,
@@ -369,6 +377,7 @@ def fwd_fa4_kernel[
 
         # Queue QK(n+1) then PV(n) on the tensor core.
         full[k_slot].wait(k_phase)
+        named_barrier[Int32(NWG * 128)](Int32(1 + wg))
         warpgroup_fence(s_reg)
         wgmma_qk.arrive()
         wgmma_qk.wgmma[num_warp_groups=NWG, scale_c=0](
@@ -381,6 +390,7 @@ def fwd_fa4_kernel[
         wgmma_pv.arrive()
         wgmma_pv.wgmma(p_reg, v_tile(v_slot), o_reg)
         wgmma_pv.commit_group()
+        named_barrier_arrive[Int32(NWG * 128)](Int32(2 - wg))
 
         # QK(n+1) retired (PV(n) still running on the tensor core).
         wgmma_qk.wait_group[1]()
@@ -454,7 +464,8 @@ def fwd_fa4_kernel[
 
     fence_async_view_proxy()
     # Producer warpgroup may have exited -> consumer-only barrier.
-    named_barrier[Int32(NWG * 128)]()
+    # (id 3: ids 1-2 are the scheduler pingpong barriers.)
+    named_barrier[Int32(NWG * 128)](Int32(3))
     if thread_idx.x == 128:
         o_tma.async_store_3d(
             o_smem, (0, h_idx, b_idx * seq_len + m_block * BM)
