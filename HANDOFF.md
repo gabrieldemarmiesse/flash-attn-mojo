@@ -37,46 +37,58 @@ schedule 3035 → v4 warp specialization 2500 → v5 TMA-store epilogue
   (2355 → 2440); reverted. ptxas seems to handle the serial chain
   better than the extra live registers.
 
-## Backward (bwd_fa4) — state as of 2026-06-10
+## Backward (bwd_fa4) — state as of 2026-06-10 (second session)
 
 Correct (bf16 noise floor vs fp32 autograd, 2.4e-4 vs FA4 grads) at
-**24.3 ms vs FA4's 6.5 ms (3.77x)**. Loop: `scripts/master_bench.sh
+**10.6 ms vs FA4's 6.6 ms (1.61x)**. Loop: `scripts/master_bench.sh
 --kind bwd`; fast check: `scripts/bench_fa4.py --impl mojo --kind
 bwd --check-only`.
 
-Perf journey: 141.8 ms -> 28.5 ms (acquire->relaxed atomics; the
-default `Atomic.fetch_add` ordering emits `atom.acquire` — always
-pass `ordering=RELAXED`, and value-returning `atom` is still slower
-than `red`; the kernel now uses inline-asm
-`red.relaxed.gpu.global.add.v2.f32`) -> 24.3 ms (manual sdS
-addressing instead of LayoutTensor setitem crd2idx, coalesced
-preprocess/convert, smem-staged lse/dpsum prefetched 1 tile ahead,
-deferred wgmma waits, 1 barrier/iter).
+Perf journey: 141.8 (acquire atomics) -> 28.5 (relaxed) -> 24.3
+(manual sdS addressing, coalesced pre/convert, red.v2 inline asm,
+deferred waits) -> 11.5 (v3: balanced hand-rolled dQ^T over both
+warpgroups) -> 10.6 ms (v4: FA4's dV,dQ,dK commit order so the dQ
+drain overlaps the dK GEMM + lse/dpsum staged by the producer warp
+riding the Q pipeline, full[Qslot].init(2)).
 
-Found races worth remembering: (1) the epilogue stages dK/dV into
-the K/V smem areas — wg1 can reach it while wg0's *last* dQ GEMM
-still reads kt_view -> pre-epilogue named barrier required. (2) sdS
-double-buffering alone is not enough without it.
+Architecture mirrors FA4's mma_one_m_block: S^T/dP^T swapAB wgmma
+(wait_group(1) tricks), P/dS in registers, dV/dK RS wgmma, dS^T
+staged to double-buffered swizzled smem read by a HAND-ROLLED
+dQ^T = K^T·dS wgmma (`wgmma_async[layout_a="col"]`, mn-major A
+descriptor — TensorCoreAsync can't express it), dq_accum (B,H,D,S)
+fp32 via red.relaxed.v2.f32, dK/dV TMA-stored from reused K/V smem.
 
-Probes: disabling the whole dQ path (GEMM+wait+atomics) only saves
-~4 ms -> the core S^T/dP^T/softmax/dV/dK loop is itself ~3x too
-slow. Tensor pipe is ~16% busy (FA4: ~53%). The fix is FA4's bwd
-overlap schedule (commit next tile's S^T before processing the
-current softmax, à la fwd v3->v4) + balancing dQ across both
-warpgroups:
+Hard-won bugs (see also memory notes):
+- smem swizzle XOR uses the ABSOLUTE address ((addr>>7)&7); dynamic
+  smem is phase-shifted by static smem (mbarriers) -> hand-rolled
+  swizzled stores must fold `(Int(base)>>7)&7` into the XOR. All
+  TMA-fed operands are immune (encode/decode both absolute) — an
+  aligned standalone unit test of the GEMM also passes. Debug via
+  in-kernel smem dumps to dq_accum.
+- Epilogue dK/dV staging overwrites K/V smem under the other wg's
+  in-flight last dQ GEMM -> pre-epilogue named barrier.
+- wgmma trans bits in PTX are the ground truth for operand
+  major-ness: FA4 bwd dQ = (trans-a=1, trans-b=0); layout strings
+  map A:"col"->1, B:"row"->1.
 
-- **dQ^T = K^T·dS split over 2 warpgroups needs an mn-major A
-  operand. modular's TensorCoreAsync only does k-major A, but the
-  raw `std.gpu.compute.mma.wgmma_async` exposes `layout_a="col"` —
-  hand-roll the dQ^T GEMM with `_wgmma_descriptor` built the way
-  TensorCoreAsync builds its transpose_b=False B descriptor.** Then
-  dS^T is stored in its NATURAL c-frag orientation (paired stores,
-  no transpose scatter), dq_accum becomes (B,H,D,S) so dQ^T c-frag
-  pairs stay contiguous for red.v2, and convert does a smem-tile
-  transpose.
-- FA4 uses tile_m=80 (m64n80 wgmma) precisely to fit the register
-  budget when everything overlaps; revisit BM after the schedule
-  rework.
+Negative result: a cross-iteration software pipeline (commit
+S/dP(n+1) at iteration end, drain dQ(n-1) at iteration top)
+REGRESSED 11.3 -> 15.4 ms with identical wgmma order, no spills,
+same 168 regs. Top-of-iteration commits win; don't retry blindly.
+
+Current profile (ncu, main kernel): tensor pipe 41.5% busy (FA4
+~53%), cycles 14.2M, stalls: long_scoreboard 5.55 (mbarrier
+try_wait spins on Q/dO arrivals — TMA/L2 latency), wait 1.67,
+everything else <1.2. Next levers:
+- dQ smem mailbox drained by producer warps 1-3 (FA4 does this —
+  barrier ids dQEmptyWG0/dQFullWG0 with 128+32 threads) to take
+  even the red.v2 drain off the MMA path.
+- tile_m=80 like FA4 (25% fewer iterations; needs n80 wgmma and a
+  different sdS layout — their dS smem is k-major, trans-b=0).
+- deeper Q/dO ring (8 slots) if smem allows, to absorb TMA latency.
+- preprocess (551us vs FA4 153) and convert (835 vs 109) are still
+  3-7x off; both are pure-bandwidth kernels worth one coalescing
+  pass (currently ~0.4ms combined of the 4ms gap).
 
 ## Not yet tried (fwd)
 
