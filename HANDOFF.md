@@ -115,6 +115,22 @@ allocation, (b) post-processing the PTX before ptxas (no hook in
 compile_function today), (c) finding ~30 regular registers some
 other way nobody has thought of yet.
 
+RULED OUT — ptxas version (checked 2026-06-10): mojo compiles
+in-process via the statically linked `modular/lib/libNVPTX.so`
+(ptxas 13.1.115; overridable with `MODULAR_NVPTX_COMPILER_PATH` —
+our `__init__.py` auto-points it at the `nvidia-cuda-nvcc-cu12`
+wheel if installed). FA4's cute DSL compiles via its own embedded
+ptxas 12.9.83 inside `_cutlass_ir...so` (the installed lib is the
+libs_base CUDA-12 variant; cubins load via cuModuleLoadData — so
+NEITHER side uses the driver JIT; cubin ELF ABI-version 7 vs 8
+confirms the 12.x/13.x split, and `CUTE_DSL_KEEP=cubin` dumps
+FA4's cubins for inspection). Rebuilding our kernel with ptxas
+12.9.86 (FA4's generation) produced BYTE-IDENTICAL SASS to the
+13.1.115 build — same 55 STL/LDL, same 77 R2UR, same 1608-instr
+mix. The spills/non-uniformization are a property of our PTX's
+dataflow shape, not the ptxas version. Also noted: mojo emits
+`.version 8.5` PTX vs FA4's 8.8 — no observed consequence.
+
 ### Diagnosis methodology that worked
 
 - LOCK THE CLOCKS before measuring anything (see above).
