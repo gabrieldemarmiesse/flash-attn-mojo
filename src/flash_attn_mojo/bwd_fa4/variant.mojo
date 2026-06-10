@@ -17,6 +17,7 @@ from _ctx import acquire_ctx_handle
 comptime DTYPE: DType = get_defined_dtype["DTYPE", DType.bfloat16]()
 comptime HEAD_DIM: Int = get_defined_int["HEAD_DIM"]()
 comptime USE_EXTERNAL_STREAM: Bool = get_defined_bool["USE_EXTERNAL_STREAM"]()
+comptime CAUSAL: Bool = get_defined_bool["CAUSAL", False]()
 
 
 def flash_attn_bwd_fa4_acquire_ctx(
@@ -31,7 +32,7 @@ def flash_attn_bwd_fa4_preprocess(
     mut py_self: PythonObject,
     mut args: PythonObject,
 ) raises -> PythonObject:
-    launch_bwd_preprocess[DTYPE, HEAD_DIM, USE_EXTERNAL_STREAM](
+    launch_bwd_preprocess[DTYPE, HEAD_DIM, USE_EXTERNAL_STREAM, CAUSAL](
         Int(py=args[0]),  # batch
         Int(py=args[1]),  # seqlen
         Int(py=args[2]),  # nheads
@@ -51,7 +52,7 @@ def flash_attn_bwd_fa4_main(
     mut py_self: PythonObject,
     mut args: PythonObject,
 ) raises -> PythonObject:
-    launch_bwd_main[DTYPE, HEAD_DIM, USE_EXTERNAL_STREAM](
+    launch_bwd_main[DTYPE, HEAD_DIM, USE_EXTERNAL_STREAM, CAUSAL](
         Int(py=args[0]),  # batch
         Int(py=args[1]),  # seqlen
         Int(py=args[2]),  # nheads
@@ -75,7 +76,7 @@ def flash_attn_bwd_fa4_convert(
     mut py_self: PythonObject,
     mut args: PythonObject,
 ) raises -> PythonObject:
-    launch_bwd_convert[DTYPE, HEAD_DIM, USE_EXTERNAL_STREAM](
+    launch_bwd_convert[DTYPE, HEAD_DIM, USE_EXTERNAL_STREAM, CAUSAL](
         Int(py=args[0]),  # batch
         Int(py=args[1]),  # seqlen
         Int(py=args[2]),  # nheads

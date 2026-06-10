@@ -43,23 +43,30 @@ def call_bwd_fa4_convert(args: tuple, config: tuple) -> None:
     fns[2](*args, ctx_handle)
 
 
-def make_config(dtype_code: int, head_dim: int, use_external_stream: bool):
+def make_config(
+    dtype_code: int,
+    head_dim: int,
+    use_external_stream: bool,
+    causal: bool = False,
+):
     dump_ptx = os.environ.get("MOJO_DUMP_PTX", "")
-    return (dtype_code, head_dim, bool(use_external_stream), dump_ptx)
+    return (dtype_code, head_dim, bool(use_external_stream), bool(causal), dump_ptx)
 
 
 def _mod_name(config: tuple) -> str:
-    (dt, hd, ues, dump_ptx) = config
-    suffix = "_dumpptx" if dump_ptx else ""
+    (dt, hd, ues, causal, dump_ptx) = config
+    suffix = "_causal" if causal else ""
+    suffix += "_dumpptx" if dump_ptx else ""
     return f"{_DTYPE_NAME[dt]}_hd{hd}_extstr{int(ues)}{suffix}"
 
 
 def _defines(config: tuple) -> dict[str, str]:
-    (dt, hd, ues, dump_ptx) = config
+    (dt, hd, ues, causal, dump_ptx) = config
     defines = {
         "DTYPE": _DTYPE_DEFINE[dt],
         "HEAD_DIM": str(hd),
         "USE_EXTERNAL_STREAM": "true" if ues else "false",
+        "CAUSAL": "true" if causal else "false",
     }
     if dump_ptx:
         defines["MOJO_DUMP_PTX"] = dump_ptx

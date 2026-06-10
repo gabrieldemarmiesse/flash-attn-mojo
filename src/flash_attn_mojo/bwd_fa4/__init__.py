@@ -29,6 +29,7 @@ def bwd_fa4(
     dout: torch.Tensor,
     lse: torch.Tensor,
     softmax_scale: float | None = None,
+    causal: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute (dq, dk, dv). Mirrors
     ``flash_attn.cute.interface._flash_attn_bwd``'s simplest call.
@@ -59,7 +60,10 @@ def bwd_fa4(
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
-    seqlen_pad = -(-seqlen // _BLOCK_M) * _BLOCK_M
+    # Causal uses FA4's tile_m=64 (divides any supported seqlen: no
+    # padding); non-causal tile_m=80 pads.
+    block_m = 64 if causal else _BLOCK_M
+    seqlen_pad = -(-seqlen // block_m) * block_m
     dpsum = torch.empty(
         (batch, nheads, seqlen_pad), dtype=torch.float32, device=q.device
     )
@@ -74,7 +78,7 @@ def bwd_fa4(
         device=q.device,
     )
 
-    config = make_config(_DTYPE_CODE[q.dtype], head_dim, True)
+    config = make_config(_DTYPE_CODE[q.dtype], head_dim, True, causal)
     stream = torch.cuda.current_stream().cuda_stream
 
     call_bwd_fa4_preprocess(

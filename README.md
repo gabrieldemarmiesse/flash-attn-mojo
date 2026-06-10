@@ -9,10 +9,12 @@ FlashAttention-4-class attention kernels written from scratch in
 D=128, bf16, H100) both the forward and the backward kernels match
 FA4's kernel time within run-to-run variance:
 
-| kernel  | mojo (µs)   | FA4 (µs)    | ratio       |
-|---------|-------------|-------------|-------------|
-| fwd     | 2237–2276   | 2206–2255   | 1.00–1.03x  |
-| bwd     | 6148–6250   | 5913–6176   | 1.00–1.06x  |
+| kernel       | mojo (µs)   | FA4 (µs)    | ratio       |
+|--------------|-------------|-------------|-------------|
+| fwd          | 2237–2276   | 2206–2255   | 1.00–1.03x  |
+| bwd          | 6148–6250   | 5913–6176   | 1.00–1.06x  |
+| fwd (causal) | 1253–1256   | ~1238       | 1.01–1.02x  |
+| bwd (causal) | 3146–3242   | 3129–3204   | 0.99–1.05x  |
 
 (Locked clocks, interleaved kernel-only CUPTI timing; both kernels
 wobble ~2–4% run to run. The bwd main loop executes 448
@@ -30,7 +32,8 @@ return_lse=False)` with:
 
 - bf16, contiguous `(batch, seqlen, nheads, head_dim)`
 - `head_dim == 128`, `seqlen % 128 == 0`, `Hq == Hk`
-- non-causal, no dropout / windows / ALiBi
+- causal or non-causal (both differentiable, both at parity); no
+  dropout / windows / ALiBi
 - CUDA sm90 (Hopper); non-CUDA tensors run a pure-PyTorch reference
 
 Everything outside the envelope raises a clear error. The op is

@@ -30,6 +30,19 @@ non-causal, torch.profiler CUPTI):
 | postprocess | 109 us |
 | **bwd total** | **~6460 us (~425 TFLOPS over 2.75 TFLOP)** |
 
+## Causal counterparts (2026-06-10)
+
+- `fa4_fwd_sm90_bf16_hdim128_causal.ptx` — same FwdConfig(128, 128,
+  RS, overlap) as non-causal; 48 wgmma sites (separate masked loop —
+  0 trips at sq==sk — plus a steady loop that still replays the
+  232-instr mask block every tile); `SingleTileLPTScheduler` (flat
+  1-D grid, heaviest-m-first, L2 swizzle-8 head grouping).
+  Target: ~1238 µs at the canonical shape (locked 1500 MHz clocks).
+- `fa4_bwd_sm90_bf16_hdim128_causal.ptx` — tile_m=64, tile_n=128,
+  dQ_swapAB=False (dQ = dS·K, per-wg 64-column split, trans(0,1));
+  24x m64n64k16 + 8x m64n128k16 per iteration; plain 3-D grid (no
+  LPT for bwd). Target: ~3129–3204 µs main kernel.
+
 ## Canonical config ("the simplest call")
 
 ```python

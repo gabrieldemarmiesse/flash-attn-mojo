@@ -139,6 +139,7 @@ def bwd_main_kernel[
     kv_desc_shape: IndexList[3],
     st_tile_shape: IndexList[3],
     st_desc_shape: IndexList[3],
+    causal: Bool = False,
 ](
     q_tma: TMATensorTile[dtype, 3, q_tile_shape, q_desc_shape],
     do_tma: TMATensorTile[dtype, 3, q_tile_shape, q_desc_shape],
@@ -152,7 +153,10 @@ def bwd_main_kernel[
     seq_len: Int,
     softmax_scale: Float32,
 ):
-    comptime BM: Int = kBwdBlockM
+    # Causal uses FA4's tile_m=64 (_tile_size_bwd_sm90: 64/128 with
+    # dQ_swapAB=False; v0 keeps our swapped dQ — valid algebra, the
+    # mailbox/convert layouts are BM-parametric).
+    comptime BM: Int = 64 if causal else kBwdBlockM
     comptime BN: Int = kBwdBlockN
     comptime D: Int = head_dim
     comptime NWG: Int = kBwdNMmaWarpgroups
@@ -290,6 +294,12 @@ def bwd_main_kernel[
     var h_idx: Int = Int(block_idx.y)
     var b_idx: Int = Int(block_idx.z)
     var num_m_blocks: Int = (seq_len + BM - 1) // BM
+    # Causal: KV tile n only receives gradient from q rows >= n*BN,
+    # i.e. m-blocks m >= m_start. All warp roles share the offset.
+    var m_start: Int = 0
+    comptime if causal:
+        m_start = (n_block * BN) // BM
+    var m_trips: Int = num_m_blocks - m_start
     var kv_row: Int = b_idx * seq_len + n_block * BN
 
     # The warpgroup index is shfl-broadcast from lane 0: ptxas's
@@ -318,16 +328,17 @@ def bwd_main_kernel[
             var slot: Int = 0
             var phase: UInt32 = 0
             var wrap: Int = 0
-            var q_row: Int = b_idx * seq_len
+            var q_row: Int = b_idx * seq_len + m_start * BM
             # lse_log2/dpsum are (B, H, Spad) — padded to a
-            # multiple of BM (pad rows +inf / 0).
+            # multiple of BM (pad rows +inf / 0; causal: spad == S).
             var bh_stat: Int = (
                 (b_idx * Int(grid_dim.y) + h_idx)
                 * (num_m_blocks * BM)
+                + m_start * BM
             ) * 4
             var lse_byte: Int = Int(lse_log2_ptr) + bh_stat
             var dps_byte: Int = Int(dpsum_ptr) + bh_stat
-            for _ in range(num_m_blocks):
+            for _ in range(m_trips):
                 # Tight TMA-issue loop. lse (Q slot) and dpsum (dO
                 # slot) ride each stage's mbarrier as 320-B 1-D
                 # cp.async.bulk copies counted by the same
@@ -410,8 +421,9 @@ def bwd_main_kernel[
             var lane_d: Int = Int(lane_id())
             var dq_byte_base: Int = Int(dq_accum_ptr) + (
                 (b_idx * Int(grid_dim.y) + h_idx) * num_m_blocks
+                + m_start
             ) * (2 * DQ_MAIL_F32 * 4)
-            for _ in range(num_m_blocks):
+            for _ in range(m_trips):
                 cp_async_bulk_wait_group[1]()
                 named_barrier_arrive[Int32(DRAIN_BAR)](Int32(9))
                 cp_async_bulk_wait_group[0]()
@@ -536,7 +548,7 @@ def bwd_main_kernel[
     var wrap: Int = 0
     var sds_stage: Int = 0
 
-    for _ in range(num_m_blocks):
+    for it in range(m_trips):
         var q_view = LayoutTensor[
             dtype,
             q_smem_layout,
@@ -629,6 +641,20 @@ def bwd_main_kernel[
         # S^T retired; dP^T still in flight.
         wgmma_sdp.wait_group[1]()
         warpgroup_fence(s_reg)
+
+        comptime if causal:
+            if it < BN // BM:
+                var mask_d: Int = it * BM
+                var mrow_lo: Int = (
+                    wg * WGMMA_M + warp_in_wg * 16 + lane_group
+                )
+                comptime for c in range(c_frag_sdp):
+                    comptime ccol_base: Int = (c // 4) * 8 + (c & 1)
+                    comptime crow_off: Int = 8 if (c % 4) >= 2 else 0
+                    if mrow_lo + crow_off > (
+                        ccol_base + 2 * lane_pair + mask_d
+                    ):
+                        s_reg.ptr[c] = Scalar[accum_type](-1.0e30)
 
         # P^T = exp2(S^T * scale_log2 - lse_log2[q col]), f32 in
         # s_reg. NOT packed yet: FA4's order computs dS first, then
@@ -928,6 +954,7 @@ def bwd_main_kernel[
 def bwd_preprocess_kernel[
     dtype: DType,
     head_dim: Int,
+    causal: Bool = False,
 ](
     o_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     do_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -946,10 +973,11 @@ def bwd_preprocess_kernel[
     var b_idx: Int = Int(block_idx.z)
     var tid: Int = Int(thread_idx.x)
 
+    comptime bm_main: Int = 64 if causal else kBwdBlockM
     var num_main_blocks: Int = (
-        seq_len + kBwdBlockM - 1
-    ) // kBwdBlockM
-    var spad: Int = num_main_blocks * kBwdBlockM
+        seq_len + bm_main - 1
+    ) // bm_main
+    var spad: Int = num_main_blocks * bm_main
 
     # Coalesced: 8 threads per row, 16 rows per pass, 8 passes.
     # Each thread loads a contiguous 16-element (32B) slice.
@@ -1018,6 +1046,7 @@ def bwd_preprocess_kernel[
 def bwd_convert_kernel[
     dtype: DType,
     head_dim: Int,
+    causal: Bool = False,
 ](
     dq_accum_ptr: UnsafePointer[Float32, ImmutAnyOrigin],
     dq_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
@@ -1034,7 +1063,7 @@ def bwd_convert_kernel[
     32). Phase 2: each thread emits contiguous 16-elem (32B) d-slices
     so every warp store covers full 256B rows (full 32B sectors)."""
     comptime D: Int = head_dim
-    comptime BM: Int = kBwdBlockM
+    comptime BM: Int = 64 if causal else kBwdBlockM
     comptime PAD: Int = 4  # pad smem rows to dodge bank conflicts
     comptime NT: Int = kBwdCvtThreads  # 256
 

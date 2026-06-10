@@ -14,6 +14,14 @@ run-to-run variance (locked clocks, interleaved):
 - fwd: 2237–2276 µs vs FA4 2206–2255 (1.00–1.03x)
 - bwd: 6148–6250 µs vs FA4 5913–6176 (1.00–1.06x); preprocess and
   dq-convert at parity too.
+- CAUSAL (2026-06-10, both differentiable end-to-end): fwd
+  1253–1256 µs vs ~1238 (1.011–1.016x; LPT scheduler was the parity
+  gate); bwd 3146–3242 vs 3129–3204 (0.988–1.048x across 6 runs —
+  straddles 1.0). Causal bwd uses FA4's tile_m=64 but KEEPS our
+  swapped dQ^T (deliberate: same wgmma inventory, identical mailbox;
+  FA4's unswapped form + per-wg column split is documented in the
+  causal-bwd audit if ever needed). Causal bwd scheduler: plain 3-D
+  grid — FA4 uses NO LPT for the bwd (PTX-verified).
 
 `HANDOFF.md` is the full race log: architecture, the perf journey,
 the codegen lessons (uniform-register file capacity, the
@@ -195,8 +203,7 @@ HANDOFF.md and the memory notes):
 
 ## Extending the envelope (if/when)
 
-The natural next features, in rough order of value: causal masking
-(block-skip in both kernels + masked softmax), other head dims,
+The natural next features, in rough order of value: other head dims,
 MQA/GQA (Hk < Hq indexing on the K/V TMA coords), varlen. The
 FA4-class algorithm core (warp specialization, tile_m=80 bwd, the
 mailbox dQ drain) carries over; these are predicate/indexing

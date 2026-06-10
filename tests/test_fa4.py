@@ -148,10 +148,38 @@ def test_causal_fwd(seqlen):
 
 
 @requires_cuda
-def test_causal_backward_raises():
-    q, k, v = _make(256, requires_grad=True)
-    with pytest.raises(NotImplementedError, match="inference only"):
-        flash_attn_func(q, k, v, causal=True)
+@pytest.mark.parametrize("seqlen", SEQLENS)
+def test_causal_backward_grads(seqlen):
+    q, k, v = _make(seqlen, requires_grad=True)
+    dout = torch.randn_like(q)
+
+    out = flash_attn_func(q, k, v, causal=True)
+    out.backward(dout)
+
+    qf = q.detach().float().requires_grad_()
+    kf = k.detach().float().requires_grad_()
+    vf = v.detach().float().requires_grad_()
+    import torch.nn.functional as F
+
+    ref = (
+        F.scaled_dot_product_attention(
+            qf.transpose(1, 2), kf.transpose(1, 2), vf.transpose(1, 2),
+            is_causal=True,
+        )
+        .transpose(1, 2)
+    )
+    ref.backward(dout.float())
+
+    # Causal grads are noisier than non-causal (short rows average
+    # fewer terms); FA4's own causal bwd differs from ours by only
+    # ~4e-3 at the bench shape.
+    for name, got, want in (
+        ("dq", q.grad, qf.grad),
+        ("dk", k.grad, kf.grad),
+        ("dv", v.grad, vf.grad),
+    ):
+        d = (got.float() - want).abs().max().item()
+        assert d < 5e-2, f"{name} maxdiff {d:.3e} at S={seqlen}"
 
 
 @requires_cuda

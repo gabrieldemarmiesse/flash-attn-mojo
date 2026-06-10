@@ -7,8 +7,8 @@ errors):
     * bf16 q/k/v, contiguous (B, S, H, D)
     * head_dim == 128
     * seqlen % 128 == 0
-    * causal supported forward/inference-only (causal backward
-      pending); no dropout/window/alibi
+    * causal or non-causal (both at FA4 kernel-time parity, fwd
+      and bwd); no dropout/window/alibi
     * Hq == Hk (no MQA/GQA)
     * CUDA sm90 (Hopper)
 
@@ -66,13 +66,14 @@ def _check_envelope(
 
 class _FlashAttnFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, softmax_scale):
+    def forward(ctx, q, k, v, softmax_scale, causal):
         from flash_attn_mojo.fwd_fa4 import fa4_fwd
 
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        out, lse = fa4_fwd(q, k, v, softmax_scale)
+        out, lse = fa4_fwd(q, k, v, softmax_scale, causal=causal)
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
         ctx.mark_non_differentiable(lse)
         return out, lse
 
@@ -82,9 +83,10 @@ class _FlashAttnFunc(torch.autograd.Function):
 
         q, k, v, out, lse = ctx.saved_tensors
         dq, dk, dv = bwd_fa4(
-            q, k, v, out, dout.contiguous(), lse, ctx.softmax_scale
+            q, k, v, out, dout.contiguous(), lse, ctx.softmax_scale,
+            causal=ctx.causal,
         )
-        return dq, dk, dv, None
+        return dq, dk, dv, None, None
 
 
 def flash_attn_func(
@@ -103,8 +105,7 @@ def flash_attn_func(
             (head_dim=128, seqlen % 128 == 0, Hq == Hk). Non-CUDA
             tensors run the pure-PyTorch reference instead.
         softmax_scale: defaults to head_dim**-0.5.
-        causal: causal masking (forward/inference only for now —
-            the causal backward raises NotImplementedError).
+        causal: causal masking (fully differentiable).
         return_lse: also return the (batch, nheads, seqlen) fp32
             natural-log row logsumexp.
 
@@ -133,29 +134,7 @@ def flash_attn_func(
             return out, torch.logsumexp(scores, dim=-1)
         return out
 
-    if causal:
-        # Causal backward not yet ported: causal=True is
-        # forward/inference-only for now.
-        needs_grad = torch.is_grad_enabled() and (
-            q.requires_grad or k.requires_grad or v.requires_grad
-        )
-        if needs_grad:
-            raise NotImplementedError(
-                "causal=True currently supports inference only (the "
-                "causal backward kernel is not yet ported). Call "
-                "under torch.no_grad() or detach q/k/v."
-            )
-        from flash_attn_mojo.fwd_fa4 import fa4_fwd
-
-        out, lse = fa4_fwd(
-            q.contiguous(), k.contiguous(), v.contiguous(),
-            softmax_scale, causal=True,
-        )
-        if return_lse:
-            return out, lse
-        return out
-
-    out, lse = _FlashAttnFunc.apply(q, k, v, softmax_scale)
+    out, lse = _FlashAttnFunc.apply(q, k, v, softmax_scale, causal)
     if return_lse:
         return out, lse
     return out

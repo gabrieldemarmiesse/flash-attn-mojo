@@ -62,6 +62,7 @@ def launch_bwd_preprocess[
     dtype: DType,
     head_dim: Int,
     use_external_stream: Bool,
+    causal: Bool = False,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -99,12 +100,13 @@ def launch_bwd_preprocess[
         unsafe_from_address=dq_accum_addr
     )
 
-    comptime kernel_inst = bwd_preprocess_kernel[dtype, head_dim]
+    comptime kernel_inst = bwd_preprocess_kernel[dtype, head_dim, causal]
     var compiled = ctx.compile_function[kernel_inst, kernel_inst]()
     # Grid covers Spad rows (side buffers padded to the main-kernel
     # m-block size; pad rows get lse=+inf / dpsum=0).
+    comptime bm_main: Int = 64 if causal else kBwdBlockM
     var spad: Int = (
-        ceildiv(seqlen_int, Int(kBwdBlockM)) * Int(kBwdBlockM)
+        ceildiv(seqlen_int, Int(bm_main)) * Int(bm_main)
     )
     var grid = (
         ceildiv(spad, Int(kBwdPreBlockM)),
@@ -148,6 +150,7 @@ def launch_bwd_main[
     dtype: DType,
     head_dim: Int,
     use_external_stream: Bool,
+    causal: Bool = False,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -175,15 +178,16 @@ def launch_bwd_main[
     # Smem (BM=80): K + V (2 x 32768) + 4-slot Q/dO ring (4 x 20480)
     # + 2 sdS stages (2 x 20480) + lse/dps (1280) + dQ mailbox
     # (2 x 20480) = 230912 B <= 232448 cap.
+    comptime bm: Int = 64 if causal else kBwdBlockM
     comptime kv_bytes: Int = kBwdBlockN * head_dim * size_of[dtype]()
-    comptime q_slot_bytes: Int = kBwdBlockM * head_dim * size_of[dtype]()
-    comptime sds_bytes: Int = kBwdBlockM * kBwdBlockN * size_of[dtype]()
+    comptime q_slot_bytes: Int = bm * head_dim * size_of[dtype]()
+    comptime sds_bytes: Int = bm * kBwdBlockN * size_of[dtype]()
     comptime mbar_bytes: Int = 256
     # + 2-stage lse_log2/dpsum staging ring (2 x 2 x BM f32).
-    comptime lse_dps_bytes: Int = 2 * (kBwdQdOStages // 2) * kBwdBlockM * 4
+    comptime lse_dps_bytes: Int = 2 * (kBwdQdOStages // 2) * bm * 4
     # + per-MMA-wg dQ mailbox (64 x BM f32 each, bulk-reduce-drained).
     comptime dq_mail_bytes: Int = (
-        kBwdNMmaWarpgroups * 64 * kBwdBlockM * 4
+        kBwdNMmaWarpgroups * 64 * bm * 4
     )
     comptime smem_bytes: Int = (
         2 * kv_bytes
@@ -223,7 +227,7 @@ def launch_bwd_main[
     )
 
     comptime gmem_shape = IndexList[3](UNKNOWN_VALUE, UNKNOWN_VALUE, head_dim)
-    comptime q_smem_shape = IndexList[3](kBwdBlockM, 1, head_dim)
+    comptime q_smem_shape = IndexList[3](bm, 1, head_dim)
     comptime kv_smem_shape = IndexList[3](kBwdBlockN, 1, head_dim)
 
     var rows: Int = batch_int * seqlen_int
@@ -255,6 +259,7 @@ def launch_bwd_main[
         type_of(k_tma).desc_shape,
         type_of(dk_tma).tile_shape,
         type_of(dk_tma).desc_shape,
+        causal,
     ]
 
     var compiled = ctx.compile_function[
@@ -317,6 +322,7 @@ def launch_bwd_convert[
     dtype: DType,
     head_dim: Int,
     use_external_stream: Bool,
+    causal: Bool = False,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -339,10 +345,11 @@ def launch_bwd_convert[
         unsafe_from_address=dq_addr
     )
 
-    # (kBwdBlockM q) x (128+4 d) f32 decode tile.
-    comptime cvt_smem_bytes: Int = kBwdBlockM * (head_dim + 4) * 4
+    # (BM q) x (128+4 d) f32 decode tile.
+    comptime bm_cvt: Int = 64 if causal else kBwdBlockM
+    comptime cvt_smem_bytes: Int = bm_cvt * (head_dim + 4) * 4
 
-    comptime kernel_inst = bwd_convert_kernel[dtype, head_dim]
+    comptime kernel_inst = bwd_convert_kernel[dtype, head_dim, causal]
     var compiled = ctx.compile_function[kernel_inst, kernel_inst](
         func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
             UInt32(cvt_smem_bytes)
@@ -350,7 +357,7 @@ def launch_bwd_convert[
     )
     # One CTA per main-kernel m-block.
     var grid = (
-        ceildiv(seqlen_int, Int(kBwdBlockM)),
+        ceildiv(seqlen_int, Int(bm_cvt)),
         nheads_int,
         batch_int,
     )
