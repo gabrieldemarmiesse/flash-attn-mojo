@@ -39,16 +39,17 @@ schedule 3035 → v4 warp specialization 2500 → v5 TMA-store epilogue
 
 ## Backward (bwd_fa4) — state as of 2026-06-10 (fourth session)
 
-Correct (bf16 noise floor vs fp32 autograd at S in {128, 256, 640,
-1024}: dq/dk/dv 1.4-1.8e-3) at **~1.10-1.13x FA4** with LOCKED clocks
-(`sudo nvidia-smi --lock-gpu-clocks=1500,1500` — DO THIS FIRST,
-unlocked clocks drift ±4-5% run-to-run and drown <3% experiments;
-persistence mode is off so relock per session). Main kernel
-6.73-6.83 ms vs FA4 6.04-6.18; preprocess (167 vs 159 us) and
-convert (115 vs 109 us) at parity. Loop:
-`scripts/master_bench.sh --kind bwd`; fast check:
-`scripts/bench_fa4.py --impl mojo --kind bwd --check-only` (covers
-tail (S%%80!=0) and exact-fit seqlens).
+**AT PARITY WITH FA4** (within FA4's own run-to-run variance):
+locked-clock interleaved master_bench x3 -> main kernel
+6148/6172/6250 us vs FA4 5913/6053/6176 = ratio 1.000/1.023/1.059.
+Loop body: 448 instructions/iteration vs FA4's 532 (identical 34
+HGMMA of tensor work) — we now run FEWER instructions per iteration
+(fma softmax vs mul+sub, no seqlen masks). Correct at bf16 noise
+floor (dq/dk/dv 1.43/1.33/1.42e-3 at S=1024; tail + exact-fit
+seqlens covered by --check-only). ALWAYS
+`sudo nvidia-smi --lock-gpu-clocks=1500,1500` before measuring
+(persistence off — relock per session); even locked, both kernels
+wobble ~2-4% run-to-run, so quote 3-run spreads.
 
 Perf journey: 141.8 (acquire atomics) -> 28.5 (relaxed) -> 24.3
 (manual sdS addressing) -> 11.5 (balanced hand-rolled dQ^T) -> 10.6
@@ -132,19 +133,31 @@ Fixes shipped (kernel.mojo, consumer loop top):
    correction chain per smem address (10 stmatrix sites). Replaced
    with `(x >> 1) - (y >> 1)`.
 
-Result: ptxas spills 164 -> 0 B; long_scoreboard 5.33 -> 1.87
-(FA4: 2.28); issue_active 18.1 -> 27.1% (FA4: 26.4); tensor pipe
-55 -> 65.5% (FA4: 77.8). Locked-clock interleaved: main kernel
-6.73-6.83 ms vs FA4 6.04-6.18 = **1.10-1.13x**. ~52 in-loop R2UR
-remain (the laundered roots are asm outputs, which ptxas keeps
-per-thread even after the shfl — possibly because the chains span
-the mbarrier-spin region); measured neutral now that spills are
-gone. The remaining ~10% is instruction-count/mix, not stalls:
-we issue MORE per cycle than FA4 but do more non-tensor work per
-unit of tensor work (e.g. descriptor rebuild ALU, two fence sites,
-the 64-bit index residue). Next levers: 32-bit index discipline
-through the consumer loop, trimming the per-iteration ALU diff
-(master_bench op-mix), and re-examining the 2-stage prefetch depth.
+Result: ptxas spills 164 -> 0 B; long_scoreboard 5.33 -> 1.87.
+That left ~10% of instruction-mix gap, closed by the SASS op-mix
+diff (extract both innermost loop bodies — same 34 HGMMA — and
+diff opcode histograms; started at 638 vs 532 instr/iter):
+
+- THE TID-WIDENING TRAP (the 52-R2UR storm's root): mojo's
+  `Int(thread_idx.x) // 128` widens tid to 64-bit BEFORE the
+  shift. ptxas's tid-uniformity rule only matches 32-bit shr.u32
+  (probe: tid7 = 0 R2UR vs tid7w = 32 R2UR), so EVERY wg-derived
+  value (per-wg A-desc offsets, mailbox base, barrier ids) was
+  per-thread. LLVM re-canonicalizes 32-bit extracts of widened tid
+  back to shr.u64; the robust fix is
+  `warp.broadcast(Int32(tid >> 7))` — convergent so LLVM keeps it,
+  a recognized broadcast so ptxas uniformizes. 638 -> 532
+  instr/iter, R2UR 52 -> 3 in one line.
+- One launder shfl, not two: V's root = K's + tile size (shfl is
+  MIO; mio_throttle was 1.28 vs FA4 0.71).
+- bf16-P dS reverted (register headroom exists post-spill-fix):
+  -40 F2F on the dS critical path, -20 PRMT, precision back to
+  1.4e-3. 532 -> 448 instr/iter.
+
+Remaining structural diffs vs FA4 are now in OUR favor or neutral;
+the ~0-5% residual is within measurement noise. If more is ever
+needed: barrier 1.71 vs 1.45 and wait 1.43 vs 0.95 stalls are the
+only deltas left (wgmma wait placement / 2-stage prefetch depth).
 
 ### Diagnosis methodology that worked
 
