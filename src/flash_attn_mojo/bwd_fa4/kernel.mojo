@@ -99,6 +99,17 @@ comptime WGMMA_K: Int = 16
 comptime NUM_PRODUCER_REGS: Int = 24
 comptime NUM_CONSUMER_REGS: Int = 240
 
+# Temporary perf probes (never commit True): compile out a subsystem
+# to attribute pipeline bubbles. Breaks dq correctness only.
+comptime PROBE_NO_DQ: Bool = False  # skip sdS/PdS-barrier/dQ/mailbox
+comptime PROBE_NO_DQ_GEMM: Bool = False  # keep sdS+barrier, skip GEMM+mailbox
+comptime PROBE_NO_MAILBOX: Bool = False  # keep GEMM, skip mailbox+drain
+comptime PROBE_NO_EXP2: Bool = False  # skip softmax exp2 chain
+comptime PROBE_NO_REDUCE: Bool = False  # full protocol, skip cp.reduce
+comptime PROBE_NO_MAIL_FENCE: Bool = False  # skip mailbox proxy fence
+comptime SKIP_DQ_GEMM: Bool = PROBE_NO_DQ or PROBE_NO_DQ_GEMM
+comptime SKIP_MAILBOX: Bool = SKIP_DQ_GEMM or PROBE_NO_MAILBOX
+
 
 # ===================================================================
 # Main backward kernel
@@ -334,6 +345,8 @@ def bwd_main_kernel[
                     slot = 0
                     phase ^= 1
         elif thread_idx.x < 64:
+            comptime if SKIP_MAILBOX:
+                return
             # ---- dQ drain warp (FA4's design). Per m-tile: signal
             # each wg's mailbox empty once its previous bulk reduce
             # finished *reading* smem (wait_group.read), sync the
@@ -351,7 +364,7 @@ def bwd_main_kernel[
                 named_barrier_arrive[Int32(DRAIN_BAR)](Int32(10))
                 comptime for w in range(2):
                     named_barrier[Int32(DRAIN_BAR)](Int32(6 + w))
-                    if lane_d == 0:
+                    if lane_d == 0 and not PROBE_NO_REDUCE:
                         inlined_assembly[
                             "cp.reduce.async.bulk.global.shared::cta"
                             + ".bulk_group.add.f32 [$0], [$1], $2;",
@@ -538,22 +551,11 @@ def bwd_main_kernel[
 
         # S^T = K · Q^T
         full[slot].wait(phase)
-
-        # lse_log2/dpsum for this tile (published with the Q slot).
-        var lse_vals = stack_allocation[16, Scalar[accum_type]]()
-        var dps_vals = stack_allocation[16, Scalar[accum_type]]()
-        comptime for cc in range(BM // 8):  # 8 col chunks
-            var col: Int = cc * 8 + 2 * lane_pair
-            var lp2 = (
-                lse_smem + (slot // 2) * BM + col
-            ).load[width=2]()
-            var dp2 = (
-                dps_smem + (slot // 2) * BM + col
-            ).load[width=2]()
-            lse_vals[cc * 2] = lp2[0]
-            lse_vals[cc * 2 + 1] = lp2[1]
-            dps_vals[cc * 2] = dp2[0]
-            dps_vals[cc * 2 + 1] = dp2[1]
+        # lse_log2/dpsum stay in smem (published with the Q slot) and
+        # are loaded pairwise at their use sites below — keeping a
+        # staged copy in a stack array put it in LOCAL memory and
+        # blew the 168-reg budget (spills + non-uniform descriptors).
+        var stat_col: Int = (slot // 2) * BM + 2 * lane_pair
         warpgroup_fence(s_reg)
         wgmma_sdp.arrive()
         wgmma_sdp.wgmma[num_warp_groups=NWG, scale_c=0](
@@ -576,12 +578,17 @@ def bwd_main_kernel[
 
         # P^T = exp2(S^T * scale_log2 - lse_log2[q col]); P kept in
         # f32 in s_reg, packed bf16 into p_reg.
-        comptime for c in range(c_frag_sdp):
-            comptime cc: Int = c // 4
-            comptime j: Int = c & 1
-            s_reg.ptr[c] = exp2(
-                s_reg.ptr[c].fma(scale_log2, -lse_vals[cc * 2 + j])
-            )
+        comptime for cc in range(c_frag_sdp // 4):
+            var lp2 = (lse_smem + stat_col + cc * 8).load[width=2]()
+            comptime for ic in range(4):
+                comptime c: Int = cc * 4 + ic
+                comptime j: Int = c & 1
+                comptime if PROBE_NO_EXP2:
+                    s_reg.ptr[c] = s_reg.ptr[c].fma(scale_log2, -lp2[j])
+                else:
+                    s_reg.ptr[c] = exp2(
+                        s_reg.ptr[c].fma(scale_log2, -lp2[j])
+                    )
         comptime for c in range(c_frag_sdp):
             p_reg.ptr[c] = s_reg.ptr[c].cast[dtype]()
 
@@ -596,12 +603,12 @@ def bwd_main_kernel[
         warpgroup_fence(dp_reg)
 
         # dS^T = P^T * (dP^T - dpsum[q col])
-        comptime for c in range(c_frag_sdp):
-            comptime cc: Int = c // 4
-            comptime j: Int = c & 1
-            dp_reg.ptr[c] = s_reg.ptr[c] * (
-                dp_reg.ptr[c] - dps_vals[cc * 2 + j]
-            )
+        comptime for cc in range(c_frag_sdp // 4):
+            var dp2 = (dps_smem + stat_col + cc * 8).load[width=2]()
+            comptime for ic in range(4):
+                comptime c: Int = cc * 4 + ic
+                comptime j: Int = c & 1
+                dp_reg.ptr[c] = s_reg.ptr[c] * (dp_reg.ptr[c] - dp2[j])
         comptime for c in range(c_frag_sdp):
             ds_reg.ptr[c] = dp_reg.ptr[c].cast[dtype]()
 
@@ -614,57 +621,64 @@ def bwd_main_kernel[
         # r*BM + ((c/8)^((r + phase)%8))*8 + c%8. Pairs (c, c+1)
         # stay contiguous -> 32-bit stores, conflict-free.
         var sds_stage_base = sds_base + sds_stage * sds_size
-        var sds_phase: Int = (Int(sds_stage_base) >> 7) & 7
-        var kv_r_lo: Int = wg * WGMMA_M + warp_in_wg * 16 + lane_group
-        var xor_lo: Int = (lane_group + sds_phase) & 7
-        comptime for c2 in range(c_frag_sdp // 2):
-            comptime cc: Int = c2 // 2
-            comptime bot: Int = c2 % 2
-            var r: Int = kv_r_lo + (8 if bot == 1 else 0)
-            var off: Int = (
-                r * BM + ((cc ^ xor_lo) * 8) + 2 * lane_pair
+        comptime if not PROBE_NO_DQ:
+            var sds_phase: Int = (Int(sds_stage_base) >> 7) & 7
+            var kv_r_lo: Int = (
+                wg * WGMMA_M + warp_in_wg * 16 + lane_group
             )
-            var pair = SIMD[dtype, 2](
-                ds_reg.ptr[2 * c2], ds_reg.ptr[2 * c2 + 1]
-            )
-            (sds_stage_base + off).store[width=2, alignment=4](pair)
+            var xor_lo: Int = (lane_group + sds_phase) & 7
+            comptime for c2 in range(c_frag_sdp // 2):
+                comptime cc: Int = c2 // 2
+                comptime bot: Int = c2 % 2
+                var r: Int = kv_r_lo + (8 if bot == 1 else 0)
+                var off: Int = (
+                    r * BM + ((cc ^ xor_lo) * 8) + 2 * lane_pair
+                )
+                var pair = SIMD[dtype, 2](
+                    ds_reg.ptr[2 * c2], ds_reg.ptr[2 * c2 + 1]
+                )
+                (sds_stage_base + off).store[width=2, alignment=4](
+                    pair
+                )
 
-        fence_async_view_proxy()
-        # Single per-iter barrier: proves both warpgroups wrote this
-        # stage of sdS *and* (transitively, via last iter's
-        # wait_group below) that dQ(iter-1) retired before its stage
-        # gets rewritten next iteration.
-        named_barrier[Int32(NWG * 128)](Int32(4))
+            fence_async_view_proxy()
+            # Single per-iter barrier: proves both warpgroups wrote
+            # this stage of sdS *and* (transitively, via last iter's
+            # wait_group below) that dQ(iter-1) retired before its
+            # stage gets rewritten next iteration.
+            named_barrier[Int32(NWG * 128)](Int32(4))
 
-        # dQ^T (D x BM) = K^T · dS, hand-rolled (layout_a="col" so A
-        # is K's bytes read mn-major). M = D = 128 split m64 per
-        # warpgroup -> both warpgroups share the GEMM.
-        warpgroup_fence(dq_reg)
-        wgmma_sdp.arrive()
-        var a_desc = _wgmma_descriptor[kt_canonical, False, swizzle](
-            k_base
-        ) + wg * a_wg_stride
-        var b_desc = _wgmma_descriptor[sds_canonical, False, swizzle](
-            sds_stage_base
-        )
-        var dq_frags = dq_reg.vectorize[1, c_frag_dq]()
-        comptime for k_mma in range(BN // WGMMA_K):
-            dq_frags[0, 0] = wgmma_async[
-                WGMMA_M,
-                BM,
-                WGMMA_K,
-                accum_type,
-                a_type=dtype,
-                b_type=dtype,
-                layout_a="col",
-                layout_b="row",
-                scale_d = 0 if k_mma == 0 else 1,
-            ](
-                a_desc + k_mma * a_k_stride,
-                b_desc + k_mma * b_k_stride,
-                dq_frags[0, 0],
-            )
-        wgmma_sdp.commit_group()
+            comptime if not SKIP_DQ_GEMM:
+                # dQ^T (D x BM) = K^T · dS, hand-rolled
+                # (layout_a="col" so A is K's bytes read mn-major).
+                # M = D = 128 split m64 per warpgroup -> both
+                # warpgroups share the GEMM.
+                warpgroup_fence(dq_reg)
+                wgmma_sdp.arrive()
+                var a_desc = _wgmma_descriptor[
+                    kt_canonical, False, swizzle
+                ](k_base) + wg * a_wg_stride
+                var b_desc = _wgmma_descriptor[
+                    sds_canonical, False, swizzle
+                ](sds_stage_base)
+                var dq_frags = dq_reg.vectorize[1, c_frag_dq]()
+                comptime for k_mma in range(BN // WGMMA_K):
+                    dq_frags[0, 0] = wgmma_async[
+                        WGMMA_M,
+                        BM,
+                        WGMMA_K,
+                        accum_type,
+                        a_type=dtype,
+                        b_type=dtype,
+                        layout_a="col",
+                        layout_b="row",
+                        scale_d = 0 if k_mma == 0 else 1,
+                    ](
+                        a_desc + k_mma * a_k_stride,
+                        b_desc + k_mma * b_k_stride,
+                        dq_frags[0, 0],
+                    )
+                wgmma_sdp.commit_group()
 
         # Queue [dV, dQ]: wait ≤1 retires dV -> dO(n) reusable now,
         # one GEMM earlier than waiting on dQ (FA4's release point).
@@ -687,19 +701,21 @@ def bwd_main_kernel[
         # Hand dQ^T to the drain warp: raw c-frag dump into this
         # wg's mailbox (8 x st.shared.v4, fully coalesced), under
         # the dK GEMM. The drain warp owns the gmem reduce-add.
-        named_barrier[Int32(DRAIN_BAR)](Int32(9 + wg))
-        var mail = dq_mail + wg * DQ_MAIL_F32 + tid_in_wg * 4
-        comptime for ch in range(c_frag_dq // 4):
-            (mail + ch * 512).store[width=4, alignment=16](
-                SIMD[accum_type, 4](
-                    dq_reg.ptr[4 * ch],
-                    dq_reg.ptr[4 * ch + 1],
-                    dq_reg.ptr[4 * ch + 2],
-                    dq_reg.ptr[4 * ch + 3],
+        comptime if not SKIP_MAILBOX:
+            named_barrier[Int32(DRAIN_BAR)](Int32(9 + wg))
+            var mail = dq_mail + wg * DQ_MAIL_F32 + tid_in_wg * 4
+            comptime for ch in range(c_frag_dq // 4):
+                (mail + ch * 512).store[width=4, alignment=16](
+                    SIMD[accum_type, 4](
+                        dq_reg.ptr[4 * ch],
+                        dq_reg.ptr[4 * ch + 1],
+                        dq_reg.ptr[4 * ch + 2],
+                        dq_reg.ptr[4 * ch + 3],
+                    )
                 )
-            )
-        fence_async_view_proxy()
-        named_barrier_arrive[Int32(DRAIN_BAR)](Int32(6 + wg))
+            comptime if not PROBE_NO_MAIL_FENCE:
+                fence_async_view_proxy()
+            named_barrier_arrive[Int32(DRAIN_BAR)](Int32(6 + wg))
 
         # dK retired -> Q(n) slot reusable.
         wgmma_dkv.wait_group[0]()
