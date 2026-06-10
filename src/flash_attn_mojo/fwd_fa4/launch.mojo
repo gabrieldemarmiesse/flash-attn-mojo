@@ -26,7 +26,7 @@ from layout import UNKNOWN_VALUE
 from layout.tma_async import create_split_tma
 
 from kernel import fwd_fa4_kernel
-from common import kFa4NThreads, kFa4BlockM, kFa4BlockN
+from common import kFa4NThreads, kFa4BlockM, kFa4BlockN, kFa4KVStages
 
 comptime MOJO_DUMP_PTX: StaticString = get_defined_string[
     "MOJO_DUMP_PTX", ""
@@ -69,15 +69,14 @@ def launch_fwd_fa4[
 
     comptime swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B
 
-    # Smem: Q (BM x D) + 2 stages x (K + V) (BN x D) bf16 + mbarriers.
-    # head_dim=128: 32 KiB per tile -> 160 KiB (H100 cap is 228 KiB).
-    comptime n_stages: Int = 2
+    # Smem: Q (BM x D) + kFa4KVStages ring slots (BN x D) bf16 +
+    # mbarriers. head_dim=128: 32 KiB per tile -> 224 KiB (H100
+    # opt-in cap is 227 KiB).
     comptime q_bytes: Int = kFa4BlockM * head_dim * size_of[dtype]()
-    comptime k_bytes: Int = kFa4BlockN * head_dim * size_of[dtype]()
-    comptime v_bytes: Int = kFa4BlockN * head_dim * size_of[dtype]()
-    comptime mbar_bytes: Int = 64
+    comptime kv_slot_bytes: Int = kFa4BlockN * head_dim * size_of[dtype]()
+    comptime mbar_bytes: Int = 128
     comptime smem_bytes: Int = (
-        q_bytes + n_stages * (k_bytes + v_bytes) + mbar_bytes
+        q_bytes + kFa4KVStages * kv_slot_bytes + mbar_bytes
     )
 
     var q_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](

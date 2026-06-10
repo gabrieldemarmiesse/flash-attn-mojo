@@ -1,25 +1,31 @@
 """FA4-target flash-attention forward kernel (sm_90a, Hopper).
 
-v2: + 2-stage K/V smem pipeline (TMA for tile n+1 issued while tile n
-computes), QK wgmma accumulates with scale_c=0 (no register-tile
-zero-fill), max.f32 softmax reductions, reciprocal normalization,
-paired output stores. Still 2 MMA warpgroups / 256 threads, no
-producer warpgroup, no intra-warpgroup overlap.
+v4: warp-specialized like FA4 — 1 producer warpgroup (WG0, thread 0
+issues all TMA loads) + 2 MMA warpgroups, 384 threads. K/V tiles
+live in a single 6-slot smem ring (slot(K_n) = 2n%6, slot(V_n) =
+(2n+1)%6) guarded by full/empty mbarrier pairs:
 
-Grid: (ceildiv(seqlen, BM), nheads, batch).
-Block: 256 threads = 2 warpgroups, each owning a 64-row half of the
-(BM=128, D=128) Q tile.
+    full[i].init(1)     -> flipped by TMA expect_bytes completion
+    empty[i].init(256)  -> flipped when every MMA thread arrives
 
-Per block (b, h, m_block):
-  1. TMA-load Q tile once.
-  2. issue TMA K/V loads of tile 0 into stage 0.
-  3. For n_block:
-       issue TMA K/V loads of tile n+1 into stage (n+1)%2
-       wait K[n%2];  S = Q·Kᵀ        (wgmma m64n128k16, SS, scale_c=0)
-       online softmax (exp2 trick), P = exp2(S·scale - m)
-       wait V[n%2];  O += P·V        (wgmma m64n128k16, RS)
-       block-wide barrier (stage n%2 buffers become writable)
-  4. O *= 1/rowsum, cast bf16, store to gmem as 32-bit pairs.
+The MMA warpgroups run FA4's intra-warpgroup overlap schedule (from
+`flash_attn/cute/flash_fwd_sm90.py::mma_one_n_block_intrawg_overlap`):
+
+    wait full K(n+1); commit QK(n+1) -> s_reg        (no wait)
+    wait full V(n);   commit PV(n):  p_reg x V -> o_reg
+    wait_group(1)   # QK(n+1) retired -> arrive empty[K(n+1)]
+    softmax(n+1)    # overlaps PV(n) on the tensor core
+    wait_group(0)   # PV(n) retired   -> arrive empty[V(n)]
+    pack P(n+1) bf16; rescale o_reg
+
+No block-wide barriers in the loop (v3's main stall). Single S /
+single P register buffer keeps the consumer register count near
+FA4's 168/thread; producer deallocates to 24 regs via setmaxnreg.
+
+The exp2 uses the scaled-domain trick: rowmax is kept premultiplied
+by softmax_scale*log2(e) so P = exp2(fma(s, scale_log2, -m)).
+
+Grid: (ceildiv(seqlen, BM), nheads, batch). Block: 384 threads.
 
 P c-frag -> a-frag mapping: with num_m_mmas=1 per warpgroup the QK
 c-fragment element order (16 col-chunks x [top0 top1 bot0 bot1]) is
@@ -43,6 +49,7 @@ from std.gpu import (
 )
 import std.gpu.primitives.warp as warp
 from std.gpu.host.nvidia.tma import TensorMapSwizzle
+from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from std.gpu.memory import AddressSpace, external_memory
 from std.memory import stack_allocation
 
@@ -55,11 +62,18 @@ from layout.tensor_core_async import (
 )
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
-from common import kFa4NThreads, kFa4BlockM, kFa4BlockN, kFa4NMmaWarpgroups
+from common import (
+    kFa4NThreads,
+    kFa4BlockM,
+    kFa4BlockN,
+    kFa4NMmaWarpgroups,
+    kFa4KVStages,
+)
 
 comptime WGMMA_M: Int = 64
 comptime WGMMA_K: Int = 16
-comptime NSTAGES: Int = 2
+comptime NUM_PRODUCER_REGS: Int = 24
+comptime NUM_CONSUMER_REGS: Int = 240
 
 
 @__llvm_metadata(
@@ -90,11 +104,10 @@ def fwd_fa4_kernel[
     comptime BN: Int = kFa4BlockN
     comptime D: Int = head_dim
     comptime NWG: Int = kFa4NMmaWarpgroups
+    comptime STAGES: Int = kFa4KVStages
     comptime accum_type: DType = DType.float32
     comptime swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B
 
-    # ---- Smem layouts (K-major for Q/K; V as MN-major view of the
-    # same row-major (BN, D) bytes the TMA writes).
     comptime q_smem_layout = tile_layout_k_major[
         dtype, BM, D, swizzle_mode=swizzle
     ]()
@@ -106,8 +119,7 @@ def fwd_fa4_kernel[
     ]()
 
     comptime q_smem_size: Int = q_smem_layout.size()
-    comptime k_smem_size: Int = k_smem_layout.size()
-    comptime v_smem_size: Int = v_smem_layout.size()
+    comptime kv_slot_size: Int = BN * D
 
     var smem_base = external_memory[
         Scalar[dtype],
@@ -121,27 +133,82 @@ def fwd_fa4_kernel[
         address_space=AddressSpace.SHARED,
         alignment=128,
     ](smem_base)
-    var k_smem_base = smem_base + q_smem_size
-    var v_smem_base = k_smem_base + NSTAGES * k_smem_size
+    var kv_smem_base = smem_base + q_smem_size
 
-    # ---- mbarriers (one per stage per tensor + one for Q).
     var mbar_q = stack_allocation[
         1, SharedMemBarrier, address_space=AddressSpace.SHARED, alignment=8
     ]()
-    var mbar_k = stack_allocation[
-        NSTAGES, SharedMemBarrier, address_space=AddressSpace.SHARED, alignment=8
+    var full = stack_allocation[
+        STAGES,
+        SharedMemBarrier,
+        address_space=AddressSpace.SHARED,
+        alignment=8,
     ]()
-    var mbar_v = stack_allocation[
-        NSTAGES, SharedMemBarrier, address_space=AddressSpace.SHARED, alignment=8
+    var empty = stack_allocation[
+        STAGES,
+        SharedMemBarrier,
+        address_space=AddressSpace.SHARED,
+        alignment=8,
     ]()
     if thread_idx.x == 0:
         mbar_q[0].init()
-        comptime for s in range(NSTAGES):
-            mbar_k[s].init()
-            mbar_v[s].init()
+        comptime for s in range(STAGES):
+            full[s].init(1)
+            empty[s].init(Int32(NWG * 128))
     barrier()
 
-    # ---- WGMMA operators. Both GEMMs are m64 n128 k16.
+    var m_block: Int = Int(block_idx.x)
+    var h_idx: Int = Int(block_idx.y)
+    var b_idx: Int = Int(block_idx.z)
+    var num_kv_blocks: Int = (seq_len + BN - 1) // BN
+
+    var wgid: Int = Int(thread_idx.x) // 128
+
+    if wgid == 0:
+        # ================= producer =================
+        warpgroup_reg_dealloc[NUM_PRODUCER_REGS]()
+        if thread_idx.x == 0:
+            mbar_q[0].expect_bytes(Int32(BM * D * size_of[dtype]()))
+            q_tma.async_copy_3d(
+                q_smem, mbar_q[0], (0, h_idx, b_idx * seq_len + m_block * BM)
+            )
+            for n_block in range(num_kv_blocks):
+                var row: Int = b_idx * seq_len + n_block * BN
+                var phase: UInt32 = UInt32((n_block // 3) & 1)
+
+                var k_slot: Int = (2 * n_block) % STAGES
+                empty[k_slot].wait(phase)
+                var k_st = LayoutTensor[
+                    dtype,
+                    k_smem_layout,
+                    MutAnyOrigin,
+                    address_space=AddressSpace.SHARED,
+                    alignment=128,
+                ](kv_smem_base + k_slot * kv_slot_size)
+                full[k_slot].expect_bytes(Int32(BN * D * size_of[dtype]()))
+                k_tma.async_copy_3d(k_st, full[k_slot], (0, h_idx, row))
+
+                var v_slot: Int = (2 * n_block + 1) % STAGES
+                empty[v_slot].wait(phase)
+                var v_st = LayoutTensor[
+                    dtype,
+                    v_smem_layout,
+                    MutAnyOrigin,
+                    address_space=AddressSpace.SHARED,
+                    alignment=128,
+                ](kv_smem_base + v_slot * kv_slot_size)
+                full[v_slot].expect_bytes(Int32(BN * D * size_of[dtype]()))
+                v_tma.async_copy_3d(v_st, full[v_slot], (0, h_idx, row))
+        return
+
+    # ================= MMA warpgroups =================
+    warpgroup_reg_alloc[NUM_CONSUMER_REGS]()
+    var wg: Int = wgid - 1
+
+    # Unblock the producer's first ring cycle.
+    comptime for s in range(STAGES):
+        _ = empty[s].arrive()
+
     var wgmma_qk = TensorCoreAsync[
         accum_type,
         dtype,
@@ -161,7 +228,6 @@ def fwd_fa4_kernel[
         transpose_b=False,
     ]()
 
-    # Per-warpgroup fragment sizes (num_m_mmas = num_n_mmas = 1).
     comptime c_frag_size_qk: Int = WGMMA_M * BN // 128  # 64
     comptime c_frag_size_pv: Int = WGMMA_M * D // 128  # 64
     comptime a_frag_size_pv: Int = WGMMA_M * WGMMA_K // 128  # 8
@@ -187,171 +253,159 @@ def fwd_fa4_kernel[
         address_space=AddressSpace.LOCAL,
     ].stack_allocation()
 
-    # Online-softmax state: 2 rows per thread (top/bot of the m64).
+    # Online-softmax state, kept in the scaled (log2) domain:
+    # rowmax_s = max(S) * softmax_scale * log2(e). 2 rows per thread.
     comptime rows_per_thread: Int = 2
     var rowmax = stack_allocation[rows_per_thread, Scalar[accum_type]]()
     var rowsum = stack_allocation[rows_per_thread, Scalar[accum_type]]()
+    var scale_old = stack_allocation[rows_per_thread, Scalar[accum_type]]()
     var neg_inf: Scalar[accum_type] = Scalar[accum_type](-1.0e30)
-    for i in range(rows_per_thread):
+    comptime for i in range(rows_per_thread):
         rowmax[i] = neg_inf
         rowsum[i] = Scalar[accum_type](0)
 
-    var wg: Int = Int(thread_idx.x) // 128
-
-    # ---- TMA coordinates.
-    var m_block: Int = Int(block_idx.x)
-    var h_idx: Int = Int(block_idx.y)
-    var b_idx: Int = Int(block_idx.z)
-    var q_row_base: Int = b_idx * seq_len + m_block * BM
-
-    var num_kv_blocks: Int = (seq_len + BN - 1) // BN
     var scale_log2: Scalar[accum_type] = (
         softmax_scale * Scalar[DType.float32](log2e)
     ).cast[accum_type]()
 
     @parameter
     @always_inline
-    def issue_kv_load(n_block: Int, stage: Int):
-        """Thread 0 only: arm + issue the K and V TMA loads of tile
-        `n_block` into smem stage `stage`."""
-        var kv_row_base: Int = b_idx * seq_len + n_block * BN
-        var k_st = LayoutTensor[
-            dtype,
-            k_smem_layout,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ](k_smem_base + stage * k_smem_size)
-        var v_st = LayoutTensor[
-            dtype,
-            v_smem_layout,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ](v_smem_base + stage * v_smem_size)
-        mbar_k[stage].expect_bytes(Int32(BN * D * size_of[dtype]()))
-        k_tma.async_copy_3d(k_st, mbar_k[stage], (0, h_idx, kv_row_base))
-        mbar_v[stage].expect_bytes(Int32(BN * D * size_of[dtype]()))
-        v_tma.async_copy_3d(v_st, mbar_v[stage], (0, h_idx, kv_row_base))
+    def k_tile(slot: Int) -> LayoutTensor[
+        dtype,
+        k_smem_layout,
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+        alignment=128,
+    ]:
+        return {kv_smem_base + slot * kv_slot_size}
 
-    # ---- One-shot Q load + first K/V tile.
-    if thread_idx.x == 0:
-        mbar_q[0].expect_bytes(Int32(BM * D * size_of[dtype]()))
-        q_tma.async_copy_3d(q_smem, mbar_q[0], (0, h_idx, q_row_base))
-        issue_kv_load(0, 0)
-    mbar_q[0].wait(UInt32(0))
+    @parameter
+    @always_inline
+    def v_tile(slot: Int) -> LayoutTensor[
+        dtype,
+        v_smem_layout,
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+        alignment=128,
+    ]:
+        return {kv_smem_base + slot * kv_slot_size}
 
-    var phase_k = stack_allocation[NSTAGES, UInt32]()
-    var phase_v = stack_allocation[NSTAGES, UInt32]()
-    comptime for s in range(NSTAGES):
-        phase_k[s] = 0
-        phase_v[s] = 0
-
-    for n_block in range(num_kv_blocks):
-        var stage: Int = n_block % NSTAGES
-
-        # Issue the next tile's loads into the other stage. Its
-        # buffers were released by the barrier ending iter n-1.
-        if thread_idx.x == 0 and n_block + 1 < num_kv_blocks:
-            issue_kv_load(n_block + 1, (n_block + 1) % NSTAGES)
-
-        var k_smem = LayoutTensor[
-            dtype,
-            k_smem_layout,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ](k_smem_base + stage * k_smem_size)
-        var v_smem = LayoutTensor[
-            dtype,
-            v_smem_layout,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ](v_smem_base + stage * v_smem_size)
-
-        mbar_k[stage].wait(phase_k[stage])
-        phase_k[stage] ^= 1
-
-        # S = Q · Kᵀ for this warpgroup's 64 rows (scale_c=0: first
-        # k-step overwrites, no zero-fill needed).
-        warpgroup_fence(s_reg)
-        wgmma_qk.arrive()
-        wgmma_qk.wgmma[num_warp_groups=NWG, scale_c=0](
-            q_smem, k_smem, s_reg, wg
-        )
-        wgmma_qk.commit_group()
-        wgmma_qk.wait_group()
-        warpgroup_fence(s_reg)
-
-        # ---- Online softmax (base-2 exp). c-frag row of element c is
-        # top (c%4 < 2) or bottom (c%4 >= 2).
-        comptime for c in range(c_frag_size_qk):
-            s_reg.ptr[c] = s_reg.ptr[c] * scale_log2
-
+    @parameter
+    @always_inline
+    def softmax_block():
+        """Online softmax over s_reg (S just retired): update
+        rowmax/rowsum/scale_old, write P (f32) back into s_reg."""
         var local_max = stack_allocation[
             rows_per_thread, Scalar[accum_type]
         ]()
-        for i in range(rows_per_thread):
+        comptime for i in range(rows_per_thread):
             local_max[i] = neg_inf
         comptime for c in range(c_frag_size_qk):
             comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
             local_max[row_idx] = max(local_max[row_idx], s_reg.ptr[c])
-        @parameter
-        for i in range(rows_per_thread):
+        comptime for i in range(rows_per_thread):
             local_max[i] = warp.lane_group_max[num_lanes=4](local_max[i])
-
-        var scale_old = stack_allocation[
-            rows_per_thread, Scalar[accum_type]
-        ]()
-        @parameter
-        for i in range(rows_per_thread):
-            var rmax_new: Scalar[accum_type] = max(local_max[i], rowmax[i])
+            var rmax_new: Scalar[accum_type] = max(
+                local_max[i] * scale_log2, rowmax[i]
+            )
             scale_old[i] = exp2(rowmax[i] - rmax_new)
             rowmax[i] = rmax_new
-            rowsum[i] *= scale_old[i]
-
-        comptime for c in range(c_frag_size_pv):
-            comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
-            o_reg.ptr[c] *= scale_old[row_idx]
 
         var local_sum = stack_allocation[
             rows_per_thread, Scalar[accum_type]
         ]()
-        for i in range(rows_per_thread):
+        comptime for i in range(rows_per_thread):
             local_sum[i] = Scalar[accum_type](0)
         comptime for c in range(c_frag_size_qk):
             comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
-            var p: Scalar[accum_type] = exp2(s_reg.ptr[c] - rowmax[row_idx])
+            var p: Scalar[accum_type] = exp2(
+                s_reg.ptr[c].fma(scale_log2, -rowmax[row_idx])
+            )
             s_reg.ptr[c] = p
             local_sum[row_idx] += p
-        @parameter
-        for i in range(rows_per_thread):
-            rowsum[i] += local_sum[i]
+        comptime for i in range(rows_per_thread):
+            rowsum[i] = rowsum[i] * scale_old[i] + local_sum[i]
 
-        # P: straight indexwise cast (valid for num_m_mmas=1, see top).
+    @parameter
+    @always_inline
+    def pack_p():
         comptime for c in range(c_frag_size_qk):
             p_reg.ptr[c] = s_reg.ptr[c].cast[dtype]()
 
-        mbar_v[stage].wait(phase_v[stage])
-        phase_v[stage] ^= 1
+    @parameter
+    @always_inline
+    def rescale_o():
+        comptime for c in range(c_frag_size_pv):
+            comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
+            o_reg.ptr[c] *= scale_old[row_idx]
 
+    # ---- Prologue: S(0) -> P(0).
+    mbar_q[0].wait(UInt32(0))
+    full[0].wait(UInt32(0))
+    warpgroup_fence(s_reg)
+    wgmma_qk.arrive()
+    wgmma_qk.wgmma[num_warp_groups=NWG, scale_c=0](
+        q_smem, k_tile(0), s_reg, wg
+    )
+    wgmma_qk.commit_group()
+    wgmma_qk.wait_group()
+    warpgroup_fence(s_reg)
+    _ = empty[0].arrive()
+
+    softmax_block()  # rowmax starts at -inf -> scale_old==0, rowsum init
+    pack_p()  # P(0)
+
+    # ---- Main loop: QK(n+1) + PV(n) per iteration.
+    for n_block in range(num_kv_blocks - 1):
+        var k_slot: Int = (2 * (n_block + 1)) % STAGES
+        var k_phase: UInt32 = UInt32(((n_block + 1) // 3) & 1)
+        var v_slot: Int = (2 * n_block + 1) % STAGES
+        var v_phase: UInt32 = UInt32((n_block // 3) & 1)
+
+        # Queue QK(n+1) then PV(n) on the tensor core.
+        full[k_slot].wait(k_phase)
+        warpgroup_fence(s_reg)
+        wgmma_qk.arrive()
+        wgmma_qk.wgmma[num_warp_groups=NWG, scale_c=0](
+            q_smem, k_tile(k_slot), s_reg, wg
+        )
+        wgmma_qk.commit_group()
+
+        full[v_slot].wait(v_phase)
         warpgroup_fence(o_reg)
         wgmma_pv.arrive()
-        wgmma_pv.wgmma(p_reg, v_smem, o_reg)
+        wgmma_pv.wgmma(p_reg, v_tile(v_slot), o_reg)
         wgmma_pv.commit_group()
-        wgmma_pv.wait_group()
+
+        # QK(n+1) retired (PV(n) still running on the tensor core).
+        wgmma_qk.wait_group[1]()
+        warpgroup_fence(s_reg)
+        _ = empty[k_slot].arrive()
+
+        # Softmax of S(n+1) overlaps PV(n).
+        softmax_block()
+
+        # PV(n) retired: p_reg and o_reg are safe to touch.
+        wgmma_pv.wait_group[0]()
         warpgroup_fence(o_reg)
+        _ = empty[v_slot].arrive()
+        pack_p()  # P(n+1)
+        rescale_o()
 
-        # Release this stage's buffers: every thread is past its
-        # wgmma reads before thread 0 reuses them for tile n+2.
-        barrier()
+    # ---- Epilogue: PV(N-1).
+    var last: Int = num_kv_blocks - 1
+    var v_slot_last: Int = (2 * last + 1) % STAGES
+    full[v_slot_last].wait(UInt32((last // 3) & 1))
+    warpgroup_fence(o_reg)
+    wgmma_pv.arrive()
+    wgmma_pv.wgmma(p_reg, v_tile(v_slot_last), o_reg)
+    wgmma_pv.commit_group()
+    wgmma_pv.wait_group[0]()
+    warpgroup_fence(o_reg)
 
-    # ---- rowsum: reduce across the 4 lanes sharing each row, then
-    # normalize with a reciprocal (one div per row, not per element).
+    # ---- Normalize (reciprocal; one div per row) and store.
     var inv_rowsum = stack_allocation[rows_per_thread, Scalar[accum_type]]()
-    @parameter
-    for i in range(rows_per_thread):
+    comptime for i in range(rows_per_thread):
         rowsum[i] = warp.lane_group_sum[num_lanes=4](rowsum[i])
         inv_rowsum[i] = Scalar[accum_type](1) / rowsum[i]
 
@@ -359,11 +413,8 @@ def fwd_fa4_kernel[
         comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
         o_reg.ptr[c] *= inv_rowsum[row_idx]
 
-    # ---- Store O. c-frag walk: col_chunk = c/4, in_chunk = c%4,
-    # row = wg*64 + warp*16 + lane/4 (+8 if bottom),
-    # col = col_chunk*8 + 2*(lane%4) + (in_chunk&1).
-    # in_chunk pairs (0,1) and (2,3) are contiguous columns — store
-    # them as one 2-element vector each.
+    # c-frag walk: col_chunk = c/4, in_chunk = c%4; in_chunk pairs
+    # (0,1) / (2,3) are contiguous columns -> 32-bit paired stores.
     var lane: Int = Int(lane_id())
     var warp_in_wg: Int = Int(warp_id()) % 4
     var lane_group: Int = lane // 4
