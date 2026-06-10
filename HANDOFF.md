@@ -40,11 +40,11 @@ schedule 3035 → v4 warp specialization 2500 → v5 TMA-store epilogue
 ## Backward (bwd_fa4) — state as of 2026-06-10 (fourth session)
 
 Correct (bf16 noise floor vs fp32 autograd at S in {128, 256, 640,
-1024}: dq/dk/dv 1.4-1.8e-3) at **~1.22x FA4** with LOCKED clocks
+1024}: dq/dk/dv 1.4-1.8e-3) at **~1.10-1.13x FA4** with LOCKED clocks
 (`sudo nvidia-smi --lock-gpu-clocks=1500,1500` — DO THIS FIRST,
 unlocked clocks drift ±4-5% run-to-run and drown <3% experiments;
 persistence mode is off so relock per session). Main kernel
-7.42-7.56 ms vs FA4 6.05-6.08; preprocess (167 vs 159 us) and
+6.73-6.83 ms vs FA4 6.04-6.18; preprocess (167 vs 159 us) and
 convert (115 vs 109 us) at parity. Loop:
 `scripts/master_bench.sh --kind bwd`; fast check:
 `scripts/bench_fa4.py --impl mojo --kind bwd --check-only` (covers
@@ -96,40 +96,55 @@ identical: 24x m64n80k16 + 10x m64n128k16):
   swizzle XOR must be applied PER CALL (the 32-B column steps live
   in the swizzled bits; the dS store's 2048-B steps dodge this).
 
-### The remaining ~22%: a compiler-level wall
+### The codegen wall: found and broken (was ~22%, now ~10%)
 
-ncu PC sampling side-by-side (locked clocks): tensor pipe 55 vs
-78%, issue_active 18 vs 26%; the ONLY large stall delta is
-long_scoreboard 5.3 vs 2.3 cyc/issue = consumer LOCAL-memory spill
-reloads. ptxas spills ~160-200 B/thread (`ptxas -v` on the dumped
-PTX shows it; nvdisasm places the LDL/STL inside the consumer hot
-loop). Root cause: FA4/cutlass keeps descriptors, smem addresses
-and loop counters on the UNIFORM datapath (UR registers — a
-separate 63-reg/warp file); mojo+LLVM materializes them in regular
-registers (R2UR storm, ~11%+7% IMAD.MOV of stall samples, plus a
-per-iter S2R SR_TID.X remat), and at the 240-reg cliff (208 f32 of
-live accumulator/fragment data is irreducible) the addressing
-state spills. EIGHT source-level attacks failed (see negative
-results). Realistic paths to parity: (a) mojo/LLVM gaining UR
-allocation, (b) post-processing the PTX before ptxas (no hook in
-compile_function today), (c) finding ~30 regular registers some
-other way nobody has thought of yet.
+The spill mechanism was isolated by a PTX bisection harness
+(`scripts/ptxas_ur_probe.py` — generates toy wgmma-loop PTX in
+varying dataflow shapes, compiles with ptxas, reads back UR
+allocation / R2UR / spills) plus a 2-reader PTX anatomy audit:
 
-RULED OUT — ptxas version (checked 2026-06-10): mojo compiles
-in-process via the statically linked `modular/lib/libNVPTX.so`
-(ptxas 13.1.115; overridable with `MODULAR_NVPTX_COMPILER_PATH` —
-our `__init__.py` auto-points it at the `nvidia-cuda-nvcc-cu12`
-wheel if installed). FA4's cute DSL compiles via its own embedded
-ptxas 12.9.83 inside `_cutlass_ir...so` (the installed lib is the
-libs_base CUDA-12 variant; cubins load via cuModuleLoadData — so
-NEITHER side uses the driver JIT; cubin ELF ABI-version 7 vs 8
-confirms the 12.x/13.x split, and `CUTE_DSL_KEEP=cubin` dumps
-FA4's cubins for inspection). Rebuilding our kernel with ptxas
-12.9.86 (FA4's generation) produced BYTE-IDENTICAL SASS to the
-13.1.115 build — same 55 STL/LDL, same 77 R2UR, same 1608-instr
-mix. The spills/non-uniformization are a property of our PTX's
-dataflow shape, not the ptxas version. Also noted: mojo emits
-`.version 8.5` PTX vs FA4's 8.8 — no observed consequence.
+- ptxas's warp-uniformity analysis was FINE on our PTX: ring
+  counters (even 64-bit selp-wrapped ones), in-loop-recomputed
+  B-descriptors, mbarrier addresses, the magic div-by-80 — all
+  landed in URs. tid>>7 warpgroup indexing, setmaxnreg, mbarrier
+  spins, selp rings, 64-bit imm chains: all uniformity-safe in
+  isolation (probe-verified).
+- The killer was CAPACITY: LLVM hoisted 24 loop-invariant 64-bit
+  A-descriptor k-step variants (S^T/dP^T/dQ^T x 8) into the loop
+  preheader. At ~30 URs already in use they overflow the 63-UR/warp
+  uniform file; ptxas spilled them to LOCAL (164 B) and reloaded +
+  R2UR'd before each HGMMA -> long_scoreboard 5.3 cyc/issue.
+  Probe repro: >=16 live 64-bit descriptors hits the UR cliff;
+  many24 + 180 live f32 = 108 spill B + 40 R2UR (the kernel's exact
+  pathology); 32-bit-root rematerialization = 0/0 at any count.
+- FA4's cute PTX REBUILDS every descriptor every iteration from
+  32-bit `mov.u32 r, <shared symbol>` roots (`.pragma "nounroll"`,
+  3 loop-carried 32-bit scalars total, warp roles made provably
+  uniform via `shfl.sync.idx` lane-0 broadcast). Rematerialization
+  on the uniform datapath is free; LIVENESS is what kills.
+
+Fixes shipped (kernel.mojo, consumer loop top):
+1. Launder the K/V tile pointers through a no-op `mov.b32` inline
+   asm (+ a `warp.broadcast` lane-0 shfl, FA4's uniformity idiom)
+   so LLVM cannot hoist the descriptor variants; they are rebuilt
+   per iteration and ptxas folds them into UIADD3/ULOP3 immediates.
+2. `(x - y) // 2` on Int = SIGNED floor-div = a 17-op rounding
+   correction chain per smem address (10 stmatrix sites). Replaced
+   with `(x >> 1) - (y >> 1)`.
+
+Result: ptxas spills 164 -> 0 B; long_scoreboard 5.33 -> 1.87
+(FA4: 2.28); issue_active 18.1 -> 27.1% (FA4: 26.4); tensor pipe
+55 -> 65.5% (FA4: 77.8). Locked-clock interleaved: main kernel
+6.73-6.83 ms vs FA4 6.04-6.18 = **1.10-1.13x**. ~52 in-loop R2UR
+remain (the laundered roots are asm outputs, which ptxas keeps
+per-thread even after the shfl — possibly because the chains span
+the mbarrier-spin region); measured neutral now that spills are
+gone. The remaining ~10% is instruction-count/mix, not stalls:
+we issue MORE per cycle than FA4 but do more non-tensor work per
+unit of tensor work (e.g. descriptor rebuild ALU, two fence sites,
+the 64-bit index residue). Next levers: 32-bit index discipline
+through the consumer loop, trimming the per-iteration ALU diff
+(master_bench op-mix), and re-examining the 2-stage prefetch depth.
 
 ### Diagnosis methodology that worked
 

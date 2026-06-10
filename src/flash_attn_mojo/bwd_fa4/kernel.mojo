@@ -563,24 +563,26 @@ def bwd_main_kernel[
         # uniform file and spill to local — the long_scoreboard
         # wall; FA4 rematerializes per iteration, ptxas folds the
         # rebuild into UR immediates).
+        # The lane-0 broadcast after the no-op asm is FA4's idiom:
+        # it makes the laundered value PROVABLY warp-uniform to
+        # ptxas, so the rebuilt descriptor chains live fully on the
+        # uniform datapath instead of being R2UR'd per HGMMA.
         var k_lnd: Int32 = inlined_assembly[
             "mov.b32 $0, $1;",
             Int32,
             constraints="=r,r",
             has_side_effect=True,
         ](Int32(Int(k_base)))
-        var k_base_l = k_base + (
-            (Int(k_lnd) >> 1) - (Int(k_base) >> 1)
-        )
+        var k_uni: Int = Int(warp.broadcast(k_lnd))
+        var k_base_l = k_base + ((k_uni >> 1) - (Int(k_base) >> 1))
         var v_lnd: Int32 = inlined_assembly[
             "mov.b32 $0, $1;",
             Int32,
             constraints="=r,r",
             has_side_effect=True,
         ](Int32(Int(v_base)))
-        var v_base_l = v_base + (
-            (Int(v_lnd) >> 1) - (Int(v_base) >> 1)
-        )
+        var v_uni: Int = Int(warp.broadcast(v_lnd))
+        var v_base_l = v_base + ((v_uni >> 1) - (Int(v_base) >> 1))
         var k_smem_l = LayoutTensor[
             dtype,
             kv_smem_layout,
