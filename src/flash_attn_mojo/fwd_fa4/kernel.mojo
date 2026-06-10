@@ -167,7 +167,14 @@ def fwd_fa4_kernel[
     var b_idx: Int = Int(block_idx.z)
     var num_kv_blocks: Int = (seq_len + BN - 1) // BN
 
-    var wgid: Int = Int(thread_idx.x) // 128
+    # shfl-broadcast warpgroup index (the bwd's tid-widening trap:
+    # ptxas's tid-uniformity rule only matches 32-bit shr.u32, and
+    # LLVM re-widens any 32-bit extract; the convergent shfl is
+    # opaque to LLVM and a recognized broadcast to ptxas — without
+    # it every wg-derived descriptor offset costs R2UR per HGMMA).
+    var wgid: Int = Int(
+        warp.broadcast(Int32(Int(thread_idx.x) >> 7))
+    )
 
     if wgid == 0:
         # ================= producer =================
