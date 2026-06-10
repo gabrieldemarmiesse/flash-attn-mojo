@@ -37,7 +37,48 @@ schedule 3035 → v4 warp specialization 2500 → v5 TMA-store epilogue
   (2355 → 2440); reverted. ptxas seems to handle the serial chain
   better than the extra live registers.
 
-## Not yet tried
+## Backward (bwd_fa4) — state as of 2026-06-10
+
+Correct (bf16 noise floor vs fp32 autograd, 2.4e-4 vs FA4 grads) at
+**24.3 ms vs FA4's 6.5 ms (3.77x)**. Loop: `scripts/master_bench.sh
+--kind bwd`; fast check: `scripts/bench_fa4.py --impl mojo --kind
+bwd --check-only`.
+
+Perf journey: 141.8 ms -> 28.5 ms (acquire->relaxed atomics; the
+default `Atomic.fetch_add` ordering emits `atom.acquire` — always
+pass `ordering=RELAXED`, and value-returning `atom` is still slower
+than `red`; the kernel now uses inline-asm
+`red.relaxed.gpu.global.add.v2.f32`) -> 24.3 ms (manual sdS
+addressing instead of LayoutTensor setitem crd2idx, coalesced
+preprocess/convert, smem-staged lse/dpsum prefetched 1 tile ahead,
+deferred wgmma waits, 1 barrier/iter).
+
+Found races worth remembering: (1) the epilogue stages dK/dV into
+the K/V smem areas — wg1 can reach it while wg0's *last* dQ GEMM
+still reads kt_view -> pre-epilogue named barrier required. (2) sdS
+double-buffering alone is not enough without it.
+
+Probes: disabling the whole dQ path (GEMM+wait+atomics) only saves
+~4 ms -> the core S^T/dP^T/softmax/dV/dK loop is itself ~3x too
+slow. Tensor pipe is ~16% busy (FA4: ~53%). The fix is FA4's bwd
+overlap schedule (commit next tile's S^T before processing the
+current softmax, à la fwd v3->v4) + balancing dQ across both
+warpgroups:
+
+- **dQ^T = K^T·dS split over 2 warpgroups needs an mn-major A
+  operand. modular's TensorCoreAsync only does k-major A, but the
+  raw `std.gpu.compute.mma.wgmma_async` exposes `layout_a="col"` —
+  hand-roll the dQ^T GEMM with `_wgmma_descriptor` built the way
+  TensorCoreAsync builds its transpose_b=False B descriptor.** Then
+  dS^T is stored in its NATURAL c-frag orientation (paired stores,
+  no transpose scatter), dq_accum becomes (B,H,D,S) so dQ^T c-frag
+  pairs stay contiguous for red.v2, and convert does a smem-tile
+  transpose.
+- FA4 uses tile_m=80 (m64n80 wgmma) precisely to fit the register
+  budget when everything overlaps; revisit BM after the schedule
+  rework.
+
+## Not yet tried (fwd)
 
 - L2 cache hints on TMA loads (FA4 emits
   `cp.async.bulk.tensor...L2::cache_hint`; our stdlib path emits
