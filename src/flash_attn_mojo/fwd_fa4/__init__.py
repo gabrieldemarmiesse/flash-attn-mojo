@@ -23,19 +23,23 @@ def fa4_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
     softmax_scale: float | None = None,
-) -> torch.Tensor:
-    """Convenience wrapper: allocate out, dispatch, return out.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convenience wrapper: allocate out + lse, dispatch, return both.
 
-    Mirrors ``flash_attn.cute.flash_attn_func(q, k, v)`` (minus the
-    LSE return). q, k, v: (B, L, H, D) bf16 contiguous, D=128,
-    L % 128 == 0.
+    Mirrors ``flash_attn.cute.flash_attn_func(q, k, v)``: returns
+    (out, lse) with lse (B, H, L) fp32 natural-log row LSE (what the
+    backward consumes). q, k, v: (B, L, H, D) bf16 contiguous,
+    D=128, L % 128 == 0.
     """
     batch, seqlen, nheads, head_dim = q.shape
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     out = torch.empty_like(q)
-    native_fwd_fa4(q, k, v, out, softmax_scale)
-    return out
+    lse = torch.empty(
+        (batch, nheads, seqlen), dtype=torch.float32, device=q.device
+    )
+    native_fwd_fa4(q, k, v, out, lse, softmax_scale)
+    return out, lse
 
 
 def native_fwd_fa4(
@@ -43,6 +47,7 @@ def native_fwd_fa4(
     k: torch.Tensor,
     v: torch.Tensor,
     out: torch.Tensor,
+    lse: torch.Tensor,
     softmax_scale: float,
 ) -> None:
     """JIT-compile (if needed) and dispatch a single fwd call."""
@@ -55,6 +60,8 @@ def native_fwd_fa4(
     assert k.shape == q.shape and v.shape == q.shape, "Hq must equal Hk in v1"
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     assert out.is_contiguous()
+    assert lse.shape == (batch, nheads, seqlen) and lse.dtype == torch.float32
+    assert lse.is_contiguous()
 
     call_fwd_fa4(
         (
@@ -62,6 +69,7 @@ def native_fwd_fa4(
             k.data_ptr(),
             v.data_ptr(),
             out.data_ptr(),
+            lse.data_ptr(),
             batch,
             seqlen,
             nheads,

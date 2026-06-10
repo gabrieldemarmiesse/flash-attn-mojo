@@ -34,7 +34,7 @@ straight indexwise cast is correct. (With >1 m_mma it would not be:
 the RS wgmma walks fragments k-major, `a_frags[m + k*num_m]`.)
 """
 
-from std.math import exp2
+from std.math import exp2, log
 from std.math.constants import log2e
 from std.sys import size_of
 from std.utils.index import StaticTuple, IndexList
@@ -43,6 +43,7 @@ from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     barrier,
     block_idx,
+    grid_dim,
     lane_id,
     thread_idx,
     warp_id,
@@ -102,6 +103,7 @@ def fwd_fa4_kernel[
     k_tma: TMATensorTile[dtype, 3, kv_tile_shape, kv_desc_shape],
     v_tma: TMATensorTile[dtype, 3, kv_tile_shape, kv_desc_shape],
     o_tma: TMATensorTile[dtype, 3, o_tile_shape, o_desc_shape],
+    lse_ptr: UnsafePointer[Float32, MutAnyOrigin],
     seq_len: Int,
     softmax_scale: Float32,
 ):
@@ -492,6 +494,21 @@ def fwd_fa4_kernel[
         (
             o_smem.ptr + col_chunk * (BM * 8) + row * 8 + 2 * lane_pair
         ).store[width=2, alignment=4](pair)
+
+    # ---- LSE (natural log), one f32 per row: rowmax is kept in the
+    # scaled log2 domain (max*scale*log2e) and rowsum is already
+    # row-reduced, so lse = rowmax*ln2 + ln(rowsum). lane_pair 0
+    # writes its thread's two rows; (B, H, S) f32, grid.y == nheads.
+    if lane_pair == 0:
+        var lse_row_base: Int = (
+            b_idx * Int(grid_dim.y) + h_idx
+        ) * seq_len + m_block * BM
+        comptime LN2: Scalar[accum_type] = 0.6931471805599453
+        comptime for i in range(rows_per_thread):
+            var r: Int = row_warp_base + lane_group + 8 * i
+            (lse_ptr + lse_row_base + r)[0] = (
+                rowmax[i] * LN2 + log(rowsum[i])
+            ).cast[DType.float32]()
 
     fence_async_view_proxy()
     # Producer warpgroup may have exited -> consumer-only barrier.

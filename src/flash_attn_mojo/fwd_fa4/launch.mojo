@@ -53,6 +53,7 @@ def launch_fwd_fa4[
     k_addr: Int,
     v_addr: Int,
     o_addr: Int,
+    lse_addr: Int,
     o_b_stride: Int,
     o_l_stride: Int,
     o_h_stride: Int,
@@ -87,6 +88,9 @@ def launch_fwd_fa4[
     )
     var v_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=v_addr
+    )
+    var lse_ptr = UnsafePointer[Float32, MutAnyOrigin](
+        unsafe_from_address=lse_addr
     )
     var o_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
         unsafe_from_address=o_addr
@@ -147,6 +151,7 @@ def launch_fwd_fa4[
             k_tma,
             v_tma,
             o_tma,
+            lse_ptr,
             seqlen_int,
             softmax_scale,
             grid_dim=grid,
@@ -160,6 +165,7 @@ def launch_fwd_fa4[
             k_tma,
             v_tma,
             o_tma,
+            lse_ptr,
             seqlen_int,
             softmax_scale,
             grid_dim=grid,

@@ -42,8 +42,7 @@ def _fa4_fwd_fn():
     from flash_attn.cute import flash_attn_func
 
     def run(q, k, v):
-        out, _lse = flash_attn_func(q, k, v)
-        return out
+        return flash_attn_func(q, k, v, return_lse=True)  # (out, lse)
 
     return run
 
@@ -62,7 +61,7 @@ def _get_step(impl: str, kind: str, q, k, v, dout):
         def step():
             out_holder["out"] = run(q, k, v)
 
-        return step, lambda: (out_holder["out"],)
+        return step, lambda: out_holder["out"]  # (out, lse)
 
     # bwd: produce out/lse once with FA4's fwd (identical inputs for
     # both impls); time only the bwd path.
@@ -108,10 +107,19 @@ def _check_small(impl: str, kind: str, D: int, seqlen: int = 512) -> None:
     if kind == "fwd":
         step, outputs = _get_step(impl, "fwd", qs, ks, vs, None)
         step()
-        d = (outputs()[0].float() - _sdpa_fp32(qs, ks, vs)).abs().max().item()
+        out, lse = outputs()
+        d = (out.float() - _sdpa_fp32(qs, ks, vs)).abs().max().item()
+        scale = qs.shape[-1] ** -0.5
+        ref_lse = torch.logsumexp(
+            torch.einsum(
+                "bshd,bthd->bhst", qs.float(), ks.float()
+            ) * scale,
+            dim=-1,
+        )
+        dl = (lse.float() - ref_lse).abs().max().item()
         print(
             f"CHECK impl={impl} kind=fwd S={seqlen} "
-            f"small_vs_fp32_sdpa_maxdiff={d:.3e}"
+            f"small_vs_fp32_sdpa_maxdiff={d:.3e} lse_maxdiff={dl:.3e}"
         )
         return
     dos = torch.randn_like(qs)

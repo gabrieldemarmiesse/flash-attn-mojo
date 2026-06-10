@@ -32,7 +32,7 @@ def call_fwd_fa4(args: tuple) -> None:
     """JIT-compile (if needed) and dispatch a single fwd call.
 
     ``args`` layout (see ``fwd_fa4/__init__.py::native_fwd_fa4``):
-        0..3   q_addr, k_addr, v_addr, o_addr
+        0..4   q_addr, k_addr, v_addr, o_addr, lse_addr
         4..6   batch, seqlen, nheads
         7      softmax_scale
         8..10  o_b_stride, o_l_stride, o_h_stride
@@ -47,9 +47,9 @@ def call_fwd_fa4(args: tuple) -> None:
 
 
 def _config_from_args(args: tuple) -> tuple:
-    dtype_code = args[12]
-    head_dim = args[13]
-    use_external_stream = bool(args[14])
+    dtype_code = args[13]
+    head_dim = args[14]
+    use_external_stream = bool(args[15])
     dump_ptx = os.environ.get("MOJO_DUMP_PTX", "")
     return (dtype_code, head_dim, use_external_stream, dump_ptx)
 
