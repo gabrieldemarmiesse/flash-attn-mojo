@@ -57,7 +57,7 @@ from std.gpu.memory import (
     external_memory,
     fence_async_view_proxy,
 )
-from std.gpu.sync import named_barrier
+from std.gpu.sync import named_barrier, syncwarp
 from std.memory import stack_allocation
 
 from std.gpu.compute.mma import wgmma_async
@@ -191,8 +191,12 @@ def bwd_main_kernel[
     # lse_log2/dpsum smem ring: 2 stages x BM f32 each, prefetched
     # one m-tile ahead (consumer threads issue the gmem loads; the
     # per-iter named barrier orders store->read across warpgroups).
+    # lse_log2/dpsum ride the Q pipeline (FA4's sLSE design): one
+    # BM-f32 buffer per Q/dO slot pair, filled by the producer warp
+    # and published by the Q slot's full barrier (init(2): TMA
+    # expect + producer arrive); recycled with the slot's empties.
     var lse_smem = (sds_base + 2 * sds_size).bitcast[Float32]()
-    var dps_smem = lse_smem + 2 * BM
+    var dps_smem = lse_smem + (STAGES // 2) * BM
 
     var k_smem = LayoutTensor[
         dtype,
@@ -238,7 +242,9 @@ def bwd_main_kernel[
         mbar_k[0].init()
         mbar_v[0].init()
         comptime for s in range(STAGES):
-            full[s].init(1)
+            # Even (Q) slots: TMA expect-arrive + producer-warp
+            # arrive after staging lse/dps.
+            full[s].init(2 if s % 2 == 0 else 1)
             empty[s].init(Int32(NWG * 128))
     barrier()
 
@@ -253,42 +259,73 @@ def bwd_main_kernel[
     if wgid == 0:
         # ================= producer =================
         warpgroup_reg_dealloc[NUM_PRODUCER_REGS]()
-        if thread_idx.x == 0:
-            mbar_k[0].expect_bytes(Int32(BN * D * size_of[dtype]()))
-            k_tma.async_copy_3d(k_smem, mbar_k[0], (0, h_idx, kv_row))
-            mbar_v[0].expect_bytes(Int32(BN * D * size_of[dtype]()))
-            v_tma.async_copy_3d(v_smem, mbar_v[0], (0, h_idx, kv_row))
+        if thread_idx.x < 32:
+            var lane: Int = Int(thread_idx.x)
+            if lane == 0:
+                mbar_k[0].expect_bytes(Int32(BN * D * size_of[dtype]()))
+                k_tma.async_copy_3d(k_smem, mbar_k[0], (0, h_idx, kv_row))
+                mbar_v[0].expect_bytes(Int32(BN * D * size_of[dtype]()))
+                v_tma.async_copy_3d(v_smem, mbar_v[0], (0, h_idx, kv_row))
 
             var slot: Int = 0
             var phase: UInt32 = 0
             var wrap: Int = 0
             var q_row: Int = b_idx * seq_len
+            var lse_row: Int = (
+                b_idx * Int(grid_dim.y) + h_idx
+            ) * seq_len
             for _ in range(num_m_blocks):
                 empty[slot].wait(phase)
-                var q_st = LayoutTensor[
-                    dtype,
-                    q_smem_layout,
-                    MutAnyOrigin,
-                    address_space=AddressSpace.SHARED,
-                    alignment=128,
-                ](ring_base + slot * q_slot_size)
-                full[slot].expect_bytes(Int32(BM * D * size_of[dtype]()))
-                q_tma.async_copy_3d(q_st, full[slot], (0, h_idx, q_row))
+                if lane == 0:
+                    var q_st = LayoutTensor[
+                        dtype,
+                        q_smem_layout,
+                        MutAnyOrigin,
+                        address_space=AddressSpace.SHARED,
+                        alignment=128,
+                    ](ring_base + slot * q_slot_size)
+                    full[slot].expect_bytes(
+                        Int32(BM * D * size_of[dtype]())
+                    )
+                    q_tma.async_copy_3d(
+                        q_st, full[slot], (0, h_idx, q_row)
+                    )
+                # Stage this tile's lse_log2/dpsum (2 f32 each per
+                # lane) into the slot-pair's buffer, then publish via
+                # the Q slot's second arrival.
+                var lse_buf = lse_smem + (slot // 2) * BM
+                var dps_buf = dps_smem + (slot // 2) * BM
+                comptime for j in range(BM // 64):
+                    var idx: Int = j * 64 + lane * 2
+                    (lse_buf + idx).store[width=2](
+                        (lse_log2_ptr + lse_row + idx).load[width=2]()
+                    )
+                    (dps_buf + idx).store[width=2](
+                        (dpsum_ptr + lse_row + idx).load[width=2]()
+                    )
+                fence_async_view_proxy()
+                syncwarp()
+                if lane == 0:
+                    _ = full[slot].arrive()
 
                 empty[slot + 1].wait(phase)
-                var do_st = LayoutTensor[
-                    dtype,
-                    q_smem_layout,
-                    MutAnyOrigin,
-                    address_space=AddressSpace.SHARED,
-                    alignment=128,
-                ](ring_base + (slot + 1) * q_slot_size)
-                full[slot + 1].expect_bytes(
-                    Int32(BM * D * size_of[dtype]())
-                )
-                do_tma.async_copy_3d(do_st, full[slot + 1], (0, h_idx, q_row))
+                if lane == 0:
+                    var do_st = LayoutTensor[
+                        dtype,
+                        q_smem_layout,
+                        MutAnyOrigin,
+                        address_space=AddressSpace.SHARED,
+                        alignment=128,
+                    ](ring_base + (slot + 1) * q_slot_size)
+                    full[slot + 1].expect_bytes(
+                        Int32(BM * D * size_of[dtype]())
+                    )
+                    do_tma.async_copy_3d(
+                        do_st, full[slot + 1], (0, h_idx, q_row)
+                    )
 
                 q_row += BM
+                lse_row += BM
                 slot += 2
                 wrap += 1
                 if wrap == 3:
@@ -401,14 +438,6 @@ def bwd_main_kernel[
     var q_base: Int = 0
     var sds_stage: Int = 0
 
-    # Prologue prefetch of tile 0's lse_log2/dpsum into stage 0.
-    var ctid: Int = Int(thread_idx.x) - 128
-    if ctid < BM:
-        lse_smem[ctid] = (lse_log2_ptr + bh_row_base + ctid)[0]
-    elif ctid < 2 * BM:
-        dps_smem[ctid - BM] = (dpsum_ptr + bh_row_base + ctid - BM)[0]
-    named_barrier[Int32(NWG * 128)](Int32(4))
-
     for _ in range(num_m_blocks):
         var q_view = LayoutTensor[
             dtype,
@@ -439,22 +468,24 @@ def bwd_main_kernel[
             alignment=128,
         ](ring_base + (slot + 1) * q_slot_size)
 
-        # lse_log2/dpsum for this tile from the prefetched smem
-        # stage (no gmem latency in the softmax dependency chain).
-        var lds_stage_off: Int = sds_stage * BM
+        # S^T = K · Q^T
+        full[slot].wait(phase)
+
+        # lse_log2/dpsum for this tile (published with the Q slot).
         var lse_vals = stack_allocation[16, Scalar[accum_type]]()
         var dps_vals = stack_allocation[16, Scalar[accum_type]]()
         comptime for cc in range(BM // 8):  # 8 col chunks
             var col: Int = cc * 8 + 2 * lane_pair
-            var lp2 = (lse_smem + lds_stage_off + col).load[width=2]()
-            var dp2 = (dps_smem + lds_stage_off + col).load[width=2]()
+            var lp2 = (
+                lse_smem + (slot // 2) * BM + col
+            ).load[width=2]()
+            var dp2 = (
+                dps_smem + (slot // 2) * BM + col
+            ).load[width=2]()
             lse_vals[cc * 2] = lp2[0]
             lse_vals[cc * 2 + 1] = lp2[1]
             dps_vals[cc * 2] = dp2[0]
             dps_vals[cc * 2 + 1] = dp2[1]
-
-        # S^T = K · Q^T
-        full[slot].wait(phase)
         warpgroup_fence(s_reg)
         wgmma_sdp.arrive()
         wgmma_sdp.wgmma[num_warp_groups=NWG, scale_c=0](
@@ -506,12 +537,6 @@ def bwd_main_kernel[
         comptime for c in range(c_frag_sdp):
             ds_reg.ptr[c] = dp_reg.ptr[c].cast[dtype]()
 
-        # dK += dS^T · Q
-        warpgroup_fence(dk_acc)
-        wgmma_dkv.arrive()
-        wgmma_dkv.wgmma(ds_reg, qt_view, dk_acc)
-        wgmma_dkv.commit_group()
-
         # Stage dS^T in its natural (kv row, q col) orientation with
         # the 128B swizzle. The hardware computes the swizzle XOR
         # from the *absolute* smem address ((addr>>7)&7), and the
@@ -535,19 +560,6 @@ def bwd_main_kernel[
                 ds_reg.ptr[2 * c2], ds_reg.ptr[2 * c2 + 1]
             )
             (sds_stage_base + off).store[width=2, alignment=4](pair)
-
-        # Prefetch the next tile's lse_log2/dpsum into the other
-        # smem stage (ordered before next iter's reads by the
-        # barrier below).
-        if q_base + BM < seq_len:
-            var nb: Int = bh_row_base + q_base + BM
-            var nst: Int = (1 - sds_stage) * BM
-            if ctid < BM:
-                lse_smem[nst + ctid] = (lse_log2_ptr + nb + ctid)[0]
-            elif ctid < 2 * BM:
-                dps_smem[nst + ctid - BM] = (
-                    dpsum_ptr + nb + ctid - BM
-                )[0]
 
         fence_async_view_proxy()
         # Single per-iter barrier: proves both warpgroups wrote this
@@ -586,17 +598,21 @@ def bwd_main_kernel[
             )
         wgmma_sdp.commit_group()
 
-        # dV+dK retired (dQ^T may still run); release the ring.
+        # dK += dS^T · Q — committed AFTER dQ (FA4's order) so the
+        # dQ drain below overlaps the dK GEMM on the tensor core.
+        warpgroup_fence(dk_acc)
+        wgmma_dkv.arrive()
+        wgmma_dkv.wgmma(ds_reg, qt_view, dk_acc)
+        wgmma_dkv.commit_group()
+
+        # Queue [dV, dQ, dK]: wait ≤1 retires dV and dQ; dK still
+        # runs while we drain dQ. dO(n) consumed by dV -> release.
         wgmma_dkv.wait_group[1]()
         warpgroup_fence(dv_acc)
-        warpgroup_fence(dk_acc)
-        _ = empty[slot].arrive()
+        warpgroup_fence(dq_reg)
         _ = empty[slot + 1].arrive()
 
-        # dQ^T retired -> drain to dq_accum (B,H,D,S): row = d dim,
-        # col = q; pairs adjacent in q are contiguous -> red.v2.f32.
-        wgmma_sdp.wait_group[0]()
-        warpgroup_fence(dq_reg)
+        # Drain dQ^T to dq_accum (B,H,D,S) under the dK GEMM.
         comptime for c2 in range(c_frag_dq // 2):
             comptime cc: Int = c2 // 2
             comptime bot: Int = c2 % 2
@@ -619,6 +635,11 @@ def bwd_main_kernel[
                 dq_reg.ptr[2 * c2],
                 dq_reg.ptr[2 * c2 + 1],
             )
+
+        # dK retired -> Q(n) slot reusable.
+        wgmma_dkv.wait_group[0]()
+        warpgroup_fence(dk_acc)
+        _ = empty[slot].arrive()
 
         sds_stage ^= 1
         q_base += BM

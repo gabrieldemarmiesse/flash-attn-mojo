@@ -171,7 +171,7 @@ def launch_bwd_main[
     comptime sds_bytes: Int = kBwdBlockM * kBwdBlockN * size_of[dtype]()
     comptime mbar_bytes: Int = 256
     # + 2-stage lse_log2/dpsum staging ring (2 x 2 x BM f32).
-    comptime lse_dps_bytes: Int = 2 * 2 * kBwdBlockM * 4
+    comptime lse_dps_bytes: Int = 2 * (kBwdQdOStages // 2) * kBwdBlockM * 4
     comptime smem_bytes: Int = (
         2 * kv_bytes
         + kBwdQdOStages * q_slot_bytes
