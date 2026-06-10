@@ -5,20 +5,22 @@ Three kernels, mirroring FA4's pipeline:
 1. `bwd_preprocess_kernel`: dpsum = rowsum(dO * O) (fp32),
    lse_log2 = lse * log2(e), and zero dq_accum.
 2. `bwd_main_kernel`: grid over KV tiles. Each block TMA-loads its
-   K/V tile once, then loops over Q tiles (BM=64 rows), streaming
-   Q/dO through a 6-slot smem ring filled by a producer warpgroup.
-   Per m-tile, the 2 MMA warpgroups (each owning 64 of the 128 KV
-   rows) compute, in scaled-log2 domain:
+   K/V tile once, then loops over Q tiles (BM=80 rows, FA4's
+   tile_m), streaming Q/dO through a 4-slot smem ring (2 stages
+   each) filled by a producer warpgroup. Per m-tile, the 2 MMA
+   warpgroups (each owning 64 of the 128 KV rows) compute, in
+   scaled-log2 domain:
 
-       S^T  = K · Q^T            (wgmma SS, m64n64k16, swapAB)
-       dP^T = V · dO^T           (wgmma SS, m64n64k16, swapAB)
+       S^T  = K · Q^T            (wgmma SS, m64n80k16, swapAB)
+       dP^T = V · dO^T           (wgmma SS, m64n80k16, swapAB)
        P^T  = exp2(S^T*scale_log2 - lse_log2[col])
-       dV  += P^T · dO           (wgmma RS, m64n128k16)
+       dV  += P^T · dO           (wgmma RS, m64n128k16, 5 k-steps)
        dS^T = P^T * (dP^T - dpsum[col])
-       dK  += dS^T · Q           (wgmma RS, m64n128k16)
-       sdS  = dS (transposed store to smem, k-major (BM, BN))
-       dQ  += dS · K             (hand-rolled wgmma, m64n64k16,
-                                  split m64 per warpgroup)
+       dK  += dS^T · Q           (wgmma RS, m64n128k16, 5 k-steps)
+       sdS  = dS (stmatrix.x4.trans into a k-major (BM, BN) SW128
+                  tile — FA4's staging; wg w writes kv-slab w)
+       dQ^T = K^T · dS           (hand-rolled wgmma, m64n80k16,
+                                  trans(1,0), split m64 per wg)
        dQ c-frag -> smem mailbox; a producer warp drains it to
        dq_accum via cp.reduce.async.bulk (FA4's design).
 
@@ -30,16 +32,20 @@ P^T / dS^T c-frag -> RS a-frag: straight indexwise cast (valid at
 num_m_mmas=1, same argument as the fwd kernel).
 
 dq_accum is an OPAQUE fragment dump (FA4's trick): per m-block of
-BM rows, a contiguous [wg(2)][chunk(8)][tid(128)][4] f32 region —
-the raw dQ^T wgmma c-frags, bulk-reduce-added linearly. Element
-(wg, ch, t, e) is dQ^T row d = wg*64 + (t/32)*16 + (t%32)/4 +
-8*(e/2), col q = ch*8 + 2*(t%4) + e%2. The convert kernel decodes.
-dpsum/lse_log2 are (B, H, S) fp32. All q/k/v/o/do/dq/dk/dv tensors
-are contiguous (B, S, H, D) bf16.
+BM rows, a contiguous [wg(2)][chunk(BM/8=10)][tid(128)][4] f32
+region — the raw dQ^T wgmma c-frags, bulk-reduce-added linearly.
+Element (wg, ch, t, e) is dQ^T row d = wg*64 + (t/32)*16 +
+(t%32)/4 + 8*(e/2), col q = ch*8 + 2*(t%4) + e%2. The convert
+kernel decodes. dpsum/lse_log2 are (B, H, Spad) fp32 with
+Spad = ceil(S/BM)*BM (pad rows: lse=+inf, dpsum=0, so the tail
+m-tile's P and dS vanish; the tail's TMA Q/dO reads are zero-fill
+or finite next-batch garbage, both annihilated by P=dS=0). All
+q/k/v/o/do/dq/dk/dv tensors are contiguous (B, S, H, D) bf16.
 """
 
 from std.math import exp2
 from std.math.constants import log2e
+from std.utils.numerics import inf
 from std.sys import size_of
 from std.utils.index import StaticTuple, IndexList
 
@@ -69,9 +75,9 @@ from std.gpu.sync import (
     named_barrier_arrive,
     syncwarp,
 )
-from std.memory import stack_allocation
+from std.memory import bitcast, stack_allocation
 
-from std.gpu.compute.mma import wgmma_async
+from std.gpu.compute.mma import st_matrix, wgmma_async
 
 from layout import Layout, LayoutTensor
 from layout.tensor_core_async import (
@@ -169,16 +175,18 @@ def bwd_main_kernel[
     comptime qt_view_layout = tile_layout_mn_major[
         dtype, D, BM, swizzle_mode=swizzle
     ]()
-    # dS^T staged in its natural (BN rows, BM cols) orientation with
-    # the 128B swizzle (BM=64 bf16 cols = exactly one swizzle row).
-    # Viewed mn-major (BM, BN) it is the B operand of the hand-rolled
-    # dQ^T GEMM below (same trick as fwd's V tile).
-    comptime sds_b_layout = tile_layout_mn_major[
+    # dS staged in FA4's orientation: a k-major (BM q-rows, BN
+    # kv-cols) SW128 tile — same layout family as the Q slots, two
+    # 64-col slabs of BM*64 elems; MMA wg w writes slab w via
+    # stmatrix.x4.trans. It is the B operand (k = BN, n = BM) of the
+    # hand-rolled dQ^T GEMM below, trans-b = 0.
+    comptime sds_layout = tile_layout_k_major[
         dtype, BM, BN, swizzle_mode=swizzle
     ]()
     comptime sds_canonical = tile_to_descriptor[
-        dtype, sds_b_layout, False
+        dtype, sds_layout, True
     ]()
+    comptime sds_slab_bytes: Int = BM * 64 * size_of[dtype]()
     # A operand of dQ^T = K^T (D, BN) = the mn-major view of K's
     # bytes. TensorCoreAsync only supports k-major A, so the dQ^T
     # GEMM is hand-rolled with raw wgmma_async[layout_a="col"].
@@ -192,8 +200,6 @@ def bwd_main_kernel[
         kt_stride01 * (WGMMA_M // kt_shape00) * size_of[dtype]()
     )
     comptime a_k_stride: Int = kt_stride11 * 2 * size_of[dtype]()
-    comptime sds_stride11: Int = sds_canonical[1].stride[1].value()
-    comptime b_k_stride: Int = sds_stride11 * 2 * size_of[dtype]()
 
     comptime kv_tile_size: Int = BN * D
     comptime q_slot_size: Int = BM * D
@@ -221,11 +227,11 @@ def bwd_main_kernel[
     var lse_smem = (sds_base + 2 * sds_size).bitcast[Float32]()
     var dps_smem = lse_smem + (STAGES // 2) * BM
     # dQ mailbox (FA4): per MMA wg, the raw dQ^T c-frag dump
-    # [chunk(8)][tid(128)][4] f32 = 16 KiB; the producer's drain
+    # [chunk(BM/8)][tid(128)][4] f32 = 20 KiB; the producer's drain
     # warp cp.reduce.async.bulk's it into dq_accum. Named-barrier
     # protocol per wg (count 128 + 32): empty 9+wg (drain arrives,
     # wg syncs), full 6+wg (wg arrives, drain syncs).
-    comptime DQ_MAIL_F32: Int = WGMMA_M * BM  # 4096 (64 d x 64 q)
+    comptime DQ_MAIL_F32: Int = WGMMA_M * BM  # 5120 (64 d x 80 q)
     comptime DRAIN_BAR: Int = 128 + 32
     var dq_mail = dps_smem + (STAGES // 2) * BM
 
@@ -282,7 +288,7 @@ def bwd_main_kernel[
     var n_block: Int = Int(block_idx.x)
     var h_idx: Int = Int(block_idx.y)
     var b_idx: Int = Int(block_idx.z)
-    var num_m_blocks: Int = seq_len // BM
+    var num_m_blocks: Int = (seq_len + BM - 1) // BM
     var kv_row: Int = b_idx * seq_len + n_block * BN
 
     var wgid: Int = Int(thread_idx.x) // 128
@@ -341,7 +347,7 @@ def bwd_main_kernel[
                 q_row += BM
                 slot += 2
                 wrap += 1
-                if wrap == 3:
+                if wrap == STAGES // 2:
                     wrap = 0
                     slot = 0
                     phase ^= 1
@@ -351,7 +357,7 @@ def bwd_main_kernel[
             # ---- dQ drain warp (FA4's design). Per m-tile: signal
             # each wg's mailbox empty once its previous bulk reduce
             # finished *reading* smem (wait_group.read), sync the
-            # full barrier, then one lane bulk-reduce-adds the 16
+            # full barrier, then one lane bulk-reduce-adds the 20
             # KiB fragment dump into dq_accum. Two outstanding bulk
             # groups (one per wg) at steady state.
             var lane_d: Int = Int(lane_id())
@@ -389,21 +395,28 @@ def bwd_main_kernel[
             var slot: Int = 0
             var phase: UInt32 = 0
             var wrap: Int = 0
+            # lse_log2/dpsum are (B, H, Spad): padded to a multiple
+            # of BM (pad rows: +inf / 0, written by preprocess).
             var lse_row: Int = (
                 b_idx * Int(grid_dim.y) + h_idx
-            ) * seq_len
+            ) * (num_m_blocks * BM)
             for _ in range(num_m_blocks):
                 empty[slot].wait(phase)
                 var lse_buf = lse_smem + (slot // 2) * BM
                 var dps_buf = dps_smem + (slot // 2) * BM
-                comptime for j in range(BM // 64):
+                comptime for j in range((BM + 63) // 64):
                     var idx: Int = j * 64 + lane_s * 2
-                    (lse_buf + idx).store[width=2](
-                        (lse_log2_ptr + lse_row + idx).load[width=2]()
-                    )
-                    (dps_buf + idx).store[width=2](
-                        (dpsum_ptr + lse_row + idx).load[width=2]()
-                    )
+                    if idx < BM:
+                        (lse_buf + idx).store[width=2](
+                            (lse_log2_ptr + lse_row + idx).load[
+                                width=2
+                            ]()
+                        )
+                        (dps_buf + idx).store[width=2](
+                            (dpsum_ptr + lse_row + idx).load[
+                                width=2
+                            ]()
+                        )
                 fence_async_view_proxy()
                 syncwarp()
                 if lane_s == 0:
@@ -411,7 +424,7 @@ def bwd_main_kernel[
                 lse_row += BM
                 slot += 2
                 wrap += 1
-                if wrap == 3:
+                if wrap == STAGES // 2:
                     wrap = 0
                     slot = 0
                     phase ^= 1
@@ -507,10 +520,6 @@ def bwd_main_kernel[
         softmax_scale * Scalar[DType.float32](log2e)
     ).cast[accum_type]()
 
-    # Per-(b,h) row base for lse_log2 / dpsum ((B, H, S) fp32);
-    # grid_dim.y == nheads.
-    var bh_row_base: Int = (b_idx * Int(grid_dim.y) + h_idx) * seq_len
-
     # ---- consumer state.
     mbar_k[0].wait(UInt32(0))
     mbar_v[0].wait(UInt32(0))
@@ -577,10 +586,16 @@ def bwd_main_kernel[
         wgmma_sdp.wait_group[1]()
         warpgroup_fence(s_reg)
 
-        # P^T = exp2(S^T * scale_log2 - lse_log2[q col]); P kept in
-        # f32 in s_reg, packed bf16 into p_reg.
+        # P^T = exp2(S^T * scale_log2 - lse_log2[q col]), f32 in
+        # s_reg. NOT packed to bf16 yet: FA4's order computes dS
+        # first, then packs P and dS together — that keeps the f32
+        # P (40) and bf16 P (20) from being live simultaneously at
+        # the register-pressure peak (the difference between
+        # fitting setmaxnreg 240 and ~200 B of ptxas spills).
         comptime for cc in range(c_frag_sdp // 4):
-            var lp2 = (lse_smem + stat_col + cc * 8).load[width=2]()
+            var lp2 = (lse_smem + stat_col + cc * 8).load[
+                width=2, alignment=8
+            ]()
             comptime for ic in range(4):
                 comptime c: Int = cc * 4 + ic
                 comptime j: Int = c & 1
@@ -590,58 +605,81 @@ def bwd_main_kernel[
                     s_reg.ptr[c] = exp2(
                         s_reg.ptr[c].fma(scale_log2, -lp2[j])
                     )
-        comptime for c in range(c_frag_sdp):
-            p_reg.ptr[c] = s_reg.ptr[c].cast[dtype]()
 
-        # dV += P^T · dO
+        # dP^T retired (wait 0: nothing else in flight — FA4's
+        # sequence; dV is committed after the dS store).
+        wgmma_sdp.wait_group[0]()
+        warpgroup_fence(dp_reg)
+
+        # dS^T = P^T * (dP^T - dpsum[q col])
+        comptime for cc in range(c_frag_sdp // 4):
+            var dp2 = (dps_smem + stat_col + cc * 8).load[
+                width=2, alignment=8
+            ]()
+            comptime for ic in range(4):
+                comptime c: Int = cc * 4 + ic
+                comptime j: Int = c & 1
+                dp_reg.ptr[c] = s_reg.ptr[c] * (dp_reg.ptr[c] - dp2[j])
+        # Pairwise f32 -> bf16x2 packing (cvt.rn.bf16x2.f32); the
+        # f32 P and dP frags die here.
+        comptime for c2 in range(c_frag_sdp // 2):
+            var pp = SIMD[accum_type, 2](
+                s_reg.ptr[2 * c2], s_reg.ptr[2 * c2 + 1]
+            ).cast[dtype]()
+            p_reg.ptr[2 * c2] = pp[0]
+            p_reg.ptr[2 * c2 + 1] = pp[1]
+        comptime for c2 in range(c_frag_sdp // 2):
+            var dsp = SIMD[accum_type, 2](
+                dp_reg.ptr[2 * c2], dp_reg.ptr[2 * c2 + 1]
+            ).cast[dtype]()
+            ds_reg.ptr[2 * c2] = dsp[0]
+            ds_reg.ptr[2 * c2 + 1] = dsp[1]
+
+        # Stage dS in FA4's k-major (q row, kv col) SW128 tile via 5
+        # stmatrix.x4.trans per thread (each call: 16 q rows x this
+        # warp's 16 kv cols, in this wg's 64-col slab; data = c-frag
+        # bf16 pairs 8i..8i+7 in order — FA4's exact scheme, PTX
+        # lines 716-781/1606-1611). The 128B swizzle XOR is taken
+        # from the ABSOLUTE smem address (addr ^ ((addr>>3)&112)),
+        # which folds the dynamic-smem base phase in for free; the
+        # XOR term is invariant across i (i steps 2048 B = 16 lines).
+        var sds_stage_base = sds_base + sds_stage * sds_size
+        comptime if not PROBE_NO_DQ:
+            var t_wg: Int = tid_in_wg
+            var sds_elems: Int = (
+                (t_wg % 8) * 64
+                + ((t_wg // 8) % 2) * 8
+                + ((t_wg // 16) % 2) * 512
+                + ((t_wg // 32) % 4) * 16
+                + wg * (BM * 64)
+            )
+            var sds_ba: Int = Int(sds_stage_base) + 2 * sds_elems
+            var sds_sw: Int = sds_ba ^ ((sds_ba >> 3) & 112)
+            var sds_ptr = sds_stage_base + (
+                sds_sw - Int(sds_stage_base)
+            ) // 2
+            comptime for i in range(c_frag_sdp // 8):
+                var packed = SIMD[DType.float32, 4](0)
+                comptime for jm in range(4):
+                    packed[jm] = bitcast[DType.float32, 1](
+                        SIMD[dtype, 2](
+                            ds_reg.ptr[8 * i + 2 * jm],
+                            ds_reg.ptr[8 * i + 2 * jm + 1],
+                        )
+                    )
+                st_matrix[simd_width=4, transpose=True](
+                    sds_ptr + i * 1024, packed
+                )
+
+        # dV += P^T · dO — committed after the dS store (FA4's
+        # order; see the register-pressure note above). The wgmma
+        # runs under the PdS barrier wait below.
         warpgroup_fence(dv_acc)
         wgmma_dkv.arrive()
         wgmma_dkv.wgmma(p_reg, dot_view, dv_acc)
         wgmma_dkv.commit_group()
 
-        # dP^T retired; dV still in flight.
-        wgmma_sdp.wait_group[1]()
-        warpgroup_fence(dp_reg)
-
-        # dS^T = P^T * (dP^T - dpsum[q col])
-        comptime for cc in range(c_frag_sdp // 4):
-            var dp2 = (dps_smem + stat_col + cc * 8).load[width=2]()
-            comptime for ic in range(4):
-                comptime c: Int = cc * 4 + ic
-                comptime j: Int = c & 1
-                dp_reg.ptr[c] = s_reg.ptr[c] * (dp_reg.ptr[c] - dp2[j])
-        comptime for c in range(c_frag_sdp):
-            ds_reg.ptr[c] = dp_reg.ptr[c].cast[dtype]()
-
-        # Stage dS^T in its natural (kv row, q col) orientation with
-        # the 128B swizzle. The hardware computes the swizzle XOR
-        # from the *absolute* smem address ((addr>>7)&7), and the
-        # dynamic-smem base is not necessarily 1024B-aligned (the
-        # static-smem mbarriers shift it), so the base's line phase
-        # is folded into the XOR: offset(r, c) =
-        # r*BM + ((c/8)^((r + phase)%8))*8 + c%8. Pairs (c, c+1)
-        # stay contiguous -> 32-bit stores, conflict-free.
-        var sds_stage_base = sds_base + sds_stage * sds_size
         comptime if not PROBE_NO_DQ:
-            var sds_phase: Int = (Int(sds_stage_base) >> 7) & 7
-            var kv_r_lo: Int = (
-                wg * WGMMA_M + warp_in_wg * 16 + lane_group
-            )
-            var xor_lo: Int = (lane_group + sds_phase) & 7
-            comptime for c2 in range(c_frag_sdp // 2):
-                comptime cc: Int = c2 // 2
-                comptime bot: Int = c2 % 2
-                var r: Int = kv_r_lo + (8 if bot == 1 else 0)
-                var off: Int = (
-                    r * BM + ((cc ^ xor_lo) * 8) + 2 * lane_pair
-                )
-                var pair = SIMD[dtype, 2](
-                    ds_reg.ptr[2 * c2], ds_reg.ptr[2 * c2 + 1]
-                )
-                (sds_stage_base + off).store[width=2, alignment=4](
-                    pair
-                )
-
             fence_async_view_proxy()
             # Single per-iter barrier: proves both warpgroups wrote
             # this stage of sdS *and* (transitively, via last iter's
@@ -651,34 +689,49 @@ def bwd_main_kernel[
 
             comptime if not SKIP_DQ_GEMM:
                 # dQ^T (D x BM) = K^T · dS, hand-rolled
-                # (layout_a="col" so A is K's bytes read mn-major).
-                # M = D = 128 split m64 per warpgroup -> both
-                # warpgroups share the GEMM.
+                # (layout_a="col": A is K's bytes read mn-major;
+                # layout_b="col": B is the k-major sdS, trans-b=0 —
+                # FA4's imm tail is trans(1,0)). M = D = 128 split
+                # m64 per warpgroup -> both warpgroups share the
+                # GEMM. B k-steps are two-level: +32 B inside a
+                # 64-kv slab (4 steps), +slab_bytes across. c-regs
+                # via StaticTuple (SIMD[f32,40] is illegal); the
+                # copy back into dq_reg folds to SSA aliases, so
+                # the existing fences keep guarding the regs.
                 warpgroup_fence(dq_reg)
                 wgmma_sdp.arrive()
                 var a_desc = _wgmma_descriptor[
                     kt_canonical, False, swizzle
                 ](k_base) + wg * a_wg_stride
                 var b_desc = _wgmma_descriptor[
-                    sds_canonical, False, swizzle
+                    sds_canonical, True, swizzle
                 ](sds_stage_base)
-                var dq_frags = dq_reg.vectorize[1, c_frag_dq]()
+                var dq_tup = StaticTuple[
+                    Scalar[accum_type], c_frag_dq
+                ]()
                 comptime for k_mma in range(BN // WGMMA_K):
-                    dq_frags[0, 0] = wgmma_async[
+                    dq_tup = wgmma_async[
                         WGMMA_M,
                         BM,
                         WGMMA_K,
                         accum_type,
+                        c_frag_dq,
                         a_type=dtype,
                         b_type=dtype,
                         layout_a="col",
-                        layout_b="row",
+                        layout_b="col",
                         scale_d = 0 if k_mma == 0 else 1,
                     ](
                         a_desc + k_mma * a_k_stride,
-                        b_desc + k_mma * b_k_stride,
-                        dq_frags[0, 0],
+                        b_desc
+                        + (
+                            (k_mma & 3) * 32
+                            + (k_mma >> 2) * sds_slab_bytes
+                        ),
+                        dq_tup,
                     )
+                comptime for c in range(c_frag_dq):
+                    dq_reg.ptr[c] = dq_tup[c]
                 wgmma_sdp.commit_group()
 
         # Queue [dV, dQ]: wait ≤1 retires dV -> dO(n) reusable now,
@@ -700,7 +753,7 @@ def bwd_main_kernel[
         warpgroup_fence(dq_reg)
 
         # Hand dQ^T to the drain warp: raw c-frag dump into this
-        # wg's mailbox (8 x st.shared.v4, fully coalesced), under
+        # wg's mailbox (10 x st.shared.v4, fully coalesced), under
         # the dK GEMM. The drain warp owns the gmem reduce-add.
         comptime if not SKIP_MAILBOX:
             named_barrier[Int32(DRAIN_BAR)](Int32(9 + wg))
@@ -726,7 +779,7 @@ def bwd_main_kernel[
         sds_stage ^= 1
         slot += 2
         wrap += 1
-        if wrap == 3:
+        if wrap == STAGES // 2:
             wrap = 0
             slot = 0
             phase ^= 1
@@ -794,7 +847,10 @@ def bwd_main_kernel[
 
 # ===================================================================
 # Preprocess kernel: dpsum = rowsum(dO * O), lse_log2 = lse*log2(e),
-# zero dq_accum. Grid (S/128, H, B), 128 threads (one Q row each).
+# zero dq_accum. Grid (ceil(Spad/128), H, B), 128 threads.
+# Side buffers (dpsum, lse_log2, dq_accum) are padded to
+# Spad = ceil(S / kBwdBlockM) * kBwdBlockM; pad rows get lse=+inf /
+# dpsum=0 so the main kernel's tail m-block contributes exact zeros.
 # ===================================================================
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
@@ -816,12 +872,16 @@ def bwd_preprocess_kernel[
 ):
     comptime D: Int = head_dim
     comptime BM: Int = kBwdPreBlockM
-    comptime VEC: Int = 8
 
     var m_block: Int = Int(block_idx.x)
     var h_idx: Int = Int(block_idx.y)
     var b_idx: Int = Int(block_idx.z)
     var tid: Int = Int(thread_idx.x)
+
+    var num_main_blocks: Int = (
+        seq_len + kBwdBlockM - 1
+    ) // kBwdBlockM
+    var spad: Int = num_main_blocks * kBwdBlockM
 
     # Coalesced: 8 threads per row, 16 rows per pass, 8 passes.
     # Each thread loads a contiguous 16-element (32B) slice.
@@ -832,42 +892,55 @@ def bwd_preprocess_kernel[
     var row_in_pass: Int = tid // LANES_PER_ROW
     comptime for p in range(BM // ROWS_PER_PASS):
         var s: Int = m_block * BM + p * ROWS_PER_PASS + row_in_pass
-        var off: Int = ((b_idx * seq_len + s) * nheads + h_idx) * D + sub * RVEC
-        var o_v = (o_ptr + off).load[width=RVEC]().cast[DType.float32]()
-        var do_v = (do_ptr + off).load[width=RVEC]().cast[DType.float32]()
-        var part: Float32 = (o_v * do_v).reduce_add()
-        var dps = warp.lane_group_sum[num_lanes=LANES_PER_ROW](part)
-        if sub == 0:
-            var bh_row: Int = (b_idx * nheads + h_idx) * seq_len + s
-            (dpsum_ptr + bh_row)[0] = dps
-            (lse_log2_ptr + bh_row)[0] = (lse_ptr + bh_row)[0] * Float32(
-                log2e
-            )
+        var bh_row: Int = (b_idx * nheads + h_idx) * spad + s
+        if s < seq_len:
+            var off: Int = (
+                (b_idx * seq_len + s) * nheads + h_idx
+            ) * D + sub * RVEC
+            var o_v = (o_ptr + off).load[width=RVEC]().cast[
+                DType.float32
+            ]()
+            var do_v = (do_ptr + off).load[width=RVEC]().cast[
+                DType.float32
+            ]()
+            var part: Float32 = (o_v * do_v).reduce_add()
+            var dps = warp.lane_group_sum[num_lanes=LANES_PER_ROW](part)
+            if sub == 0:
+                var lse_row: Int = (
+                    b_idx * nheads + h_idx
+                ) * seq_len + s
+                (dpsum_ptr + bh_row)[0] = dps
+                (lse_log2_ptr + bh_row)[0] = (lse_ptr + lse_row)[
+                    0
+                ] * Float32(log2e)
+        elif s < spad:
+            # Pad rows: exp2(x - inf) = 0 kills P; dpsum = 0 keeps
+            # dS = P * (dP - dpsum) = 0 * finite = 0.
+            if sub == 0:
+                (dpsum_ptr + bh_row)[0] = Float32(0)
+                (lse_log2_ptr + bh_row)[0] = inf[DType.float32]()
 
-    # Zero this block's dq_accum slice. dq_accum is the blocked
-    # fragment dump: D*kBwdBlockM f32 contiguous per main-kernel
-    # m-block; this 128-row block owns 2 of those back to back ->
-    # one flat contiguous memset.
+    # Zero dq_accum (the main kernel bulk-reduce-ADDS into it):
+    # Spad*D f32 per (b, h), split as a flat contiguous range across
+    # the grid's x dimension.
     comptime ZVEC: Int = 4
-    comptime BLK_F32: Int = D * kBwdBlockM  # 8192
-    var zbase: Int = (
-        (b_idx * nheads + h_idx) * (seq_len // kBwdBlockM)
-        + m_block * (BM // kBwdBlockM)
-    ) * BLK_F32
-    comptime for pass_i in range(
-        (BM // kBwdBlockM) * BLK_F32 // (kBwdPreThreads * ZVEC)
-    ):
-        (
-            dq_accum_ptr
-            + zbase
-            + pass_i * kBwdPreThreads * ZVEC
-            + tid * ZVEC
-        ).store[width=ZVEC](SIMD[DType.float32, ZVEC](0))
+    comptime ZCHUNK: Int = kBwdPreThreads * ZVEC  # f32 per pass
+    var ztot: Int = spad * D
+    var zbase: Int = (b_idx * nheads + h_idx) * ztot
+    var nb: Int = Int(grid_dim.x)
+    var passes: Int = (ztot + nb * ZCHUNK - 1) // (nb * ZCHUNK)
+    var zoff: Int = m_block * passes * ZCHUNK + tid * ZVEC
+    for _ in range(passes):
+        if zoff < ztot:
+            (dq_accum_ptr + zbase + zoff).store[width=ZVEC](
+                SIMD[DType.float32, ZVEC](0)
+            )
+        zoff += ZCHUNK
 
 
 # ===================================================================
 # Convert kernel: dq = (dq_accum * softmax_scale) cast to bf16.
-# Grid (S/128, H, B), 128 threads (one Q row each).
+# Grid (ceil(S/kBwdBlockM), H, B) — one CTA per main-kernel m-block.
 # ===================================================================
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
@@ -886,13 +959,14 @@ def bwd_convert_kernel[
 ):
     """dq[b,s,h,d] = scale * decode(dq_accum) via a (q, d) smem tile.
 
-    256 threads. Phase 1 reads the fragment dump coalesced (16B per
-    thread per cell) and scatters single f32s into tile[q][d] — the
-    scatter is bank-conflict-free (banks = lane_group + 8*lane_pair
-    cover all 32). Phase 2: each thread emits one contiguous 64-elem
-    half-row of dq (both gmem sides fully coalesced/vectorized)."""
+    256 threads, one CTA per main-kernel m-block (kBwdBlockM q rows).
+    Phase 1 reads the fragment dump coalesced (16B per thread per
+    cell) and scatters single f32s into tile[q][d] — the scatter is
+    bank-conflict-free (banks = lane_group + 8*lane_pair cover all
+    32). Phase 2: each thread emits contiguous 16-elem (32B) d-slices
+    so every warp store covers full 256B rows (full 32B sectors)."""
     comptime D: Int = head_dim
-    comptime BM: Int = kBwdPreBlockM
+    comptime BM: Int = kBwdBlockM
     comptime PAD: Int = 4  # pad smem rows to dodge bank conflicts
     comptime NT: Int = kBwdCvtThreads  # 256
 
@@ -901,6 +975,8 @@ def bwd_convert_kernel[
     var b_idx: Int = Int(block_idx.z)
     var tid: Int = Int(thread_idx.x)
 
+    var num_m_blocks: Int = (seq_len + BM - 1) // BM
+
     var tile = external_memory[
         Float32,
         address_space=AddressSpace.SHARED,
@@ -908,54 +984,52 @@ def bwd_convert_kernel[
     ]()
 
     # Phase 1: decode the fragment dump (see bwd_main_kernel's
-    # docstring): per main m-block (kBwdBlockM=64 rows), layout
-    # [wg(2)][chunk(8)][tid(128)][4] f32. Thread (sub, ft) reads the
-    # cells (combo = i*2 + sub, ft) — consecutive ft -> consecutive
-    # 16B: fully coalesced.
-    comptime MBM: Int = kBwdBlockM  # 64
-    comptime WG_F32: Int = (D // 2) * MBM  # 4096
-    comptime NCOMBO: Int = (BM // MBM) * 2 * 8  # blk x wg x ch = 32
+    # docstring): per m-block, layout [wg(2)][chunk(BM/8)][tid(128)]
+    # [4] f32. Thread (sub, ft) reads the cells (combo = i*2 + sub,
+    # ft) — consecutive ft -> consecutive 16B: fully coalesced.
+    comptime NCH: Int = BM // 8  # chunks per wg
+    comptime WG_F32: Int = (D // 2) * BM
+    comptime NCOMBO: Int = 2 * NCH  # wg x ch
     var sub: Int = tid // 128
     var ft: Int = tid % 128
     var frag_base: Int = (
-        (b_idx * nheads + h_idx) * (seq_len // MBM)
-        + m_block * (BM // MBM)
+        (b_idx * nheads + h_idx) * num_m_blocks + m_block
     ) * (2 * WG_F32)
     var d_wl: Int = (ft // 32) * 16 + (ft % 32) // 4
     var q_lp: Int = 2 * (ft % 4)
     comptime for i in range(NCOMBO // 2):
         var c: Int = i * 2 + sub
-        var blk: Int = c // 16
-        var wg: Int = (c // 8) % 2
-        var ch: Int = c % 8
+        var wg: Int = c // NCH
+        var ch: Int = c % NCH
         var v = (
             dq_accum_ptr
             + frag_base
-            + (blk * 2 + wg) * WG_F32
+            + wg * WG_F32
             + ch * (128 * 4)
             + ft * 4
         ).load[width=4]()
         comptime for e in range(4):
             var d: Int = wg * 64 + d_wl + 8 * (e // 2)
-            var q: Int = blk * MBM + ch * 8 + q_lp + (e % 2)
+            var q: Int = ch * 8 + q_lp + (e % 2)
             tile[q * (D + PAD) + d] = v[e]
     barrier()
 
     # Phase 2: 8 lanes per row, 16 d (32B bf16) per lane, so every
     # warp store covers 4 full 256B rows — full 32B sectors, fully
-    # coalesced (the previous 16B-per-lane scatter hit 32 half-used
-    # sectors per request: 16x write amplification at L2).
+    # coalesced. Tail m-block: rows s >= seq_len are pad, skipped.
     comptime OV: Int = 16
+    comptime ROWS_PER_PASS: Int = NT // 8  # 32
     var row_in_pass: Int = tid // 8
     var d_base: Int = (tid % 8) * OV
-    comptime for p in range(BM // (NT // 8)):
-        var s_local: Int = p * (NT // 8) + row_in_pass
+    comptime for p in range((BM + ROWS_PER_PASS - 1) // ROWS_PER_PASS):
+        var s_local: Int = p * ROWS_PER_PASS + row_in_pass
         var s: Int = m_block * BM + s_local
-        var dq_off: Int = (
-            (b_idx * seq_len + s) * nheads + h_idx
-        ) * D + d_base
-        var fv = (
-            tile + s_local * (D + PAD) + d_base
-        ).load[width=OV, alignment=16]()
-        var out = (fv * softmax_scale).cast[dtype]()
-        (dq_ptr + dq_off).store[width=OV, alignment=32](out)
+        if s_local < BM and s < seq_len:
+            var dq_off: Int = (
+                (b_idx * seq_len + s) * nheads + h_idx
+            ) * D + d_base
+            var fv = (
+                tile + s_local * (D + PAD) + d_base
+            ).load[width=OV, alignment=16]()
+            var out = (fv * softmax_scale).cast[dtype]()
+            (dq_ptr + dq_off).store[width=OV, alignment=32](out)

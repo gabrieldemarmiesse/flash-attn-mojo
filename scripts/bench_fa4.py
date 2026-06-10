@@ -173,7 +173,9 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     if args.check_only:
-        for s_len in (128, 256, 1024):
+        # 640 = 8 * 80 exercises the bwd tile_m=80 exact-fit path;
+        # the others all leave a partial tail m-tile (S % 80 != 0).
+        for s_len in (128, 256, 640, 1024):
             _check_small(args.impl, args.kind, D, seqlen=s_len)
         return
 

@@ -14,6 +14,11 @@ import torch
 from flash_attn_mojo._dtype import _DTYPE_CODE
 
 _BLOCK = 128
+# Main-kernel Q-tile rows (FA4's tile_m for hdim128 non-causal).
+# Side buffers are padded to a multiple of this; the preprocess
+# kernel fills the pad with lse=+inf / dpsum=0 so the main kernel's
+# tail m-block contributes exactly zero.
+_BLOCK_M = 80
 
 
 def bwd_fa4(
@@ -54,16 +59,17 @@ def bwd_fa4(
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
+    seqlen_pad = -(-seqlen // _BLOCK_M) * _BLOCK_M
     dpsum = torch.empty(
-        (batch, nheads, seqlen), dtype=torch.float32, device=q.device
+        (batch, nheads, seqlen_pad), dtype=torch.float32, device=q.device
     )
     lse_log2 = torch.empty_like(dpsum)
     # Opaque blocked fragment dump (FA4's trick): per (b, h, m-block
-    # of 64 rows) a contiguous [wg(2)][chunk(8)][tid(128)][4] f32
+    # of 80 rows) a contiguous [wg(2)][chunk(10)][tid(128)][4] f32
     # region, bulk-reduce-added by the main kernel's drain warp and
-    # decoded by the convert kernel. Same numel as (B, S, H, D).
+    # decoded by the convert kernel. Numel = B * H * Spad * D.
     dq_accum = torch.empty(
-        (batch * nheads * seqlen * head_dim,),
+        (batch * nheads * seqlen_pad * head_dim,),
         dtype=torch.float32,
         device=q.device,
     )

@@ -2,9 +2,10 @@
 convert). Scope (v1): bf16, head_dim=128, non-causal, contiguous
 (B, L, H, D), seqlen % 128 == 0, Hq == Hk.
 
-Side tensors (allocated by the Python wrapper):
-  dpsum, lse_log2: (B, H, S) fp32 contiguous.
-  dq_accum:        (B, H, S, D) fp32 contiguous (zeroed by preprocess).
+Side tensors (allocated by the Python wrapper, padded to
+Spad = ceil(S / kBwdBlockM) * kBwdBlockM):
+  dpsum, lse_log2: (B, H, Spad) fp32 contiguous (+inf/0 pad rows).
+  dq_accum:        B*H*Spad*D f32 fragment dump (zeroed by preprocess).
 
 PTX dump: `-D MOJO_DUMP_PTX=<path>` dumps the *main* kernel's PTX.
 """
@@ -29,6 +30,7 @@ from common import (
     kBwdBlockM,
     kBwdBlockN,
     kBwdCvtThreads,
+    kBwdNMmaWarpgroups,
     kBwdNThreads,
     kBwdQdOStages,
     kBwdPreBlockM,
@@ -99,8 +101,13 @@ def launch_bwd_preprocess[
 
     comptime kernel_inst = bwd_preprocess_kernel[dtype, head_dim]
     var compiled = ctx.compile_function[kernel_inst, kernel_inst]()
+    # Grid covers Spad rows (side buffers padded to the main-kernel
+    # m-block size; pad rows get lse=+inf / dpsum=0).
+    var spad: Int = (
+        ceildiv(seqlen_int, Int(kBwdBlockM)) * Int(kBwdBlockM)
+    )
     var grid = (
-        ceildiv(seqlen_int, Int(kBwdPreBlockM)),
+        ceildiv(spad, Int(kBwdPreBlockM)),
         nheads_int,
         batch_int,
     )
@@ -165,8 +172,9 @@ def launch_bwd_main[
 
     comptime swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B
 
-    # Smem: K + V (BN x D) + 6-slot Q/dO ring (BM x D each) + 2 sdS
-    # stages (BM x BN). hdim128: 32K + 32K + 96K + 32K = 192 KiB.
+    # Smem (BM=80): K + V (2 x 32768) + 4-slot Q/dO ring (4 x 20480)
+    # + 2 sdS stages (2 x 20480) + lse/dps (1280) + dQ mailbox
+    # (2 x 20480) = 230912 B <= 232448 cap.
     comptime kv_bytes: Int = kBwdBlockN * head_dim * size_of[dtype]()
     comptime q_slot_bytes: Int = kBwdBlockM * head_dim * size_of[dtype]()
     comptime sds_bytes: Int = kBwdBlockM * kBwdBlockN * size_of[dtype]()
@@ -174,7 +182,9 @@ def launch_bwd_main[
     # + 2-stage lse_log2/dpsum staging ring (2 x 2 x BM f32).
     comptime lse_dps_bytes: Int = 2 * (kBwdQdOStages // 2) * kBwdBlockM * 4
     # + per-MMA-wg dQ mailbox (64 x BM f32 each, bulk-reduce-drained).
-    comptime dq_mail_bytes: Int = head_dim * kBwdBlockM * 4
+    comptime dq_mail_bytes: Int = (
+        kBwdNMmaWarpgroups * 64 * kBwdBlockM * 4
+    )
     comptime smem_bytes: Int = (
         2 * kv_bytes
         + kBwdQdOStages * q_slot_bytes
@@ -329,8 +339,8 @@ def launch_bwd_convert[
         unsafe_from_address=dq_addr
     )
 
-    # (128 q) x (128+4 d) f32 decode tile.
-    comptime cvt_smem_bytes: Int = kBwdPreBlockM * (head_dim + 4) * 4
+    # (kBwdBlockM q) x (128+4 d) f32 decode tile.
+    comptime cvt_smem_bytes: Int = kBwdBlockM * (head_dim + 4) * 4
 
     comptime kernel_inst = bwd_convert_kernel[dtype, head_dim]
     var compiled = ctx.compile_function[kernel_inst, kernel_inst](
@@ -338,8 +348,9 @@ def launch_bwd_convert[
             UInt32(cvt_smem_bytes)
         )
     )
+    # One CTA per main-kernel m-block.
     var grid = (
-        ceildiv(seqlen_int, Int(kBwdPreBlockM)),
+        ceildiv(seqlen_int, Int(kBwdBlockM)),
         nheads_int,
         batch_int,
     )
