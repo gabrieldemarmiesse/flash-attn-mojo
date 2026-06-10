@@ -37,26 +37,74 @@ schedule 3035 → v4 warp specialization 2500 → v5 TMA-store epilogue
   (2355 → 2440); reverted. ptxas seems to handle the serial chain
   better than the extra live registers.
 
-## Backward (bwd_fa4) — state as of 2026-06-10 (second session)
+## Backward (bwd_fa4) — state as of 2026-06-10 (third session)
 
-Correct (bf16 noise floor vs fp32 autograd, 2.4e-4 vs FA4 grads) at
-**10.6 ms vs FA4's 6.6 ms (1.61x)**. Loop: `scripts/master_bench.sh
---kind bwd`; fast check: `scripts/bench_fa4.py --impl mojo --kind
-bwd --check-only`.
+Correct (bf16 noise floor vs fp32 autograd) at **~8.6 ms vs FA4's
+~6.4 ms total (~1.34x)**; main kernel 8.2-8.3 vs 5.9-6.2 ms, the
+preprocess (167 vs 159 us) and convert (114 vs 109 us) kernels are
+at FA4 parity. Loop: `scripts/master_bench.sh --kind bwd`; fast
+check: `scripts/bench_fa4.py --impl mojo --kind bwd --check-only`
+(bench prints per-kernel `KERNEL` lines now).
 
 Perf journey: 141.8 (acquire atomics) -> 28.5 (relaxed) -> 24.3
-(manual sdS addressing, coalesced pre/convert, red.v2 inline asm,
-deferred waits) -> 11.5 (v3: balanced hand-rolled dQ^T over both
-warpgroups) -> 10.6 ms (v4: FA4's dV,dQ,dK commit order so the dQ
-drain overlaps the dK GEMM + lse/dpsum staged by the producer warp
-riding the Q pipeline, full[Qslot].init(2)).
+(manual sdS addressing, red.v2 inline asm) -> 11.5 (v3: balanced
+hand-rolled dQ^T over both warpgroups) -> 10.6 (v4: FA4 commit order
++ producer-staged lse/dpsum) -> 9.3 (v5: dQ smem mailbox +
+cp.reduce.async.bulk drain warp) -> 8.6 ms (lse/dps local-memory fix
++ convert rewrite).
 
 Architecture mirrors FA4's mma_one_m_block: S^T/dP^T swapAB wgmma
 (wait_group(1) tricks), P/dS in registers, dV/dK RS wgmma, dS^T
 staged to double-buffered swizzled smem read by a HAND-ROLLED
 dQ^T = K^T·dS wgmma (`wgmma_async[layout_a="col"]`, mn-major A
-descriptor — TensorCoreAsync can't express it), dq_accum (B,H,D,S)
-fp32 via red.relaxed.v2.f32, dK/dV TMA-stored from reused K/V smem.
+descriptor — TensorCoreAsync can't express it). dQ c-frags are
+dumped raw (8x st.shared.v4) into a per-wg 16 KiB smem mailbox that
+producer warp 1 drains with `cp.reduce.async.bulk...add.f32`
+(inlined asm — the stdlib wrapper is wrongly gated SM100+) into
+dq_accum, an OPAQUE blocked fragment dump (per m-block:
+[wg(2)][chunk(8)][tid(128)][4] f32 contiguous) that the convert
+kernel decodes. Mailbox protocol = FA4's: named barriers 6/7 (full)
+9/10 (empty), count 160, gated by cp.async.bulk.wait_group.read.
+Producer warp 0 = tight TMA issue only; warp 1 = dQ drain; warp 2 =
+lse/dpsum stager (rides the Q slot's full barrier, init(2)).
+dK/dV TMA-stored from reused K/V smem.
+
+### Diagnosis methodology that worked (third session)
+
+- `PROBE_NO_*` comptime flags in kernel.mojo compile out subsystems
+  to attribute bubbles. Result: dQ subsystem = ~3.1ms of which
+  mailbox handoff ~2.2ms; cp.reduce itself and the proxy fence are
+  nearly free; the dQ GEMM fully overlaps.
+- ncu PC sampling (`--section SourceCounters`, then `--page source
+  --print-source sass --csv`, sort by 'Warp Stall Sampling') beats
+  metric-level stalls. Found: (1) stack_allocation arrays live in
+  LOCAL memory (LDL/STL = long_scoreboard) — fixed by loading
+  lse/dps pairs from smem at use sites; (2) R2UR+IMAD.MOV descriptor
+  plumbing = 25-30% of stall samples vs FA4's ~0% (cutlass keeps
+  descriptors on the uniform datapath, UIADD3/ULEA/UMOV). This is
+  the main remaining instruction-level delta.
+- ncu sector tables (l1tex__t_sectors per request) found convert's
+  16x write amplification (16B/lane scattered -> 32 half-sectors per
+  warp store).
+- ptxas DOES honor setmaxnreg: consumer SASS uses R232+ (240 cap);
+  the pool math 2*128*240 + 128*24 = 384*168 is exact.
+
+### Negative results (don't retry blindly)
+
+- Cross-iteration software pipelining (commit S/dP(n+1) at iter end)
+  REGRESSED 11.3 -> 15.4 ms.
+- Hoisting descriptors/pointers out of the consumer loop REGRESSED
+  8.2 -> 8.9 ms (cross-loop liveness costs more than remat at this
+  register pressure).
+- Producer/consumer reg split 40/232 REGRESSED 8.2 -> 8.5 ms
+  (consumers are the reg-starved side).
+- L2 cache hints: FA4's `.L2::cache_hint` instructions all pass a
+  ZERO policy handle (cute always emits the hint form) — not a real
+  difference, nothing to copy. (Also applies to the fwd ideas list.)
+- LLVM CSEs adjacent identical `wgmma.wait_group` intrinsics and
+  reorders mbarrier arrives past wgmma asm: the intended
+  "wait(1)->release dO->commit dK->wait(1)" collapses to one wait
+  after dK. Harmless here but don't trust source-order scheduling.
 
 Hard-won bugs (see also memory notes):
 - smem swizzle XOR uses the ABSOLUTE address ((addr>>7)&7); dynamic
@@ -76,25 +124,26 @@ S/dP(n+1) at iteration end, drain dQ(n-1) at iteration top)
 REGRESSED 11.3 -> 15.4 ms with identical wgmma order, no spills,
 same 168 regs. Top-of-iteration commits win; don't retry blindly.
 
-Current profile (ncu, main kernel): tensor pipe 41.5% busy (FA4
-~53%), cycles 14.2M, stalls: long_scoreboard 5.55 (mbarrier
-try_wait spins on Q/dO arrivals — TMA/L2 latency), wait 1.67,
-everything else <1.2. Next levers:
-- dQ smem mailbox drained by producer warps 1-3 (FA4 does this —
-  barrier ids dQEmptyWG0/dQFullWG0 with 128+32 threads) to take
-  even the red.v2 drain off the MMA path.
-- tile_m=80 like FA4 (25% fewer iterations; needs n80 wgmma and a
-  different sdS layout — their dS smem is k-major, trans-b=0).
-- deeper Q/dO ring (8 slots) if smem allows, to absorb TMA latency.
-- preprocess (551us vs FA4 153) and convert (835 vs 109) are still
-  3-7x off; both are pure-bandwidth kernels worth one coalescing
-  pass (currently ~0.4ms combined of the 4ms gap).
+Current profile (ncu, main kernel): tensor pipe ~48% busy (FA4
+78%), SM throughput 48% vs 78% at identical occupancy/regs/launch.
+Remaining stall budget: spin branches+VOTEU ~18% (steady-state
+producer/consumer idle, FA4 pays ~20% too), R2UR+IMAD.MOV descriptor
+plumbing ~25% (FA4 ~2%: uniform datapath), FENCE.VIEW 3.3% (FA4
+6.1%). Next levers:
+- tile_m=80 like FA4 (THE structural delta: 103 vs 128 outer
+  iterations amortize all per-iter fixed costs; needs n80 wgmma,
+  k-major dS smem with trans-b=0, TMA OOB-zero tail handling for
+  S %% 80 != 0, padded lse smem, 40-elem c-frags).
+- Find what blocks ptxas from uniformizing our descriptor math
+  (FA4's SASS does UIADD3/ULEA on URs; ours rematerializes via
+  R2UR). In-loop recompute is currently better than hoisting; the
+  blocker is likely the LLVM-level dataflow shape, not the math.
+- Convert kernel is at parity; preprocess at parity.
 
 ## Not yet tried (fwd)
 
-- L2 cache hints on TMA loads (FA4 emits
-  `cp.async.bulk.tensor...L2::cache_hint`; our stdlib path emits
-  none — would need stdlib patch or inline PTX).
+- ~~L2 cache hints on TMA loads~~ DEBUNKED (third session): FA4's
+  cache_hint operands are all zero policy handles — no-op.
 - 32-bit (`layout_int_type=DType.int32`) LayoutTensor index types
   (PTX still has ~50 add.s64 vs FA4's 0).
 - Profile-guided softmax reordering with SASS (`--set source`).
