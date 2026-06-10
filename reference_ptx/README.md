@@ -10,9 +10,11 @@ The backward counterparts (same canonical config):
 - `fa4_bwd_sm90_bf16_hdim128_noncausal.ptx` — the main bwd kernel
   (`FlashAttentionBackwardSm90`). Config from
   `interface._tile_size_bwd_sm90(128, ...)`: tile_m=80, tile_n=128,
-  SdP_swapAB + dQ_swapAB, 2-stage Q/dO/PdS pipelines, dQ accumulated
-  into fp32 gmem via vectorized `red.v2/v4.f32` atomics. PTX = one
-  unrolled iteration: 24x `wgmma.m64n80k16` (S^T, dP^T, dQ^T) +
+  SdP_swapAB + dQ_swapAB, 2-stage Q/dO/PdS pipelines, dQ drained via
+  a smem mailbox + `cp.reduce.async.bulk...add.f32` (20480 B per
+  warpgroup per m-tile, issued by a producer warp; there are NO
+  `red.*` atomics anywhere in the PTX). PTX = one unrolled
+  iteration: 24x `wgmma.m64n80k16` (S^T, dP^T, dQ^T) +
   10x `wgmma.m64n128k16` (dV, dK; k=80 -> 5 each).
 - `fa4_bwd_preprocess_bf16_hdim128.ptx` — dpsum = rowsum(dO*O),
   lse_log2 = lse * log2(e), zero dq_accum.
