@@ -177,33 +177,42 @@ def fwd_fa4_kernel[
             q_tma.async_copy_3d(
                 q_smem, mbar_q[0], (0, h_idx, b_idx * seq_len + m_block * BM)
             )
-            for n_block in range(num_kv_blocks):
-                var row: Int = b_idx * seq_len + n_block * BN
-                var phase: UInt32 = UInt32((n_block // 3) & 1)
-
-                var k_slot: Int = (2 * n_block) % STAGES
-                empty[k_slot].wait(phase)
+            # Incremental ring state: K(n) in slot 2n%6, V(n) in
+            # (2n+1)%6; the empty-barrier phase flips every 3 tiles.
+            var slot: Int = 0
+            var phase: UInt32 = 0
+            var wrap: Int = 0
+            var row: Int = b_idx * seq_len
+            for _ in range(num_kv_blocks):
+                empty[slot].wait(phase)
                 var k_st = LayoutTensor[
                     dtype,
                     k_smem_layout,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
-                ](kv_smem_base + k_slot * kv_slot_size)
-                full[k_slot].expect_bytes(Int32(BN * D * size_of[dtype]()))
-                k_tma.async_copy_3d(k_st, full[k_slot], (0, h_idx, row))
+                ](kv_smem_base + slot * kv_slot_size)
+                full[slot].expect_bytes(Int32(BN * D * size_of[dtype]()))
+                k_tma.async_copy_3d(k_st, full[slot], (0, h_idx, row))
 
-                var v_slot: Int = (2 * n_block + 1) % STAGES
-                empty[v_slot].wait(phase)
+                empty[slot + 1].wait(phase)
                 var v_st = LayoutTensor[
                     dtype,
                     v_smem_layout,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
-                ](kv_smem_base + v_slot * kv_slot_size)
-                full[v_slot].expect_bytes(Int32(BN * D * size_of[dtype]()))
-                v_tma.async_copy_3d(v_st, full[v_slot], (0, h_idx, row))
+                ](kv_smem_base + (slot + 1) * kv_slot_size)
+                full[slot + 1].expect_bytes(Int32(BN * D * size_of[dtype]()))
+                v_tma.async_copy_3d(v_st, full[slot + 1], (0, h_idx, row))
+
+                row += BN
+                slot += 2
+                wrap += 1
+                if wrap == 3:
+                    wrap = 0
+                    slot = 0
+                    phase ^= 1
         return
 
     # ================= MMA warpgroups =================
@@ -368,13 +377,17 @@ def fwd_fa4_kernel[
     softmax_block()  # rowmax starts at -inf -> scale_old==0, rowsum init
     pack_p()  # P(0)
 
-    # ---- Main loop: QK(n+1) + PV(n) per iteration.
-    for n_block in range(num_kv_blocks - 1):
-        var k_slot: Int = (2 * (n_block + 1)) % STAGES
-        var k_phase: UInt32 = UInt32(((n_block + 1) // 3) & 1)
-        var v_slot: Int = (2 * n_block + 1) % STAGES
-        var v_phase: UInt32 = UInt32((n_block // 3) & 1)
+    # ---- Main loop: QK(n+1) + PV(n) per iteration. Ring slots and
+    # empty-barrier phases track incrementally (no div/mod per iter):
+    # K(t): slot 2t%6, V(t): (2t+1)%6, phase flips every 3 tiles.
+    var k_slot: Int = 2  # K(1)
+    var k_phase: UInt32 = 0
+    var k_wrap: Int = 1
+    var v_slot: Int = 1  # V(0)
+    var v_phase: UInt32 = 0
+    var v_wrap: Int = 0
 
+    for _ in range(num_kv_blocks - 1):
         # Queue QK(n+1) then PV(n) on the tensor core.
         full[k_slot].wait(k_phase)
         named_barrier[Int32(NWG * 128)](Int32(1 + wg))
@@ -407,13 +420,24 @@ def fwd_fa4_kernel[
         pack_p()  # P(n+1)
         rescale_o()
 
-    # ---- Epilogue: PV(N-1).
-    var last: Int = num_kv_blocks - 1
-    var v_slot_last: Int = (2 * last + 1) % STAGES
-    full[v_slot_last].wait(UInt32((last // 3) & 1))
+        k_slot += 2
+        k_wrap += 1
+        if k_wrap == 3:
+            k_wrap = 0
+            k_slot = 0
+            k_phase ^= 1
+        v_slot += 2
+        v_wrap += 1
+        if v_wrap == 3:
+            v_wrap = 0
+            v_slot = 1
+            v_phase ^= 1
+
+    # ---- Epilogue: PV(N-1) (v_slot/v_phase left at tile N-1).
+    full[v_slot].wait(v_phase)
     warpgroup_fence(o_reg)
     wgmma_pv.arrive()
-    wgmma_pv.wgmma(p_reg, v_tile(v_slot_last), o_reg)
+    wgmma_pv.wgmma(p_reg, v_tile(v_slot), o_reg)
     wgmma_pv.commit_group()
     wgmma_pv.wait_group[0]()
     warpgroup_fence(o_reg)
