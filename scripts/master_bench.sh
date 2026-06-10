@@ -27,6 +27,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 KIND="fwd"
+CAUSAL=0
 SHAPE="2,8192,16,128"
 ITERS=20
 RUN_NCU=1
@@ -37,6 +38,7 @@ CHECK=1
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --kind) KIND="$2"; shift 2 ;;
+        --causal) CAUSAL=1; shift ;;
         --shape) SHAPE="$2"; shift 2 ;;
         --iters) ITERS="$2"; shift 2 ;;
         --no-ncu) RUN_NCU=0; shift ;;
@@ -48,14 +50,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+CSUF="noncausal"; MSUF=""; CFLAG=()
+if [[ "$CAUSAL" == 1 ]]; then CSUF="causal"; MSUF="_causal"; CFLAG=(--causal); fi
 if [[ "$KIND" == "fwd" ]]; then
-    FA4_PTX="$ROOT/reference_ptx/fa4_fwd_sm90_bf16_hdim128_noncausal.ptx"
-    MOJO_PTX="$ROOT/ptx/mojo_fwd_fa4.ptx"
+    FA4_PTX="$ROOT/reference_ptx/fa4_fwd_sm90_bf16_hdim128_${CSUF}.ptx"
+    MOJO_PTX="$ROOT/ptx/mojo_fwd_fa4${MSUF}.ptx"
     FA4_NCU_FILTER='FlashAttentionForwardSm90'
     MOJO_NCU_FILTER='fwd_fa4_kernel'
 else
-    FA4_PTX="$ROOT/reference_ptx/fa4_bwd_sm90_bf16_hdim128_noncausal.ptx"
-    MOJO_PTX="$ROOT/ptx/mojo_bwd_fa4.ptx"
+    FA4_PTX="$ROOT/reference_ptx/fa4_bwd_sm90_bf16_hdim128_${CSUF}.ptx"
+    MOJO_PTX="$ROOT/ptx/mojo_bwd_fa4${MSUF}.ptx"
     # ncu compares the *main* bwd kernel (>95% of bwd time).
     FA4_NCU_FILTER='FlashAttentionBackwardSm90'
     MOJO_NCU_FILTER='bwd_main_kernel'
@@ -76,7 +80,7 @@ rm -rf ~/.cache/flash_attn_mojo
 # SDPA + FA4, and measures kernel time.
 step "2+3. mojo ($KIND): compile, dump PTX, check, bench"
 MOJO_RESULT="$(MOJO_DUMP_PTX="$MOJO_PTX" "$UV" run python scripts/bench_fa4.py \
-    --impl mojo --kind "$KIND" --shape "$SHAPE" --iters "$ITERS" "${CHECK_FLAG[@]}" | tee /dev/stderr | grep ^RESULT)"
+    --impl mojo --kind "$KIND" --shape "$SHAPE" --iters "$ITERS" "${CFLAG[@]}" "${CHECK_FLAG[@]}" | tee /dev/stderr | grep ^RESULT)"
 
 step "2b. fa4 ($KIND) bench"
 if [[ "$REFRESH_FA4_PTX" == 1 ]]; then
@@ -84,12 +88,12 @@ if [[ "$REFRESH_FA4_PTX" == 1 ]]; then
     FA4_RESULT="$(CUTE_DSL_KEEP_PTX=1 CUTE_DSL_DUMP_DIR="$TMP_PTX_DIR" \
         FLASH_ATTENTION_CUTE_DSL_CACHE_DIR="$(mktemp -d)" \
         "$UV" run python scripts/bench_fa4.py \
-        --impl fa4 --kind "$KIND" --shape "$SHAPE" --iters "$ITERS" "${CHECK_FLAG[@]}" | tee /dev/stderr | grep ^RESULT)"
+        --impl fa4 --kind "$KIND" --shape "$SHAPE" --iters "$ITERS" "${CFLAG[@]}" "${CHECK_FLAG[@]}" | tee /dev/stderr | grep ^RESULT)"
     tr -d '\000' < "$TMP_PTX_DIR"/cutlass*${FA4_NCU_FILTER}*.ptx > "$FA4_PTX"
     echo "[master_bench] refreshed $FA4_PTX"
 else
     FA4_RESULT="$("$UV" run python scripts/bench_fa4.py \
-        --impl fa4 --kind "$KIND" --shape "$SHAPE" --iters "$ITERS" "${CHECK_FLAG[@]}" | tee /dev/stderr | grep ^RESULT)"
+        --impl fa4 --kind "$KIND" --shape "$SHAPE" --iters "$ITERS" "${CFLAG[@]}" "${CHECK_FLAG[@]}" | tee /dev/stderr | grep ^RESULT)"
 fi
 
 # ---------------------------------------------------------------- 4
@@ -133,7 +137,7 @@ if [[ "$RUN_NCU" == 1 ]]; then
                     --set "$NCU_SET" \
                     --force-overwrite -o "/tmp/master_bench_${IMPL}" \
                     "$UV" run python scripts/bench_fa4.py \
-                        --impl "$IMPL" --kind "$KIND" --shape "$SHAPE" --profile \
+                        --impl "$IMPL" --kind "$KIND" --shape "$SHAPE" "${CFLAG[@]}" --profile \
                         --iters 1 --warmup 3 > /dev/null
             done
             "$UV" run python scripts/ncu_compare.py \

@@ -38,23 +38,28 @@ def _parse_shape(s: str) -> tuple[int, int, int, int]:
     return tuple(int(x) for x in parts)  # type: ignore[return-value]
 
 
-def _fa4_fwd_fn():
+def _fa4_fwd_fn(causal: bool):
     from flash_attn.cute import flash_attn_func
 
     def run(q, k, v):
-        return flash_attn_func(q, k, v, return_lse=True)  # (out, lse)
+        return flash_attn_func(
+            q, k, v, causal=causal, return_lse=True
+        )  # (out, lse)
 
     return run
 
 
-def _get_step(impl: str, kind: str, q, k, v, dout):
+def _get_step(impl: str, kind: str, q, k, v, dout, causal: bool = False):
     """Returns (step_fn, outputs_fn). outputs_fn() -> tensors for the
     correctness check."""
     if kind == "fwd":
         if impl == "fa4":
-            run = _fa4_fwd_fn()
+            run = _fa4_fwd_fn(causal)
         else:
-            from flash_attn_mojo.fwd_fa4 import fa4_fwd as run
+            from flash_attn_mojo.fwd_fa4 import fa4_fwd as _mojo_fwd
+
+            def run(q, k, v):
+                return _mojo_fwd(q, k, v, causal=causal)
 
         out_holder = {}
 
@@ -67,7 +72,7 @@ def _get_step(impl: str, kind: str, q, k, v, dout):
     # both impls); time only the bwd path.
     from flash_attn.cute import flash_attn_func
 
-    out, lse = flash_attn_func(q, k, v, return_lse=True)
+    out, lse = flash_attn_func(q, k, v, causal=causal, return_lse=True)
     torch.cuda.synchronize()
     grads = {}
 
@@ -75,19 +80,21 @@ def _get_step(impl: str, kind: str, q, k, v, dout):
         from flash_attn.cute.interface import _flash_attn_bwd
 
         def step():
-            dq, dk, dv = _flash_attn_bwd(q, k, v, out, dout, lse)
+            dq, dk, dv = _flash_attn_bwd(
+                q, k, v, out, dout, lse, causal=causal
+            )
             grads["g"] = (dq, dk, dv)
 
     else:
         from flash_attn_mojo.bwd_fa4 import bwd_fa4
 
         def step():
-            grads["g"] = bwd_fa4(q, k, v, out, dout, lse)
+            grads["g"] = bwd_fa4(q, k, v, out, dout, lse, causal=causal)
 
     return step, lambda: grads["g"]
 
 
-def _sdpa_fp32(q, k, v):
+def _sdpa_fp32(q, k, v, causal: bool = False):
     import torch.nn.functional as F
 
     return (
@@ -95,35 +102,45 @@ def _sdpa_fp32(q, k, v):
             q.transpose(1, 2).float(),
             k.transpose(1, 2).float(),
             v.transpose(1, 2).float(),
+            is_causal=causal,
         )
         .transpose(1, 2)
     )
 
 
-def _check_small(impl: str, kind: str, D: int, seqlen: int = 512) -> None:
+def _check_small(
+    impl: str, kind: str, D: int, seqlen: int = 512, causal: bool = False
+) -> None:
     torch.manual_seed(1)
     qs = torch.randn(2, seqlen, 4, D, dtype=torch.bfloat16, device="cuda")
     ks, vs = torch.randn_like(qs), torch.randn_like(qs)
     if kind == "fwd":
-        step, outputs = _get_step(impl, "fwd", qs, ks, vs, None)
+        step, outputs = _get_step(impl, "fwd", qs, ks, vs, None, causal)
         step()
         out, lse = outputs()
-        d = (out.float() - _sdpa_fp32(qs, ks, vs)).abs().max().item()
+        d = (out.float() - _sdpa_fp32(qs, ks, vs, causal)).abs().max().item()
         scale = qs.shape[-1] ** -0.5
+        scores = (
+            torch.einsum("bshd,bthd->bhst", qs.float(), ks.float()) * scale
+        )
+        if causal:
+            s_q = scores.shape[-2]
+            mask = torch.ones(
+                s_q, s_q, dtype=torch.bool, device=scores.device
+            ).triu(1)
+            scores = scores.masked_fill(mask, float("-inf"))
         ref_lse = torch.logsumexp(
-            torch.einsum(
-                "bshd,bthd->bhst", qs.float(), ks.float()
-            ) * scale,
+            scores,
             dim=-1,
         )
         dl = (lse.float() - ref_lse).abs().max().item()
         print(
-            f"CHECK impl={impl} kind=fwd S={seqlen} "
+            f"CHECK impl={impl} kind=fwd S={seqlen} causal={int(causal)} "
             f"small_vs_fp32_sdpa_maxdiff={d:.3e} lse_maxdiff={dl:.3e}"
         )
         return
     dos = torch.randn_like(qs)
-    step, outputs = _get_step(impl, "bwd", qs, ks, vs, dos)
+    step, outputs = _get_step(impl, "bwd", qs, ks, vs, dos, causal)
     step()
     qf = qs.detach().float().requires_grad_()
     kf = ks.detach().float().requires_grad_()
@@ -131,7 +148,8 @@ def _check_small(impl: str, kind: str, D: int, seqlen: int = 512) -> None:
     import torch.nn.functional as F
 
     of = F.scaled_dot_product_attention(
-        qf.transpose(1, 2), kf.transpose(1, 2), vf.transpose(1, 2)
+        qf.transpose(1, 2), kf.transpose(1, 2), vf.transpose(1, 2),
+        is_causal=causal,
     ).transpose(1, 2)
     of.backward(dos.float())
     names = ("dq", "dk", "dv")
@@ -140,7 +158,10 @@ def _check_small(impl: str, kind: str, D: int, seqlen: int = 512) -> None:
     for name, got, ref in zip(names, outputs(), refs):
         d = (got.float() - ref).abs().max().item()
         worst = max(worst, d)
-        print(f"CHECK impl={impl} kind=bwd {name}_vs_fp32_maxdiff={d:.3e}")
+        print(
+            f"CHECK impl={impl} kind=bwd causal={int(causal)} "
+            f"{name}_vs_fp32_maxdiff={d:.3e}"
+        )
     if worst > 5e-2:
         print("CHECK FAILED: bwd grads diverge from fp32 reference", file=sys.stderr)
         sys.exit(1)
@@ -174,6 +195,7 @@ def main() -> None:
         action="store_true",
         help="no timing; bracket capture iters with cudaProfilerStart/Stop",
     )
+    p.add_argument("--causal", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -184,7 +206,9 @@ def main() -> None:
         # 640 = 8 * 80 exercises the bwd tile_m=80 exact-fit path;
         # the others all leave a partial tail m-tile (S % 80 != 0).
         for s_len in (128, 256, 640, 1024):
-            _check_small(args.impl, args.kind, D, seqlen=s_len)
+            _check_small(
+                args.impl, args.kind, D, seqlen=s_len, causal=args.causal
+            )
         return
 
     q = torch.randn(B, S, H, D, dtype=torch.bfloat16, device="cuda")
@@ -192,16 +216,20 @@ def main() -> None:
     v = torch.randn_like(q)
     dout = torch.randn_like(q) if args.kind == "bwd" else None
 
-    step, outputs = _get_step(args.impl, args.kind, q, k, v, dout)
+    step, outputs = _get_step(
+        args.impl, args.kind, q, k, v, dout, args.causal
+    )
 
     # JIT compile + allocator warmup.
     step()
     torch.cuda.synchronize()
 
     if args.check:
-        _check_small(args.impl, args.kind, D)
+        _check_small(args.impl, args.kind, D, causal=args.causal)
         if args.impl == "mojo":
-            ref_step, ref_outputs = _get_step("fa4", args.kind, q, k, v, dout)
+            ref_step, ref_outputs = _get_step(
+                "fa4", args.kind, q, k, v, dout, args.causal
+            )
             ref_step()
             torch.cuda.synchronize()
             worst = 0.0
@@ -223,6 +251,8 @@ def main() -> None:
     torch.cuda.synchronize()
 
     fwd_flops = 4 * B * H * S * S * D
+    if args.causal:
+        fwd_flops //= 2
     flops = fwd_flops if args.kind == "fwd" else fwd_flops * 5 // 2
 
     if args.profile:
@@ -248,7 +278,8 @@ def main() -> None:
     us = kernel_us / args.iters
     tflops = flops / (us * 1e-6) / 1e12
     print(
-        f"RESULT impl={args.impl} kind={args.kind} shape={B},{S},{H},{D} "
+        f"RESULT impl={args.impl} kind={args.kind} "
+        f"shape={B},{S},{H},{D} causal={int(args.causal)} "
         f"us={us:.1f} tflops={tflops:.1f}"
     )
     for e in sorted(

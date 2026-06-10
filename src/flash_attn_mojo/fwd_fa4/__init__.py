@@ -23,6 +23,7 @@ def fa4_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
     softmax_scale: float | None = None,
+    causal: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convenience wrapper: allocate out + lse, dispatch, return both.
 
@@ -38,7 +39,7 @@ def fa4_fwd(
     lse = torch.empty(
         (batch, nheads, seqlen), dtype=torch.float32, device=q.device
     )
-    native_fwd_fa4(q, k, v, out, lse, softmax_scale)
+    native_fwd_fa4(q, k, v, out, lse, softmax_scale, causal)
     return out, lse
 
 
@@ -49,6 +50,7 @@ def native_fwd_fa4(
     out: torch.Tensor,
     lse: torch.Tensor,
     softmax_scale: float,
+    causal: bool = False,
 ) -> None:
     """JIT-compile (if needed) and dispatch a single fwd call."""
     from flash_attn_mojo.fwd_fa4._jit import call_fwd_fa4
@@ -81,5 +83,6 @@ def native_fwd_fa4(
             _DTYPE_CODE[q.dtype],
             head_dim,
             1,  # use_external_stream
+            1 if causal else 0,
         )
     )

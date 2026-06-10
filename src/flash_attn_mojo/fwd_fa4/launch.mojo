@@ -44,6 +44,7 @@ def launch_fwd_fa4[
     dtype: DType,
     head_dim: Int,
     use_external_stream: Bool,
+    causal: Bool = False,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -129,6 +130,7 @@ def launch_fwd_fa4[
         type_of(k_tma).desc_shape,
         type_of(o_tma).tile_shape,
         type_of(o_tma).desc_shape,
+        causal,
     ]
 
     var compiled = ctx.compile_function[
@@ -141,7 +143,25 @@ def launch_fwd_fa4[
         )
     )
 
-    var grid = (ceildiv(seqlen_int, Int(kFa4BlockM)), nheads_int, batch_int)
+    # Scheduler params (used by the causal LPT decode; harmless
+    # otherwise). L2 swizzle: how many (head, batch) pairs share one
+    # m_block sweep so their K+V tiles stay L2-resident (FA4's
+    # SingleTileLPTScheduler with a 50 MiB L2 budget).
+    var num_m: Int = ceildiv(seqlen_int, Int(kFa4BlockM))
+    var size_one_kv_head: Int = seqlen_int * 2 * head_dim * size_of[dtype]()
+    var l2_ratio: Int = (50 * 1024 * 1024) // size_one_kv_head
+    var sched_swizzle: Int = 1
+    while sched_swizzle * 2 <= l2_ratio:
+        sched_swizzle *= 2
+    var num_hb: Int = nheads_int * batch_int
+    var sched_num_hb_q: Int = num_hb // sched_swizzle
+    var sched_residual: Int = max(num_hb % sched_swizzle, 1)
+
+    var grid: Tuple[Int, Int, Int]
+    comptime if causal:
+        grid = (num_m * num_hb, 1, 1)
+    else:
+        grid = (num_m, nheads_int, batch_int)
 
     comptime if use_external_stream:
         var stream = ctx.create_external_stream(stream_opaque)
@@ -154,6 +174,10 @@ def launch_fwd_fa4[
             lse_ptr,
             seqlen_int,
             softmax_scale,
+            nheads_int,
+            sched_swizzle,
+            sched_num_hb_q,
+            sched_residual,
             grid_dim=grid,
             block_dim=(kFa4NThreads,),
             shared_mem_bytes=smem_bytes,
@@ -168,6 +192,10 @@ def launch_fwd_fa4[
             lse_ptr,
             seqlen_int,
             softmax_scale,
+            nheads_int,
+            sched_swizzle,
+            sched_num_hb_q,
+            sched_residual,
             grid_dim=grid,
             block_dim=(kFa4NThreads,),
             shared_mem_bytes=smem_bytes,

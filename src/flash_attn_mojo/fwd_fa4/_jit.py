@@ -40,7 +40,8 @@ def call_fwd_fa4(args: tuple) -> None:
         12     dtype_code     (comptime)
         13     head_dim       (comptime)
         14     use_external_stream (comptime)
-    ``ctx_handle`` is appended as index 15 by this dispatcher.
+        15     causal         (comptime)
+    ``ctx_handle`` is appended as index 16 by this dispatcher.
     """
     variant_fn, ctx_handle = _get_variant_fn(_config_from_args(args))
     variant_fn(*args, ctx_handle)
@@ -50,23 +51,26 @@ def _config_from_args(args: tuple) -> tuple:
     dtype_code = args[13]
     head_dim = args[14]
     use_external_stream = bool(args[15])
+    causal = bool(args[16])
     dump_ptx = os.environ.get("MOJO_DUMP_PTX", "")
-    return (dtype_code, head_dim, use_external_stream, dump_ptx)
+    return (dtype_code, head_dim, use_external_stream, causal, dump_ptx)
 
 
 def _mod_name(config: tuple) -> str:
-    (dt, hd, ues, dump_ptx) = config
-    suffix = "_dumpptx" if dump_ptx else ""
+    (dt, hd, ues, causal, dump_ptx) = config
+    suffix = "_causal" if causal else ""
+    suffix += "_dumpptx" if dump_ptx else ""
     return f"{_DTYPE_NAME[dt]}_hd{hd}_extstr{int(ues)}{suffix}"
 
 
 def _defines(config: tuple) -> dict[str, str]:
-    (dt, hd, ues, dump_ptx) = config
+    (dt, hd, ues, causal, dump_ptx) = config
 
     defines = {
         "DTYPE": _DTYPE_DEFINE[dt],
         "HEAD_DIM": str(hd),
         "USE_EXTERNAL_STREAM": "true" if ues else "false",
+        "CAUSAL": "true" if causal else "false",
     }
     if dump_ptx:
         defines["MOJO_DUMP_PTX"] = dump_ptx

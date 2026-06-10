@@ -98,6 +98,7 @@ def fwd_fa4_kernel[
     kv_desc_shape: IndexList[3],
     o_tile_shape: IndexList[3],
     o_desc_shape: IndexList[3],
+    causal: Bool = False,
 ](
     q_tma: TMATensorTile[dtype, 3, q_tile_shape, q_desc_shape],
     k_tma: TMATensorTile[dtype, 3, kv_tile_shape, kv_desc_shape],
@@ -106,6 +107,10 @@ def fwd_fa4_kernel[
     lse_ptr: UnsafePointer[Float32, MutAnyOrigin],
     seq_len: Int,
     softmax_scale: Float32,
+    nheads: Int,
+    sched_swizzle: Int,
+    sched_num_hb_q: Int,
+    sched_residual: Int,
 ):
     comptime BM: Int = kFa4BlockM
     comptime BN: Int = kFa4BlockN
@@ -164,10 +169,38 @@ def fwd_fa4_kernel[
             empty[s].init(Int32(NWG * 128))
     barrier()
 
-    var m_block: Int = Int(block_idx.x)
-    var h_idx: Int = Int(block_idx.y)
-    var b_idx: Int = Int(block_idx.z)
+    var m_block: Int
+    var h_idx: Int
+    var b_idx: Int
+    comptime if causal:
+        # FA4's SingleTileLPTScheduler (static, non-persistent): flat
+        # 1-D grid; heaviest m_blocks launch FIRST (LPT reversal) and
+        # sched_swizzle (head,batch) pairs sweep each m together so
+        # their K/V tiles stay L2-resident.
+        var bx: Int = Int(block_idx.x)
+        var num_m: Int = (seq_len + BM - 1) // BM
+        var l2_major: Int = num_m * sched_swizzle
+        var bidhb: Int = bx // l2_major
+        var l2_mod: Int = bx - bidhb * l2_major
+        var dvsr: Int = (
+            sched_swizzle if bidhb < sched_num_hb_q else sched_residual
+        )
+        var blk: Int = l2_mod // dvsr
+        var res: Int = l2_mod - blk * dvsr
+        var bidhb_act: Int = bidhb * sched_swizzle + res
+        b_idx = bidhb_act // nheads
+        h_idx = bidhb_act - b_idx * nheads
+        m_block = num_m - 1 - blk
+    else:
+        m_block = Int(block_idx.x)
+        h_idx = Int(block_idx.y)
+        b_idx = Int(block_idx.z)
     var num_kv_blocks: Int = (seq_len + BN - 1) // BN
+    comptime if causal:
+        # BM == BN: row block m attends KV tiles 0..m inclusive; the
+        # tile n == m_block is the (only) masked diagonal tile.
+        comptime assert BM == BN, "causal block-skip assumes BM == BN"
+        num_kv_blocks = min(num_kv_blocks, m_block + 1)
 
     # shfl-broadcast warpgroup index (the bwd's tid-widening trap:
     # ptxas's tid-uniformity rule only matches 32-bit shr.u32, and
@@ -321,11 +354,27 @@ def fwd_fa4_kernel[
     ]:
         return {kv_smem_base + slot * kv_slot_size}
 
+    # c-frag (row, col) roots for the diagonal mask (within-tile
+    # coordinates; global q = m*BM + row, kv = n*BN + col, and on the
+    # diagonal tile n == m_block the mask is simply col > row).
+    var mask_row_lo: Int = (
+        wg * WGMMA_M + (Int(warp_id()) % 4) * 16 + Int(lane_id()) // 4
+    )
+    var mask_col_lo: Int = 2 * (Int(lane_id()) % 4)
+
     @parameter
     @always_inline
-    def softmax_block():
+    def softmax_block(mask_diag: Bool):
         """Online softmax over s_reg (S just retired): update
-        rowmax/rowsum/scale_old, write P (f32) back into s_reg."""
+        rowmax/rowsum/scale_old, write P (f32) back into s_reg.
+        mask_diag (causal only): apply the diagonal-tile mask first."""
+        comptime if causal:
+            if mask_diag:
+                comptime for c in range(c_frag_size_qk):
+                    comptime col_base: Int = (c // 4) * 8 + (c & 1)
+                    comptime row_off: Int = 8 if (c % 4) >= 2 else 0
+                    if col_base + mask_col_lo > mask_row_lo + row_off:
+                        s_reg.ptr[c] = neg_inf
         var local_max = stack_allocation[
             rows_per_thread, Scalar[accum_type]
         ]()
@@ -383,7 +432,9 @@ def fwd_fa4_kernel[
     warpgroup_fence(s_reg)
     _ = empty[0].arrive()
 
-    softmax_block()  # rowmax starts at -inf -> scale_old==0, rowsum init
+    # rowmax starts at -inf -> scale_old==0, rowsum init. For causal,
+    # m_block 0's single tile IS the diagonal.
+    softmax_block(causal and num_kv_blocks == 1)
     pack_p()  # P(0)
 
     # ---- Main loop: QK(n+1) + PV(n) per iteration. Ring slots and
@@ -396,7 +447,7 @@ def fwd_fa4_kernel[
     var v_phase: UInt32 = 0
     var v_wrap: Int = 0
 
-    for _ in range(num_kv_blocks - 1):
+    for it in range(num_kv_blocks - 1):
         # Queue QK(n+1) then PV(n) on the tensor core.
         full[k_slot].wait(k_phase)
         named_barrier[Int32(NWG * 128)](Int32(1 + wg))
@@ -419,8 +470,9 @@ def fwd_fa4_kernel[
         warpgroup_fence(s_reg)
         _ = empty[k_slot].arrive()
 
-        # Softmax of S(n+1) overlaps PV(n).
-        softmax_block()
+        # Softmax of S(n+1) overlaps PV(n). For causal the last
+        # tile (n+1 == num_kv_blocks-1 == m_block) is the diagonal.
+        softmax_block(causal and it == num_kv_blocks - 2)
 
         # PV(n) retired: p_reg and o_reg are safe to touch.
         wgmma_pv.wait_group[0]()
@@ -501,7 +553,7 @@ def fwd_fa4_kernel[
     # writes its thread's two rows; (B, H, S) f32, grid.y == nheads.
     if lane_pair == 0:
         var lse_row_base: Int = (
-            b_idx * Int(grid_dim.y) + h_idx
+            b_idx * nheads + h_idx
         ) * seq_len + m_block * BM
         comptime LN2: Scalar[accum_type] = 0.6931471805599453
         comptime for i in range(rows_per_thread):
