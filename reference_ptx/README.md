@@ -5,6 +5,29 @@ Mojo kernel: the PTX of FA4's Hopper forward kernel
 (`flash_attn.cute.flash_fwd_sm90.FlashAttentionForwardSm90`) for the
 canonical config we are trying to match.
 
+The backward counterparts (same canonical config):
+
+- `fa4_bwd_sm90_bf16_hdim128_noncausal.ptx` — the main bwd kernel
+  (`FlashAttentionBackwardSm90`). Config from
+  `interface._tile_size_bwd_sm90(128, ...)`: tile_m=80, tile_n=128,
+  SdP_swapAB + dQ_swapAB, 2-stage Q/dO/PdS pipelines, dQ accumulated
+  into fp32 gmem via vectorized `red.v2/v4.f32` atomics. PTX = one
+  unrolled iteration: 24x `wgmma.m64n80k16` (S^T, dP^T, dQ^T) +
+  10x `wgmma.m64n128k16` (dV, dK; k=80 -> 5 each).
+- `fa4_bwd_preprocess_bf16_hdim128.ptx` — dpsum = rowsum(dO*O),
+  lse_log2 = lse * log2(e), zero dq_accum.
+- `fa4_bwd_postprocess_bf16_hdim128.ptx` — dq_accum fp32 -> dq bf16.
+
+Backward target numbers (H100 PCIe, B=2 S=8192 H=16 D=128,
+non-causal, torch.profiler CUPTI):
+
+| kernel | time |
+|---|---|
+| FlashAttentionBackwardSm90 (main) | 6198 us |
+| preprocess | 153 us |
+| postprocess | 109 us |
+| **bwd total** | **~6460 us (~425 TFLOPS over 2.75 TFLOP)** |
+
 ## Canonical config ("the simplest call")
 
 ```python
