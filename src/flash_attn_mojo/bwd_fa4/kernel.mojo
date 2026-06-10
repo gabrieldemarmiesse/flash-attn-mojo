@@ -279,9 +279,10 @@ def bwd_main_kernel[
         mbar_k[0].init()
         mbar_v[0].init()
         comptime for s in range(STAGES):
-            # Even (Q) slots: TMA expect-arrive + producer-warp
-            # arrive after staging lse/dps.
-            full[s].init(2 if s % 2 == 0 else 1)
+            # One expect-arrive per slot (producer lane 0); the
+            # slot's 320-B lse/dps cp.async.bulk rides the same
+            # barrier via expect_tx (FA4's design — no stager warp).
+            full[s].init(1)
             empty[s].init(Int32(NWG * 128))
     barrier()
 
@@ -308,10 +309,20 @@ def bwd_main_kernel[
             var phase: UInt32 = 0
             var wrap: Int = 0
             var q_row: Int = b_idx * seq_len
+            # lse_log2/dpsum are (B, H, Spad) — padded to a
+            # multiple of BM (pad rows +inf / 0).
+            var bh_stat: Int = (
+                (b_idx * Int(grid_dim.y) + h_idx)
+                * (num_m_blocks * BM)
+            ) * 4
+            var lse_byte: Int = Int(lse_log2_ptr) + bh_stat
+            var dps_byte: Int = Int(dpsum_ptr) + bh_stat
             for _ in range(num_m_blocks):
-                # Tight TMA-issue loop: lse/dpsum staging lives on
-                # warp 2 so no synchronous gmem load sits between
-                # the Q and dO issues.
+                # Tight TMA-issue loop. lse (Q slot) and dpsum (dO
+                # slot) ride each stage's mbarrier as 320-B 1-D
+                # cp.async.bulk copies counted by the same
+                # expect_tx (FA4's design — the TMA/DMA engine does
+                # the staging; no warp touches gmem).
                 empty[slot].wait(phase)
                 if lane == 0:
                     var q_st = LayoutTensor[
@@ -322,10 +333,22 @@ def bwd_main_kernel[
                         alignment=128,
                     ](ring_base + slot * q_slot_size)
                     full[slot].expect_bytes(
-                        Int32(BM * D * size_of[dtype]())
+                        Int32(BM * D * size_of[dtype]() + BM * 4)
                     )
                     q_tma.async_copy_3d(
                         q_st, full[slot], (0, h_idx, q_row)
+                    )
+                    inlined_assembly[
+                        "cp.async.bulk.shared::cluster.global"
+                        + ".mbarrier::complete_tx::bytes"
+                        + " [$0], [$1], $2, [$3];",
+                        NoneType,
+                        constraints="r,l,r,r",
+                    ](
+                        Int32(Int(lse_smem + (slot // 2) * BM)),
+                        Int64(lse_byte),
+                        Int32(BM * 4),
+                        Int32(Int(full + slot)),
                     )
 
                 empty[slot + 1].wait(phase)
@@ -338,13 +361,27 @@ def bwd_main_kernel[
                         alignment=128,
                     ](ring_base + (slot + 1) * q_slot_size)
                     full[slot + 1].expect_bytes(
-                        Int32(BM * D * size_of[dtype]())
+                        Int32(BM * D * size_of[dtype]() + BM * 4)
                     )
                     do_tma.async_copy_3d(
                         do_st, full[slot + 1], (0, h_idx, q_row)
                     )
+                    inlined_assembly[
+                        "cp.async.bulk.shared::cluster.global"
+                        + ".mbarrier::complete_tx::bytes"
+                        + " [$0], [$1], $2, [$3];",
+                        NoneType,
+                        constraints="r,l,r,r",
+                    ](
+                        Int32(Int(dps_smem + (slot // 2) * BM)),
+                        Int64(dps_byte),
+                        Int32(BM * 4),
+                        Int32(Int(full + slot + 1)),
+                    )
 
                 q_row += BM
+                lse_byte += BM * 4
+                dps_byte += BM * 4
                 slot += 2
                 wrap += 1
                 if wrap == STAGES // 2:
@@ -387,47 +424,6 @@ def bwd_main_kernel[
                     cp_async_bulk_commit_group()
                 dq_byte_base += 2 * DQ_MAIL_F32 * 4
             cp_async_bulk_wait_group[0]()
-        elif thread_idx.x < 96:
-            # ---- lse/dpsum stager (warp 2). Rides the Q slot's
-            # full barrier as its second arrival (init(2): TMA
-            # expect + this warp's lane 0).
-            var lane_s: Int = Int(lane_id())
-            var slot: Int = 0
-            var phase: UInt32 = 0
-            var wrap: Int = 0
-            # lse_log2/dpsum are (B, H, Spad): padded to a multiple
-            # of BM (pad rows: +inf / 0, written by preprocess).
-            var lse_row: Int = (
-                b_idx * Int(grid_dim.y) + h_idx
-            ) * (num_m_blocks * BM)
-            for _ in range(num_m_blocks):
-                empty[slot].wait(phase)
-                var lse_buf = lse_smem + (slot // 2) * BM
-                var dps_buf = dps_smem + (slot // 2) * BM
-                comptime for j in range((BM + 63) // 64):
-                    var idx: Int = j * 64 + lane_s * 2
-                    if idx < BM:
-                        (lse_buf + idx).store[width=2](
-                            (lse_log2_ptr + lse_row + idx).load[
-                                width=2
-                            ]()
-                        )
-                        (dps_buf + idx).store[width=2](
-                            (dpsum_ptr + lse_row + idx).load[
-                                width=2
-                            ]()
-                        )
-                fence_async_view_proxy()
-                syncwarp()
-                if lane_s == 0:
-                    _ = full[slot].arrive()
-                lse_row += BM
-                slot += 2
-                wrap += 1
-                if wrap == STAGES // 2:
-                    wrap = 0
-                    slot = 0
-                    phase ^= 1
         return
 
     # ================= MMA warpgroups =================
@@ -523,6 +519,7 @@ def bwd_main_kernel[
     # ---- consumer state.
     mbar_k[0].wait(UInt32(0))
     mbar_v[0].wait(UInt32(0))
+
 
     var slot: Int = 0
     var phase: UInt32 = 0
