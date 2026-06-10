@@ -14,17 +14,19 @@
 #      kernels side by side.
 #
 # Usage:
-#   scripts/master_bench.sh [--shape B,S,H,D] [--iters N] [--no-ncu]
+#   scripts/master_bench.sh [--kind fwd|bwd] [--shape B,S,H,D]
+#                           [--iters N] [--no-ncu]
 #                           [--ncu-set basic|detailed|full]
 #                           [--refresh-fa4-ptx] [--no-check]
 #
-# Typical loop: edit src/flash_attn_mojo/fwd_fa4/kernel.mojo, run
-# scripts/master_bench.sh, read the summary, repeat.
+# Typical loop: edit src/flash_attn_mojo/{fwd,bwd}_fa4/kernel.mojo,
+# run scripts/master_bench.sh [--kind bwd], read the summary, repeat.
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+KIND="fwd"
 SHAPE="2,8192,16,128"
 ITERS=20
 RUN_NCU=1
@@ -34,19 +36,30 @@ CHECK=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --kind) KIND="$2"; shift 2 ;;
         --shape) SHAPE="$2"; shift 2 ;;
         --iters) ITERS="$2"; shift 2 ;;
         --no-ncu) RUN_NCU=0; shift ;;
         --ncu-set) NCU_SET="$2"; shift 2 ;;
         --refresh-fa4-ptx) REFRESH_FA4_PTX=1; shift ;;
         --no-check) CHECK=0; shift ;;
-        -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
 
-FA4_PTX="$ROOT/reference_ptx/fa4_fwd_sm90_bf16_hdim128_noncausal.ptx"
-MOJO_PTX="$ROOT/ptx/mojo_fwd_fa4.ptx"
+if [[ "$KIND" == "fwd" ]]; then
+    FA4_PTX="$ROOT/reference_ptx/fa4_fwd_sm90_bf16_hdim128_noncausal.ptx"
+    MOJO_PTX="$ROOT/ptx/mojo_fwd_fa4.ptx"
+    FA4_NCU_FILTER='FlashAttentionForwardSm90'
+    MOJO_NCU_FILTER='fwd_fa4_kernel'
+else
+    FA4_PTX="$ROOT/reference_ptx/fa4_bwd_sm90_bf16_hdim128_noncausal.ptx"
+    MOJO_PTX="$ROOT/ptx/mojo_bwd_fa4.ptx"
+    # ncu compares the *main* bwd kernel (>95% of bwd time).
+    FA4_NCU_FILTER='FlashAttentionBackwardSm90'
+    MOJO_NCU_FILTER='bwd_main_kernel'
+fi
 mkdir -p "$ROOT/ptx"
 
 UV="$(command -v uv)"
@@ -61,22 +74,22 @@ rm -rf ~/.cache/flash_attn_mojo
 # A single bench run compiles the kernel (cache was just cleared),
 # dumps its PTX (MOJO_DUMP_PTX define), checks correctness vs fp32
 # SDPA + FA4, and measures kernel time.
-step "2+3. mojo: compile, dump PTX, check, bench"
+step "2+3. mojo ($KIND): compile, dump PTX, check, bench"
 MOJO_RESULT="$(MOJO_DUMP_PTX="$MOJO_PTX" "$UV" run python scripts/bench_fa4.py \
-    --impl mojo --shape "$SHAPE" --iters "$ITERS" "${CHECK_FLAG[@]}" | tee /dev/stderr | grep ^RESULT)"
+    --impl mojo --kind "$KIND" --shape "$SHAPE" --iters "$ITERS" "${CHECK_FLAG[@]}" | tee /dev/stderr | grep ^RESULT)"
 
-step "2b. fa4 bench"
+step "2b. fa4 ($KIND) bench"
 if [[ "$REFRESH_FA4_PTX" == 1 ]]; then
     TMP_PTX_DIR="$(mktemp -d)"
     FA4_RESULT="$(CUTE_DSL_KEEP_PTX=1 CUTE_DSL_DUMP_DIR="$TMP_PTX_DIR" \
         FLASH_ATTENTION_CUTE_DSL_CACHE_DIR="$(mktemp -d)" \
         "$UV" run python scripts/bench_fa4.py \
-        --impl fa4 --shape "$SHAPE" --iters "$ITERS" "${CHECK_FLAG[@]}" | tee /dev/stderr | grep ^RESULT)"
-    tr -d '\000' < "$TMP_PTX_DIR"/cutlass*FlashAttentionForwardSm90*.ptx > "$FA4_PTX"
+        --impl fa4 --kind "$KIND" --shape "$SHAPE" --iters "$ITERS" "${CHECK_FLAG[@]}" | tee /dev/stderr | grep ^RESULT)"
+    tr -d '\000' < "$TMP_PTX_DIR"/cutlass*${FA4_NCU_FILTER}*.ptx > "$FA4_PTX"
     echo "[master_bench] refreshed $FA4_PTX"
 else
     FA4_RESULT="$("$UV" run python scripts/bench_fa4.py \
-        --impl fa4 --shape "$SHAPE" --iters "$ITERS" "${CHECK_FLAG[@]}" | tee /dev/stderr | grep ^RESULT)"
+        --impl fa4 --kind "$KIND" --shape "$SHAPE" --iters "$ITERS" "${CHECK_FLAG[@]}" | tee /dev/stderr | grep ^RESULT)"
 fi
 
 # ---------------------------------------------------------------- 4
@@ -108,8 +121,8 @@ if [[ "$RUN_NCU" == 1 ]]; then
         if [[ -n "$PIXI" ]]; then
             for IMPL in fa4 mojo; do
                 case "$IMPL" in
-                    fa4)  FILT='FlashAttentionForwardSm90' ;;
-                    mojo) FILT='fwd_fa4_kernel' ;;
+                    fa4)  FILT="$FA4_NCU_FILTER" ;;
+                    mojo) FILT="$MOJO_NCU_FILTER" ;;
                 esac
                 echo "[master_bench] ncu capture: $IMPL (filter $FILT)"
                 "${SUDO_PREFIX[@]}" "$PIXI" "${NCU_SPEC[@]}" \
@@ -120,7 +133,7 @@ if [[ "$RUN_NCU" == 1 ]]; then
                     --set "$NCU_SET" \
                     --force-overwrite -o "/tmp/master_bench_${IMPL}" \
                     "$UV" run python scripts/bench_fa4.py \
-                        --impl "$IMPL" --shape "$SHAPE" --profile \
+                        --impl "$IMPL" --kind "$KIND" --shape "$SHAPE" --profile \
                         --iters 1 --warmup 3 > /dev/null
             done
             "$UV" run python scripts/ncu_compare.py \
