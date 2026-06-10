@@ -325,8 +325,15 @@ def launch_bwd_convert[
         unsafe_from_address=dq_addr
     )
 
+    # 128 x (128+4) f32 transpose tile.
+    comptime cvt_smem_bytes: Int = head_dim * (kBwdPreBlockM + 4) * 4
+
     comptime kernel_inst = bwd_convert_kernel[dtype, head_dim]
-    var compiled = ctx.compile_function[kernel_inst, kernel_inst]()
+    var compiled = ctx.compile_function[kernel_inst, kernel_inst](
+        func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
+            UInt32(cvt_smem_bytes)
+        )
+    )
     var grid = (
         ceildiv(seqlen_int, Int(kBwdPreBlockM)),
         nheads_int,
@@ -344,6 +351,7 @@ def launch_bwd_convert[
             softmax_scale,
             grid_dim=grid,
             block_dim=(kBwdPreThreads,),
+            shared_mem_bytes=cvt_smem_bytes,
         )
     else:
         ctx.enqueue_function(
@@ -355,5 +363,6 @@ def launch_bwd_convert[
             softmax_scale,
             grid_dim=grid,
             block_dim=(kBwdPreThreads,),
+            shared_mem_bytes=cvt_smem_bytes,
         )
         ctx.synchronize()

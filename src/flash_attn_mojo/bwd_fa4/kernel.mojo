@@ -60,11 +60,15 @@ from std.gpu.memory import (
 from std.gpu.sync import named_barrier
 from std.memory import stack_allocation
 
+from std.gpu.compute.mma import wgmma_async
+
 from layout import Layout, LayoutTensor
 from layout.tensor_core_async import (
     TensorCoreAsync,
+    _wgmma_descriptor,
     tile_layout_k_major,
     tile_layout_mn_major,
+    tile_to_descriptor,
     warpgroup_fence,
 )
 from layout.tma_async import SharedMemBarrier, TMATensorTile
@@ -142,10 +146,31 @@ def bwd_main_kernel[
     comptime qt_view_layout = tile_layout_mn_major[
         dtype, D, BM, swizzle_mode=swizzle
     ]()
-    # dS staged k-major (BM, BN), unswizzled, for the dQ GEMM's A.
-    comptime sds_layout = tile_layout_k_major[
-        dtype, BM, BN, swizzle_mode = TensorMapSwizzle.SWIZZLE_NONE
+    # dS^T staged in its natural (BN rows, BM cols) orientation with
+    # the 128B swizzle (BM=64 bf16 cols = exactly one swizzle row).
+    # Viewed mn-major (BM, BN) it is the B operand of the hand-rolled
+    # dQ^T GEMM below (same trick as fwd's V tile).
+    comptime sds_b_layout = tile_layout_mn_major[
+        dtype, BM, BN, swizzle_mode=swizzle
     ]()
+    comptime sds_canonical = tile_to_descriptor[
+        dtype, sds_b_layout, False
+    ]()
+    # A operand of dQ^T = K^T (D, BN) = the mn-major view of K's
+    # bytes. TensorCoreAsync only supports k-major A, so the dQ^T
+    # GEMM is hand-rolled with raw wgmma_async[layout_a="col"].
+    comptime kt_canonical = tile_to_descriptor[
+        dtype, kt_view_layout, False
+    ]()
+    comptime kt_shape00: Int = kt_canonical[0].shape[0].value()
+    comptime kt_stride01: Int = kt_canonical[0].stride[1].value()
+    comptime kt_stride11: Int = kt_canonical[1].stride[1].value()
+    comptime a_wg_stride: Int = (
+        kt_stride01 * (WGMMA_M // kt_shape00) * size_of[dtype]()
+    )
+    comptime a_k_stride: Int = kt_stride11 * 2 * size_of[dtype]()
+    comptime sds_stride11: Int = sds_canonical[1].stride[1].value()
+    comptime b_k_stride: Int = sds_stride11 * 2 * size_of[dtype]()
 
     comptime kv_tile_size: Int = BN * D
     comptime q_slot_size: Int = BM * D
@@ -300,17 +325,6 @@ def bwd_main_kernel[
         b_swizzle=swizzle,
         transpose_b=False,
     ]()
-    # dQ: (BM x D) = dS_smem · K (B = mn-major view). BM=64 -> a
-    # single warpgroup's m64; only wg 0 runs it.
-    var wgmma_dq = TensorCoreAsync[
-        accum_type,
-        dtype,
-        dtype,
-        IndexList[3](WGMMA_M, D, WGMMA_K),
-        a_swizzle = TensorMapSwizzle.SWIZZLE_NONE,
-        b_swizzle=swizzle,
-        transpose_b=False,
-    ]()
 
     comptime c_frag_sdp: Int = WGMMA_M * BM // 128  # 32
     comptime c_frag_dkv: Int = WGMMA_M * D // 128  # 64
@@ -355,9 +369,10 @@ def bwd_main_kernel[
     ].stack_allocation()
     _ = dv_acc.fill(0)
     _ = dk_acc.fill(0)
+    comptime c_frag_dq: Int = WGMMA_M * BM // 128  # 32
     var dq_reg = LayoutTensor[
         accum_type,
-        Layout.row_major(1, c_frag_dkv),
+        Layout.row_major(1, c_frag_dq),
         MutAnyOrigin,
         address_space=AddressSpace.LOCAL,
     ].stack_allocation()
@@ -371,9 +386,10 @@ def bwd_main_kernel[
         softmax_scale * Scalar[DType.float32](log2e)
     ).cast[accum_type]()
 
-    # Per-(b,h) row base for lse_log2 / dpsum / dq_accum, all laid
-    # out (B, H, S[, D]). grid_dim.y == nheads.
+    # Per-(b,h) row base for lse_log2 / dpsum ((B, H, S) fp32);
+    # grid_dim.y == nheads. dq_accum is (B, H, D, S) fp32.
     var bh_row_base: Int = (b_idx * Int(grid_dim.y) + h_idx) * seq_len
+    var dq_bh_base: Int = (b_idx * Int(grid_dim.y) + h_idx) * D
 
     # ---- consumer state.
     mbar_k[0].wait(UInt32(0))
@@ -496,24 +512,29 @@ def bwd_main_kernel[
         wgmma_dkv.wgmma(ds_reg, qt_view, dk_acc)
         wgmma_dkv.commit_group()
 
-        # Stage dS (transposed: [q col, kv row]) for the dQ GEMM in
-        # the double-buffered sdS (stage = iter % 2). sds is k-major
-        # (BM, BN) unswizzled; canonical layout is 8x8 core matrices:
-        # offset(m, k) = (m%8)*8 + (m//8)*64 + k%8 + (k//8)*(BM*8).
+        # Stage dS^T in its natural (kv row, q col) orientation with
+        # the 128B swizzle. The hardware computes the swizzle XOR
+        # from the *absolute* smem address ((addr>>7)&7), and the
+        # dynamic-smem base is not necessarily 1024B-aligned (the
+        # static-smem mbarriers shift it), so the base's line phase
+        # is folded into the XOR: offset(r, c) =
+        # r*BM + ((c/8)^((r + phase)%8))*8 + c%8. Pairs (c, c+1)
+        # stay contiguous -> 32-bit stores, conflict-free.
         var sds_stage_base = sds_base + sds_stage * sds_size
-        var sds_thread_base = (
-            sds_stage_base
-            + 2 * lane_pair * 8
-            + lane_group
-            + (wg * 8 + warp_in_wg * 2) * (BM * 8)
-        )
-        comptime for c in range(c_frag_sdp):
-            comptime cc: Int = c // 4
-            comptime in_chunk: Int = c % 4
-            comptime j: Int = c & 1
-            comptime bot: Int = 1 if in_chunk >= 2 else 0
-            comptime c_off: Int = j * 8 + cc * 64 + bot * (BM * 8)
-            (sds_thread_base + c_off)[0] = ds_reg.ptr[c]
+        var sds_phase: Int = (Int(sds_stage_base) >> 7) & 7
+        var kv_r_lo: Int = wg * WGMMA_M + warp_in_wg * 16 + lane_group
+        var xor_lo: Int = (lane_group + sds_phase) & 7
+        comptime for c2 in range(c_frag_sdp // 2):
+            comptime cc: Int = c2 // 2
+            comptime bot: Int = c2 % 2
+            var r: Int = kv_r_lo + (8 if bot == 1 else 0)
+            var off: Int = (
+                r * BM + ((cc ^ xor_lo) * 8) + 2 * lane_pair
+            )
+            var pair = SIMD[dtype, 2](
+                ds_reg.ptr[2 * c2], ds_reg.ptr[2 * c2 + 1]
+            )
+            (sds_stage_base + off).store[width=2, alignment=4](pair)
 
         # Prefetch the next tile's lse_log2/dpsum into the other
         # smem stage (ordered before next iter's reads by the
@@ -535,52 +556,69 @@ def bwd_main_kernel[
         # gets rewritten next iteration.
         named_barrier[Int32(NWG * 128)](Int32(4))
 
-        # dQ = dS · K on warpgroup 0 (M = BM = 64 = one warpgroup).
-        if wg == 0:
-            var sds_view = LayoutTensor[
-                dtype,
-                sds_layout,
-                MutAnyOrigin,
-                address_space=AddressSpace.SHARED,
-                alignment=128,
-            ](sds_stage_base)
-            warpgroup_fence(dq_reg)
-            wgmma_dq.arrive()
-            wgmma_dq.wgmma[scale_c=0](sds_view, kt_view, dq_reg)
-            wgmma_dq.commit_group()
-            # dV+dK retired (dQ may still run); release the ring.
-            wgmma_dkv.wait_group[1]()
-        else:
-            wgmma_dkv.wait_group[0]()
+        # dQ^T (D x BM) = K^T · dS, hand-rolled (layout_a="col" so A
+        # is K's bytes read mn-major). M = D = 128 split m64 per
+        # warpgroup -> both warpgroups share the GEMM.
+        warpgroup_fence(dq_reg)
+        wgmma_sdp.arrive()
+        var a_desc = _wgmma_descriptor[kt_canonical, False, swizzle](
+            k_base
+        ) + wg * a_wg_stride
+        var b_desc = _wgmma_descriptor[sds_canonical, False, swizzle](
+            sds_stage_base
+        )
+        var dq_frags = dq_reg.vectorize[1, c_frag_dq]()
+        comptime for k_mma in range(BN // WGMMA_K):
+            dq_frags[0, 0] = wgmma_async[
+                WGMMA_M,
+                BM,
+                WGMMA_K,
+                accum_type,
+                a_type=dtype,
+                b_type=dtype,
+                layout_a="col",
+                layout_b="row",
+                scale_d = 0 if k_mma == 0 else 1,
+            ](
+                a_desc + k_mma * a_k_stride,
+                b_desc + k_mma * b_k_stride,
+                dq_frags[0, 0],
+            )
+        wgmma_sdp.commit_group()
+
+        # dV+dK retired (dQ^T may still run); release the ring.
+        wgmma_dkv.wait_group[1]()
         warpgroup_fence(dv_acc)
         warpgroup_fence(dk_acc)
         _ = empty[slot].arrive()
         _ = empty[slot + 1].arrive()
 
-        if wg == 0:
-            wgmma_dq.wait_group[0]()
-            warpgroup_fence(dq_reg)
-            # dq_accum[(bh*S + q_base + row)*D + col] += dq c-frag,
-            # paired into red.v2.f32 (no return value -> no
-            # scoreboard, half the LSU instructions).
-            comptime for c2 in range(c_frag_dkv // 2):
-                comptime cc: Int = c2 // 2
-                comptime bot: Int = c2 % 2
-                var qr: Int = (
-                    warp_in_wg * 16 + lane_group + (8 if bot == 1 else 0)
-                )
-                var dcol: Int = cc * 8 + 2 * lane_pair
-                inlined_assembly[
-                    "red.relaxed.gpu.global.add.v2.f32 [$0], {$1, $2};",
-                    NoneType,
-                    constraints="l,f,f",
-                ](
-                    dq_accum_ptr
-                    + (bh_row_base + q_base + qr) * D
-                    + dcol,
-                    dq_reg.ptr[2 * c2],
-                    dq_reg.ptr[2 * c2 + 1],
-                )
+        # dQ^T retired -> drain to dq_accum (B,H,D,S): row = d dim,
+        # col = q; pairs adjacent in q are contiguous -> red.v2.f32.
+        wgmma_sdp.wait_group[0]()
+        warpgroup_fence(dq_reg)
+        comptime for c2 in range(c_frag_dq // 2):
+            comptime cc: Int = c2 // 2
+            comptime bot: Int = c2 % 2
+            var d_row: Int = (
+                wg * WGMMA_M
+                + warp_in_wg * 16
+                + lane_group
+                + (8 if bot == 1 else 0)
+            )
+            var qc: Int = cc * 8 + 2 * lane_pair
+            inlined_assembly[
+                "red.relaxed.gpu.global.add.v2.f32 [$0], {$1, $2};",
+                NoneType,
+                constraints="l,f,f",
+            ](
+                dq_accum_ptr
+                + (dq_bh_base + d_row) * seq_len
+                + q_base
+                + qc,
+                dq_reg.ptr[2 * c2],
+                dq_reg.ptr[2 * c2 + 1],
+            )
 
         sds_stage ^= 1
         q_base += BM
@@ -704,19 +742,20 @@ def bwd_preprocess_kernel[
                 log2e
             )
 
-    # Cooperative coalesced zeroing of this block's dq_accum rows:
-    # (BM * D) f32 starting at ((b*H+h)*S + m_block*BM) * D.
-    var zero_base: Int = (
-        (b_idx * nheads + h_idx) * seq_len + m_block * BM
-    ) * D
+    # Cooperative coalesced zeroing of this block's dq_accum slice:
+    # dq_accum is (B, H, D, S); this block owns s in [m*BM, m*BM+BM)
+    # for every d. 4 d-rows per pass (32 lanes x 4 f32 = the 128 s).
     comptime ZVEC: Int = 4
-    comptime total_vecs: Int = BM * D // ZVEC
-    comptime per_thread: Int = total_vecs // kBwdPreThreads
-    comptime for i in range(per_thread):
+    var dq_bh: Int = (b_idx * nheads + h_idx) * D
+    var lane32: Int = tid % 32
+    var dsub: Int = tid // 32
+    comptime for pass_i in range(D // (kBwdPreThreads // 32)):
+        var d: Int = pass_i * (kBwdPreThreads // 32) + dsub
         (
             dq_accum_ptr
-            + zero_base
-            + (i * kBwdPreThreads + tid) * ZVEC
+            + (dq_bh + d) * seq_len
+            + m_block * BM
+            + lane32 * ZVEC
         ).store[width=ZVEC](SIMD[DType.float32, ZVEC](0))
 
 
@@ -739,29 +778,48 @@ def bwd_convert_kernel[
     nheads: Int,
     softmax_scale: Float32,
 ):
+    """dq[b,s,h,d] = scale * dq_accum[b,h,d,s] via a 128x128 smem
+    transpose tile (both gmem sides coalesced)."""
     comptime D: Int = head_dim
     comptime BM: Int = kBwdPreBlockM
-    comptime VEC: Int = 8
+    comptime PAD: Int = 4  # pad smem rows to dodge bank conflicts
 
     var m_block: Int = Int(block_idx.x)
     var h_idx: Int = Int(block_idx.y)
     var b_idx: Int = Int(block_idx.z)
     var tid: Int = Int(thread_idx.x)
 
-    # Coalesced: 8 threads per row (16 f32 = 64B in, 16 bf16 = 32B
-    # out per thread), 16 rows per pass, 8 passes.
-    comptime LANES_PER_ROW: Int = 8
-    comptime RVEC: Int = D // LANES_PER_ROW  # 16
-    comptime ROWS_PER_PASS: Int = kBwdPreThreads // LANES_PER_ROW  # 16
-    var sub: Int = tid % LANES_PER_ROW
-    var row_in_pass: Int = tid // LANES_PER_ROW
-    comptime for p in range(BM // ROWS_PER_PASS):
-        var s: Int = m_block * BM + p * ROWS_PER_PASS + row_in_pass
-        var acc_off: Int = (
-            (b_idx * nheads + h_idx) * seq_len + s
-        ) * D + sub * RVEC
-        var dq_off: Int = (
-            (b_idx * seq_len + s) * nheads + h_idx
-        ) * D + sub * RVEC
-        var v = (dq_accum_ptr + acc_off).load[width=RVEC]()
-        (dq_ptr + dq_off).store[width=RVEC]((v * softmax_scale).cast[dtype]())
+    var tile = external_memory[
+        Float32,
+        address_space=AddressSpace.SHARED,
+        alignment=16,
+    ]()
+
+    # Phase 1: read (d, s-contiguous) rows of dq_accum, 4 d per pass.
+    var dq_bh: Int = (b_idx * nheads + h_idx) * D
+    var lane32: Int = tid % 32
+    var dsub: Int = tid // 32
+    comptime for pass_i in range(D // (kBwdPreThreads // 32)):
+        var d: Int = pass_i * (kBwdPreThreads // 32) + dsub
+        var v = (
+            dq_accum_ptr
+            + (dq_bh + d) * seq_len
+            + m_block * BM
+            + lane32 * 4
+        ).load[width=4]()
+        comptime for j in range(4):
+            tile[d * (BM + PAD) + lane32 * 4 + j] = v[j]
+    barrier()
+
+    # Phase 2: thread t writes output row s = m*BM + t (contiguous
+    # in d), reading the smem column s_local = t.
+    comptime OV: Int = 8
+    var s: Int = m_block * BM + tid
+    var dq_off: Int = ((b_idx * seq_len + s) * nheads + h_idx) * D
+    comptime for i in range(D // OV):
+        var out = SIMD[dtype, OV]()
+        comptime for j in range(OV):
+            out[j] = (
+                tile[(i * OV + j) * (BM + PAD) + tid] * softmax_scale
+            ).cast[dtype]()
+        (dq_ptr + dq_off + i * OV).store[width=OV](out)

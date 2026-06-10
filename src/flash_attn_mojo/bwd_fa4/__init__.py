@@ -58,8 +58,10 @@ def bwd_fa4(
         (batch, nheads, seqlen), dtype=torch.float32, device=q.device
     )
     lse_log2 = torch.empty_like(dpsum)
+    # (B, H, D, S): the dQ^T c-frag's column pairs (adjacent q) stay
+    # contiguous for the red.v2 atomics in the main kernel.
     dq_accum = torch.empty(
-        (batch, nheads, seqlen, head_dim),
+        (batch, nheads, head_dim, seqlen),
         dtype=torch.float32,
         device=q.device,
     )
