@@ -17,9 +17,10 @@ Three kernels, mirroring FA4's pipeline:
        dS^T = P^T * (dP^T - dpsum[col])
        dK  += dS^T · Q           (wgmma RS, m64n128k16)
        sdS  = dS (transposed store to smem, k-major (BM, BN))
-       dQ  += dS · K             (wgmma SS on warpgroup 0 only,
-                                  m64n128k16; B = K as mn-major view)
-       dq_accum[q, d] +=atomic dQ c-frag   (fp32 gmem)
+       dQ  += dS · K             (hand-rolled wgmma, m64n64k16,
+                                  split m64 per warpgroup)
+       dQ c-frag -> smem mailbox; a producer warp drains it to
+       dq_accum via cp.reduce.async.bulk (FA4's design).
 
    Epilogue: dK *= softmax_scale; dV and dK staged to smem
    (16B-chunk-major) and TMA bulk-stored.
@@ -28,9 +29,13 @@ Three kernels, mirroring FA4's pipeline:
 P^T / dS^T c-frag -> RS a-frag: straight indexwise cast (valid at
 num_m_mmas=1, same argument as the fwd kernel).
 
-dq_accum layout is (B, H, S, D) fp32 so the dQ c-frag's column pairs
-(adjacent d) are contiguous. dpsum/lse_log2 are (B, H, S) fp32.
-All q/k/v/o/do/dq/dk/dv tensors are contiguous (B, S, H, D) bf16.
+dq_accum is an OPAQUE fragment dump (FA4's trick): per m-block of
+BM rows, a contiguous [wg(2)][chunk(8)][tid(128)][4] f32 region —
+the raw dQ^T wgmma c-frags, bulk-reduce-added linearly. Element
+(wg, ch, t, e) is dQ^T row d = wg*64 + (t/32)*16 + (t%32)/4 +
+8*(e/2), col q = ch*8 + 2*(t%4) + e%2. The convert kernel decodes.
+dpsum/lse_log2 are (B, H, S) fp32. All q/k/v/o/do/dq/dk/dv tensors
+are contiguous (B, S, H, D) bf16.
 """
 
 from std.math import exp2
@@ -57,7 +62,13 @@ from std.gpu.memory import (
     external_memory,
     fence_async_view_proxy,
 )
-from std.gpu.sync import named_barrier, syncwarp
+from std.gpu.sync import (
+    cp_async_bulk_commit_group,
+    cp_async_bulk_wait_group,
+    named_barrier,
+    named_barrier_arrive,
+    syncwarp,
+)
 from std.memory import stack_allocation
 
 from std.gpu.compute.mma import wgmma_async
@@ -197,6 +208,14 @@ def bwd_main_kernel[
     # expect + producer arrive); recycled with the slot's empties.
     var lse_smem = (sds_base + 2 * sds_size).bitcast[Float32]()
     var dps_smem = lse_smem + (STAGES // 2) * BM
+    # dQ mailbox (FA4): per MMA wg, the raw dQ^T c-frag dump
+    # [chunk(8)][tid(128)][4] f32 = 16 KiB; the producer's drain
+    # warp cp.reduce.async.bulk's it into dq_accum. Named-barrier
+    # protocol per wg (count 128 + 32): empty 9+wg (drain arrives,
+    # wg syncs), full 6+wg (wg arrives, drain syncs).
+    comptime DQ_MAIL_F32: Int = WGMMA_M * BM  # 4096 (64 d x 64 q)
+    comptime DRAIN_BAR: Int = 128 + 32
+    var dq_mail = dps_smem + (STAGES // 2) * BM
 
     var k_smem = LayoutTensor[
         dtype,
@@ -332,6 +351,40 @@ def bwd_main_kernel[
                     wrap = 0
                     slot = 0
                     phase ^= 1
+        elif thread_idx.x < 64:
+            # ---- dQ drain warp (FA4's design). Per m-tile: signal
+            # each wg's mailbox empty once its previous bulk reduce
+            # finished *reading* smem (wait_group.read), sync the
+            # full barrier, then one lane bulk-reduce-adds the 16
+            # KiB fragment dump into dq_accum. Two outstanding bulk
+            # groups (one per wg) at steady state.
+            var lane_d: Int = Int(lane_id())
+            var dq_byte_base: Int = Int(dq_accum_ptr) + (
+                (b_idx * Int(grid_dim.y) + h_idx) * num_m_blocks
+            ) * (2 * DQ_MAIL_F32 * 4)
+            for _ in range(num_m_blocks):
+                cp_async_bulk_wait_group[1]()
+                named_barrier_arrive[Int32(DRAIN_BAR)](Int32(9))
+                cp_async_bulk_wait_group[0]()
+                named_barrier_arrive[Int32(DRAIN_BAR)](Int32(10))
+                comptime for w in range(2):
+                    named_barrier[Int32(DRAIN_BAR)](Int32(6 + w))
+                    if lane_d == 0:
+                        inlined_assembly[
+                            "cp.reduce.async.bulk.global.shared::cta"
+                            + ".bulk_group.add.f32 [$0], [$1], $2;",
+                            NoneType,
+                            constraints="l,r,r",
+                        ](
+                            Int64(
+                                dq_byte_base + w * DQ_MAIL_F32 * 4
+                            ),
+                            Int32(Int(dq_mail + w * DQ_MAIL_F32)),
+                            Int32(DQ_MAIL_F32 * 4),
+                        )
+                    cp_async_bulk_commit_group()
+                dq_byte_base += 2 * DQ_MAIL_F32 * 4
+            cp_async_bulk_wait_group[0]()
         return
 
     # ================= MMA warpgroups =================
@@ -418,15 +471,15 @@ def bwd_main_kernel[
     var warp_in_wg: Int = Int(warp_id()) % 4
     var lane_group: Int = lane // 4
     var lane_pair: Int = lane % 4
+    var tid_in_wg: Int = Int(thread_idx.x) & 127
 
     var scale_log2: Scalar[accum_type] = (
         softmax_scale * Scalar[DType.float32](log2e)
     ).cast[accum_type]()
 
     # Per-(b,h) row base for lse_log2 / dpsum ((B, H, S) fp32);
-    # grid_dim.y == nheads. dq_accum is (B, H, D, S) fp32.
+    # grid_dim.y == nheads.
     var bh_row_base: Int = (b_idx * Int(grid_dim.y) + h_idx) * seq_len
-    var dq_bh_base: Int = (b_idx * Int(grid_dim.y) + h_idx) * D
 
     # ---- consumer state.
     mbar_k[0].wait(UInt32(0))
@@ -435,7 +488,6 @@ def bwd_main_kernel[
     var slot: Int = 0
     var phase: UInt32 = 0
     var wrap: Int = 0
-    var q_base: Int = 0
     var sds_stage: Int = 0
 
     for _ in range(num_m_blocks):
@@ -606,35 +658,28 @@ def bwd_main_kernel[
         wgmma_dkv.commit_group()
 
         # Queue [dV, dQ, dK]: wait ≤1 retires dV and dQ; dK still
-        # runs while we drain dQ. dO(n) consumed by dV -> release.
+        # runs while we hand dQ off. dO(n) consumed by dV -> release.
         wgmma_dkv.wait_group[1]()
         warpgroup_fence(dv_acc)
         warpgroup_fence(dq_reg)
         _ = empty[slot + 1].arrive()
 
-        # Drain dQ^T to dq_accum (B,H,D,S) under the dK GEMM.
-        comptime for c2 in range(c_frag_dq // 2):
-            comptime cc: Int = c2 // 2
-            comptime bot: Int = c2 % 2
-            var d_row: Int = (
-                wg * WGMMA_M
-                + warp_in_wg * 16
-                + lane_group
-                + (8 if bot == 1 else 0)
+        # Hand dQ^T to the drain warp: raw c-frag dump into this
+        # wg's mailbox (8 x st.shared.v4, fully coalesced), under
+        # the dK GEMM. The drain warp owns the gmem reduce-add.
+        named_barrier[Int32(DRAIN_BAR)](Int32(9 + wg))
+        var mail = dq_mail + wg * DQ_MAIL_F32 + tid_in_wg * 4
+        comptime for ch in range(c_frag_dq // 4):
+            (mail + ch * 512).store[width=4, alignment=16](
+                SIMD[accum_type, 4](
+                    dq_reg.ptr[4 * ch],
+                    dq_reg.ptr[4 * ch + 1],
+                    dq_reg.ptr[4 * ch + 2],
+                    dq_reg.ptr[4 * ch + 3],
+                )
             )
-            var qc: Int = cc * 8 + 2 * lane_pair
-            inlined_assembly[
-                "red.relaxed.gpu.global.add.v2.f32 [$0], {$1, $2};",
-                NoneType,
-                constraints="l,f,f",
-            ](
-                dq_accum_ptr
-                + (dq_bh_base + d_row) * seq_len
-                + q_base
-                + qc,
-                dq_reg.ptr[2 * c2],
-                dq_reg.ptr[2 * c2 + 1],
-            )
+        fence_async_view_proxy()
+        named_barrier_arrive[Int32(DRAIN_BAR)](Int32(6 + wg))
 
         # dK retired -> Q(n) slot reusable.
         wgmma_dkv.wait_group[0]()
@@ -642,7 +687,6 @@ def bwd_main_kernel[
         _ = empty[slot].arrive()
 
         sds_stage ^= 1
-        q_base += BM
         slot += 2
         wrap += 1
         if wrap == 3:
@@ -763,20 +807,24 @@ def bwd_preprocess_kernel[
                 log2e
             )
 
-    # Cooperative coalesced zeroing of this block's dq_accum slice:
-    # dq_accum is (B, H, D, S); this block owns s in [m*BM, m*BM+BM)
-    # for every d. 4 d-rows per pass (32 lanes x 4 f32 = the 128 s).
+    # Zero this block's dq_accum slice. dq_accum is the blocked
+    # fragment dump: D*kBwdBlockM f32 contiguous per main-kernel
+    # m-block; this 128-row block owns 2 of those back to back ->
+    # one flat contiguous memset.
     comptime ZVEC: Int = 4
-    var dq_bh: Int = (b_idx * nheads + h_idx) * D
-    var lane32: Int = tid % 32
-    var dsub: Int = tid // 32
-    comptime for pass_i in range(D // (kBwdPreThreads // 32)):
-        var d: Int = pass_i * (kBwdPreThreads // 32) + dsub
+    comptime BLK_F32: Int = D * kBwdBlockM  # 8192
+    var zbase: Int = (
+        (b_idx * nheads + h_idx) * (seq_len // kBwdBlockM)
+        + m_block * (BM // kBwdBlockM)
+    ) * BLK_F32
+    comptime for pass_i in range(
+        (BM // kBwdBlockM) * BLK_F32 // (kBwdPreThreads * ZVEC)
+    ):
         (
             dq_accum_ptr
-            + (dq_bh + d) * seq_len
-            + m_block * BM
-            + lane32 * ZVEC
+            + zbase
+            + pass_i * kBwdPreThreads * ZVEC
+            + tid * ZVEC
         ).store[width=ZVEC](SIMD[DType.float32, ZVEC](0))
 
 
@@ -816,20 +864,33 @@ def bwd_convert_kernel[
         alignment=16,
     ]()
 
-    # Phase 1: read (d, s-contiguous) rows of dq_accum, 4 d per pass.
-    var dq_bh: Int = (b_idx * nheads + h_idx) * D
-    var lane32: Int = tid % 32
-    var dsub: Int = tid // 32
-    comptime for pass_i in range(D // (kBwdPreThreads // 32)):
-        var d: Int = pass_i * (kBwdPreThreads // 32) + dsub
-        var v = (
-            dq_accum_ptr
-            + (dq_bh + d) * seq_len
-            + m_block * BM
-            + lane32 * 4
-        ).load[width=4]()
-        comptime for j in range(4):
-            tile[d * (BM + PAD) + lane32 * 4 + j] = v[j]
+    # Phase 1: decode the fragment dump (see bwd_main_kernel's
+    # docstring): per main m-block (kBwdBlockM=64 rows), layout
+    # [wg(2)][chunk(8)][tid(128)][4] f32. Thread t reads its own
+    # cells (consecutive t -> consecutive 16B: fully coalesced) and
+    # scatters the decoded (d, q) into the transpose tile.
+    comptime MBM: Int = kBwdBlockM  # 64
+    comptime WG_F32: Int = (D // 2) * MBM  # 4096
+    var frag_base: Int = (
+        (b_idx * nheads + h_idx) * (seq_len // MBM)
+        + m_block * (BM // MBM)
+    ) * (2 * WG_F32)
+    var d_wl: Int = (tid // 32) * 16 + (tid % 32) // 4
+    var q_lp: Int = 2 * (tid % 4)
+    comptime for blk in range(BM // MBM):
+        comptime for wg in range(2):
+            comptime for ch in range(8):
+                var v = (
+                    dq_accum_ptr
+                    + frag_base
+                    + (blk * 2 + wg) * WG_F32
+                    + ch * (kBwdPreThreads * 4)
+                    + tid * 4
+                ).load[width=4]()
+                comptime for e in range(4):
+                    var d: Int = wg * 64 + d_wl + 8 * (e // 2)
+                    var q: Int = blk * MBM + ch * 8 + q_lp + (e % 2)
+                    tile[d * (BM + PAD) + q] = v[e]
     barrier()
 
     # Phase 2: thread t writes output row s = m*BM + t (contiguous

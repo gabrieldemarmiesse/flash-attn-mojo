@@ -154,4 +154,4 @@ import sys
 fa4, mojo = float(sys.argv[1]), float(sys.argv[2])
 print(f"mojo/fa4 ratio: {mojo / fa4:.3f}x  ({'mojo SLOWER' if mojo > fa4 else 'mojo FASTER'})")
 EOF
-echo "mojo PTX: ptx/mojo_fwd_fa4.ptx   fa4 PTX: reference_ptx/$(basename "$FA4_PTX")"
+echo "mojo PTX: ptx/$(basename "$MOJO_PTX")   fa4 PTX: reference_ptx/$(basename "$FA4_PTX")"

@@ -58,10 +58,12 @@ def bwd_fa4(
         (batch, nheads, seqlen), dtype=torch.float32, device=q.device
     )
     lse_log2 = torch.empty_like(dpsum)
-    # (B, H, D, S): the dQ^T c-frag's column pairs (adjacent q) stay
-    # contiguous for the red.v2 atomics in the main kernel.
+    # Opaque blocked fragment dump (FA4's trick): per (b, h, m-block
+    # of 64 rows) a contiguous [wg(2)][chunk(8)][tid(128)][4] f32
+    # region, bulk-reduce-added by the main kernel's drain warp and
+    # decoded by the convert kernel. Same numel as (B, S, H, D).
     dq_accum = torch.empty(
-        (batch, nheads, head_dim, seqlen),
+        (batch * nheads * seqlen * head_dim,),
         dtype=torch.float32,
         device=q.device,
     )
