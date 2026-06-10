@@ -292,7 +292,17 @@ def bwd_main_kernel[
     var num_m_blocks: Int = (seq_len + BM - 1) // BM
     var kv_row: Int = b_idx * seq_len + n_block * BN
 
-    var wgid: Int = Int(thread_idx.x) // 128
+    # The warpgroup index is shfl-broadcast from lane 0: ptxas's
+    # tid-uniformity pattern only matches 32-bit shr.u32 on %tid.x,
+    # and LLVM re-canonicalizes any 32-bit extract of the widened
+    # tid back to shr.u64, which makes every wg-derived value
+    # per-thread (per-wg A-descriptor offsets, mailbox base,
+    # barrier ids: ~2 R2UR per HGMMA). The convergent shfl is
+    # opaque to LLVM and a recognized broadcast to ptxas (probe:
+    # tid7w vs tid7c vs shflroot in scripts/ptxas_ur_probe.py).
+    var wgid: Int = Int(
+        warp.broadcast(Int32(Int(thread_idx.x) >> 7))
+    )
 
     if wgid == 0:
         # ================= producer =================
@@ -575,14 +585,9 @@ def bwd_main_kernel[
         ](Int32(Int(k_base)))
         var k_uni: Int = Int(warp.broadcast(k_lnd))
         var k_base_l = k_base + ((k_uni >> 1) - (Int(k_base) >> 1))
-        var v_lnd: Int32 = inlined_assembly[
-            "mov.b32 $0, $1;",
-            Int32,
-            constraints="=r,r",
-            has_side_effect=True,
-        ](Int32(Int(v_base)))
-        var v_uni: Int = Int(warp.broadcast(v_lnd))
-        var v_base_l = v_base + ((v_uni >> 1) - (Int(v_base) >> 1))
+        # V root derived from K's (one shfl per iteration, not two:
+        # shfl is an MIO op and mio_throttle is a live stall).
+        var v_base_l = k_base_l + kv_tile_size
         var k_smem_l = LayoutTensor[
             dtype,
             kv_smem_layout,
@@ -625,12 +630,11 @@ def bwd_main_kernel[
         wgmma_sdp.wait_group[1]()
         warpgroup_fence(s_reg)
 
-        # P^T = exp2(S^T * scale_log2 - lse_log2[q col]) and pack
-        # straight to bf16 (under the dP^T wgmma's latency). The
-        # f32 P dies HERE: dS below is computed from the bf16 P —
-        # the same rounding the dV GEMM consumes — freeing 40 f32
-        # at the register-pressure peak (the s+dp+pack overlap was
-        # what pushed ptxas past setmaxnreg 240 into spills).
+        # P^T = exp2(S^T * scale_log2 - lse_log2[q col]), f32 in
+        # s_reg. NOT packed yet: FA4's order computs dS first, then
+        # packs P and dS together — keeps the f32 P and bf16 P from
+        # coexisting at the (former) register peak, and keeps the
+        # dS multiply off a bf16->f32 unpack critical path.
         comptime for cc in range(c_frag_sdp // 4):
             var lp2 = (lse_smem + stat_col + cc * 8).load[
                 width=2, alignment=8
@@ -644,19 +648,13 @@ def bwd_main_kernel[
                     s_reg.ptr[c] = exp2(
                         s_reg.ptr[c].fma(scale_log2, -lp2[j])
                     )
-        comptime for c2 in range(c_frag_sdp // 2):
-            var pp = SIMD[accum_type, 2](
-                s_reg.ptr[2 * c2], s_reg.ptr[2 * c2 + 1]
-            ).cast[dtype]()
-            p_reg.ptr[2 * c2] = pp[0]
-            p_reg.ptr[2 * c2 + 1] = pp[1]
 
         # dP^T retired (wait 0: nothing else in flight — FA4's
         # sequence; dV is committed after the dS store).
         wgmma_sdp.wait_group[0]()
         warpgroup_fence(dp_reg)
 
-        # dS^T = bf16(P^T) * (dP^T - dpsum[q col]), packed bf16.
+        # dS^T = P^T * (dP^T - dpsum[q col]); pack P and dS bf16.
         comptime for cc in range(c_frag_sdp // 4):
             var dp2 = (dps_smem + stat_col + cc * 8).load[
                 width=2, alignment=8
@@ -664,9 +662,13 @@ def bwd_main_kernel[
             comptime for ic in range(4):
                 comptime c: Int = cc * 4 + ic
                 comptime j: Int = c & 1
-                dp_reg.ptr[c] = p_reg.ptr[c].cast[accum_type]() * (
-                    dp_reg.ptr[c] - dp2[j]
-                )
+                dp_reg.ptr[c] = s_reg.ptr[c] * (dp_reg.ptr[c] - dp2[j])
+        comptime for c2 in range(c_frag_sdp // 2):
+            var pp = SIMD[accum_type, 2](
+                s_reg.ptr[2 * c2], s_reg.ptr[2 * c2 + 1]
+            ).cast[dtype]()
+            p_reg.ptr[2 * c2] = pp[0]
+            p_reg.ptr[2 * c2 + 1] = pp[1]
         comptime for c2 in range(c_frag_sdp // 2):
             var dsp = SIMD[accum_type, 2](
                 dp_reg.ptr[2 * c2], dp_reg.ptr[2 * c2 + 1]

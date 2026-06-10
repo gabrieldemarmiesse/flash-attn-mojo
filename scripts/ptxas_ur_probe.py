@@ -227,7 +227,60 @@ def gen_body(traits: set[str]) -> tuple[str, str, str]:
     m32 = next(
         (int(t[3:]) for t in traits if re.fullmatch(r"m32\d+", t)), 0
     )
-    if m32:
+    if "tid7c" in traits:
+        # the FIX shape: 32-bit extract of the warpgroup index, then
+        # widen the (already-uniform) result for 64-bit chains.
+        body.append("mov.u32 %r45, %tid.x;")
+        body.append("shr.u32 %r46, %r45, 7;")
+        body.append("shl.b32 %r47, %r46, 9;")
+        body.append("and.b32 %r48, %r47, 15872;")
+        body.append("cvt.u64.u32 %rd48, %r48;")
+        body.append("cvt.u64.u32 %rd40, %r17;")
+        body.append("add.s64 %rd41, %rd40, %rd48;")
+        for k in range(8):
+            body.append(f"or.b64 %rd2{k}, %rd41, {DESC_TEMPLATE + 2 * k};")
+        for k in range(8):
+            body.append(wgmma(ACC, f"%rd2{k}", f"%rd2{(k + 1) % 8}"))
+    elif "tid7w" in traits:
+        # the mojo/LLVM shape: tid widened to 64-bit FIRST, then the
+        # warpgroup index extracted with shr.u64 — vs tid7's 32-bit
+        # shr.u32. Tests whether ptxas's tid-uniformity rule only
+        # matches the 32-bit pattern.
+        body.append("mov.u32 %r45, %tid.x;")
+        body.append("cvt.u64.u32 %rd45, %r45;")
+        body.append("shr.u64 %rd46, %rd45, 7;")
+        body.append("shl.b64 %rd47, %rd46, 9;")
+        body.append("and.b64 %rd48, %rd47, 15872;")
+        body.append("cvt.u64.u32 %rd40, %r17;")
+        body.append("add.s64 %rd41, %rd40, %rd48;")
+        for k in range(8):
+            body.append(f"or.b64 %rd2{k}, %rd41, {DESC_TEMPLATE + 2 * k};")
+        for k in range(8):
+            body.append(wgmma(ACC, f"%rd2{k}", f"%rd2{(k + 1) % 8}"))
+    elif "bferoot" in traits:
+        # same as shflroot but the address-field extract uses
+        # bfe.u32 (LLVM's canonicalization of shr+and) — suspected
+        # to have no uniform-datapath counterpart.
+        body.append("shfl.sync.idx.b32 %r40, %r10, 0, 31, -1;")
+        body.append("bfe.u32 %r42, %r40, 4, 14;")
+        body.append("cvt.u64.u32 %rd40, %r42;")
+        for k in range(8):
+            body.append(f"or.b64 %rd2{k}, %rd40, {DESC_TEMPLATE + 2 * k};")
+        for k in range(8):
+            body.append(wgmma(ACC, f"%rd2{k}", f"%rd2{(k + 1) % 8}"))
+    elif "shflroot" in traits:
+        # In-loop shfl.idx lane-0 broadcast as the descriptor root:
+        # convergent (LLVM cannot hoist), and ptxas recognizes the
+        # broadcast idiom (expect ~1 R2UR per root, U-side variants).
+        body.append("shfl.sync.idx.b32 %r40, %r10, 0, 31, -1;")
+        body.append("shr.u32 %r41, %r40, 4;")
+        body.append("and.b32 %r42, %r41, 16376;")
+        body.append("cvt.u64.u32 %rd40, %r42;")
+        for k in range(8):
+            body.append(f"or.b64 %rd2{k}, %rd40, {DESC_TEMPLATE + 2 * k};")
+        for k in range(8):
+            body.append(wgmma(ACC, f"%rd2{k}", f"%rd2{(k + 1) % 8}"))
+    elif m32:
         # N distinct 32-bit address roots live across the loop; the
         # 64-bit descriptor is materialized transiently per use
         # (cute's discipline: 1 UR per root instead of 2).
