@@ -50,7 +50,12 @@ from std.gpu import (
 import std.gpu.primitives.warp as warp
 from std.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
-from std.gpu.memory import AddressSpace, external_memory
+from std.gpu.memory import (
+    AddressSpace,
+    external_memory,
+    fence_async_view_proxy,
+)
+from std.gpu.sync import named_barrier
 from std.memory import stack_allocation
 
 from layout import Layout, LayoutTensor
@@ -82,6 +87,7 @@ comptime NUM_CONSUMER_REGS: Int = 240
 @__llvm_arg_metadata(q_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(k_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(v_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(o_tma, `nvvm.grid_constant`)
 def fwd_fa4_kernel[
     dtype: DType,
     head_dim: Int,
@@ -89,16 +95,15 @@ def fwd_fa4_kernel[
     q_desc_shape: IndexList[3],
     kv_tile_shape: IndexList[3],
     kv_desc_shape: IndexList[3],
+    o_tile_shape: IndexList[3],
+    o_desc_shape: IndexList[3],
 ](
     q_tma: TMATensorTile[dtype, 3, q_tile_shape, q_desc_shape],
     k_tma: TMATensorTile[dtype, 3, kv_tile_shape, kv_desc_shape],
     v_tma: TMATensorTile[dtype, 3, kv_tile_shape, kv_desc_shape],
-    o_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    o_tma: TMATensorTile[dtype, 3, o_tile_shape, o_desc_shape],
     seq_len: Int,
     softmax_scale: Float32,
-    o_b_stride: Int,
-    o_l_stride: Int,
-    o_h_stride: Int,
 ):
     comptime BM: Int = kFa4BlockM
     comptime BN: Int = kFa4BlockN
@@ -413,27 +418,46 @@ def fwd_fa4_kernel[
         comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
         o_reg.ptr[c] *= inv_rowsum[row_idx]
 
-    # c-frag walk: col_chunk = c/4, in_chunk = c%4; in_chunk pairs
-    # (0,1) / (2,3) are contiguous columns -> 32-bit paired stores.
+    # ---- Store: stage O in smem (reusing the dead Q tile region)
+    # and TMA bulk-store the whole tile. The unswizzled O descriptor
+    # copies in 16B chunks along D (desc_shape = (BM, 1, 8)), chunk
+    # j contiguous at offset j*BM*8: smem offset of (row, col) =
+    # (col/8)*BM*8 + row*8 + col%8. A warp's 32-bit paired stores
+    # land 512B-contiguous -> conflict-free. c-frag walk: col_chunk
+    # = c/4 covers cols [8*col_chunk, 8*col_chunk+8) = exactly one
+    # 16B chunk.
+    var o_smem = LayoutTensor[
+        dtype,
+        Layout.row_major(BM, D),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+        alignment=128,
+    ](smem_base)
+
     var lane: Int = Int(lane_id())
     var warp_in_wg: Int = Int(warp_id()) % 4
     var lane_group: Int = lane // 4
     var lane_pair: Int = lane % 4
-
-    var o_base: Int = (
-        b_idx * o_b_stride + h_idx * o_h_stride + m_block * BM * o_l_stride
-    )
-    var rows_in_block: Int = seq_len - m_block * BM
     var row_warp_base: Int = wg * WGMMA_M + warp_in_wg * 16
 
     comptime for c2 in range(c_frag_size_pv // 2):
         comptime col_chunk: Int = c2 // 2
         comptime is_bot: Int = c2 % 2
         var row: Int = row_warp_base + lane_group + (8 if is_bot == 1 else 0)
-        var col: Int = col_chunk * 8 + 2 * lane_pair
-        if row < rows_in_block:
-            var pair = SIMD[dtype, 2](
-                o_reg.ptr[2 * c2].cast[dtype](),
-                o_reg.ptr[2 * c2 + 1].cast[dtype](),
-            )
-            (o_ptr + o_base + row * o_l_stride + col).store[width=2](pair)
+        var pair = SIMD[dtype, 2](
+            o_reg.ptr[2 * c2].cast[dtype](),
+            o_reg.ptr[2 * c2 + 1].cast[dtype](),
+        )
+        (
+            o_smem.ptr + col_chunk * (BM * 8) + row * 8 + 2 * lane_pair
+        ).store[width=2, alignment=4](pair)
+
+    fence_async_view_proxy()
+    # Producer warpgroup may have exited -> consumer-only barrier.
+    named_barrier[Int32(NWG * 128)]()
+    if thread_idx.x == 128:
+        o_tma.async_store_3d(
+            o_smem, (0, h_idx, b_idx * seq_len + m_block * BM)
+        )
+        o_tma.commit_group()
+        o_tma.wait_group()

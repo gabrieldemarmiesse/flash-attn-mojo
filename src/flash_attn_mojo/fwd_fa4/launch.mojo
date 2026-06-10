@@ -107,6 +107,14 @@ def launch_fwd_fa4[
     var v_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
     ](ctx, v_ptr, rows, nheads_int)
+    # O store descriptor: unswizzled, so the kernel can stage O in a
+    # plain row-major smem tile (one whole-tile bulk store).
+    var o_imm_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+        unsafe_from_address=o_addr
+    )
+    var o_tma = create_split_tma[
+        q_smem_shape, gmem_shape, swizzle_mode = TensorMapSwizzle.SWIZZLE_NONE
+    ](ctx, o_imm_ptr, rows, nheads_int)
 
     comptime kernel_inst = fwd_fa4_kernel[
         dtype,
@@ -115,6 +123,8 @@ def launch_fwd_fa4[
         type_of(q_tma).desc_shape,
         type_of(k_tma).tile_shape,
         type_of(k_tma).desc_shape,
+        type_of(o_tma).tile_shape,
+        type_of(o_tma).desc_shape,
     ]
 
     var compiled = ctx.compile_function[
@@ -136,12 +146,9 @@ def launch_fwd_fa4[
             q_tma,
             k_tma,
             v_tma,
-            o_ptr,
+            o_tma,
             seqlen_int,
             softmax_scale,
-            o_b_stride,
-            o_l_stride,
-            o_h_stride,
             grid_dim=grid,
             block_dim=(kFa4NThreads,),
             shared_mem_bytes=smem_bytes,
@@ -152,12 +159,9 @@ def launch_fwd_fa4[
             q_tma,
             k_tma,
             v_tma,
-            o_ptr,
+            o_tma,
             seqlen_int,
             softmax_scale,
-            o_b_stride,
-            o_l_stride,
-            o_h_stride,
             grid_dim=grid,
             block_dim=(kFa4NThreads,),
             shared_mem_bytes=smem_bytes,
