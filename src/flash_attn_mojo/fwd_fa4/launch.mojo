@@ -69,13 +69,16 @@ def launch_fwd_fa4[
 
     comptime swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B
 
-    # Smem: Q (BM x D) + K (BN x D) + V (BN x D) bf16 + mbarriers.
-    # head_dim=128: 32 KiB each = 96 KiB total (H100 cap is 228 KiB).
+    # Smem: Q (BM x D) + 2 stages x (K + V) (BN x D) bf16 + mbarriers.
+    # head_dim=128: 32 KiB per tile -> 160 KiB (H100 cap is 228 KiB).
+    comptime n_stages: Int = 2
     comptime q_bytes: Int = kFa4BlockM * head_dim * size_of[dtype]()
     comptime k_bytes: Int = kFa4BlockN * head_dim * size_of[dtype]()
     comptime v_bytes: Int = kFa4BlockN * head_dim * size_of[dtype]()
     comptime mbar_bytes: Int = 64
-    comptime smem_bytes: Int = q_bytes + k_bytes + v_bytes + mbar_bytes
+    comptime smem_bytes: Int = (
+        q_bytes + n_stages * (k_bytes + v_bytes) + mbar_bytes
+    )
 
     var q_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=q_addr
