@@ -35,16 +35,11 @@ from flash_attn_mojo import (  # noqa: E402
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
     flash_attn_ref,
-    flash_attn_varlen_func,
-    flash_attn_with_kvcache,
 )
 
 __all__ = [
-    "__version__",
     "flash_attn_func",
     "flash_attn_kvpacked_func",
     "flash_attn_qkvpacked_func",
     "flash_attn_ref",
-    "flash_attn_varlen_func",
-    "flash_attn_with_kvcache",
 ]

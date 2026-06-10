@@ -8,14 +8,14 @@ that happens during JIT, allocator warmup, and torch's first-call
 overhead — only the post-warmup `--iters` launches are recorded.
 
 Usage (standalone — runs the bench, no profiling):
-    uv run python scripts/profile_bench.py --kind bwd --shape 1,1024,8,64
+    uv run python scripts/profile_bench.py --kind bwd --shape 2,8192,16,128
 
 Usage (under ncu):
-    scripts/profile_kernel.sh --kind bwd --shape 1,1024,8,64
+    scripts/profile_kernel.sh --kind bwd --shape 2,8192,16,128
     # internally invokes:
     #   ncu --profile-from-start no --kernel-name regex:bwd \
     #     uv run python scripts/profile_bench.py --kind bwd \
-    #       --shape 1,1024,8,64 --profile
+    #       --shape 2,8192,16,128 --profile
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def main() -> None:
         "--shape",
         type=_parse_shape,
         default=(1, 1024, 8, 64),
-        help="B,L,H,D (default: 1,1024,8,64)",
+        help="B,L,H,D (default: 2,8192,16,128)",
     )
     p.add_argument("--causal", action="store_true")
     p.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")

@@ -76,11 +76,11 @@ BENCH_ARGS=("$@")
 # ---- derive filter from --kernel if --filter not set ----
 if [[ -z "$FILTER" && -n "$KERNEL" ]]; then
     case "$KERNEL" in
-        fwd)            FILTER='kernel_fwd_kernel' ;;
-        bwd)            FILTER='bwd' ;;
-        bwd-main)       FILTER='kernel_bwd_kernel' ;;
-        bwd-preprocess) FILTER='preprocess_bwd_preprocess' ;;
-        bwd-convert)    FILTER='convert_dq_bwd_convert_dq' ;;
+        fwd)            FILTER='fwd_fa4_kernel' ;;
+        bwd)            FILTER='bwd_' ;;
+        bwd-main)       FILTER='bwd_main_kernel' ;;
+        bwd-preprocess) FILTER='bwd_preprocess_kernel' ;;
+        bwd-convert)    FILTER='bwd_convert_kernel' ;;
         *)
             echo "error: unknown --kernel '$KERNEL' (use fwd|bwd|bwd-main|bwd-preprocess|bwd-convert)" >&2
             exit 2
@@ -93,8 +93,8 @@ if [[ -z "$FILTER" ]]; then
     for ((i=0; i<${#BENCH_ARGS[@]}; i++)); do
         if [[ "${BENCH_ARGS[$i]}" == "--kind" ]] && (( i+1 < ${#BENCH_ARGS[@]} )); then
             case "${BENCH_ARGS[$i+1]}" in
-                fwd) FILTER='kernel_fwd_kernel' ;;
-                bwd) FILTER='bwd' ;;
+                fwd) FILTER='fwd_fa4_kernel' ;;
+                bwd) FILTER='bwd_' ;;
             esac
             break
         fi

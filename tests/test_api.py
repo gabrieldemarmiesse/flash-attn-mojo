@@ -1,0 +1,68 @@
+"""Public-API tests: surface, envelope errors, CPU reference path."""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+import flash_attn_mojo
+from flash_attn_mojo import (
+    flash_attn_func,
+    flash_attn_kvpacked_func,
+    flash_attn_qkvpacked_func,
+    flash_attn_ref,
+)
+
+
+def test_exports():
+    assert set(flash_attn_mojo.__all__) == {
+        "flash_attn_func",
+        "flash_attn_kvpacked_func",
+        "flash_attn_qkvpacked_func",
+        "flash_attn_ref",
+    }
+
+
+def _qkv(device="cpu", seqlen=128, head_dim=128, dtype=torch.bfloat16):
+    q = torch.randn(2, seqlen, 4, head_dim, dtype=dtype, device=device)
+    return q, torch.randn_like(q), torch.randn_like(q)
+
+
+def test_causal_not_implemented():
+    q, k, v = _qkv()
+    with pytest.raises(NotImplementedError, match="non-causal"):
+        flash_attn_func(q, k, v, causal=True)
+
+
+def test_envelope_errors():
+    q, k, v = _qkv(dtype=torch.float16)
+    with pytest.raises(ValueError, match="bf16"):
+        flash_attn_func(q, k, v)
+    q, k, v = _qkv(head_dim=64)
+    with pytest.raises(ValueError, match="head_dim"):
+        flash_attn_func(q, k, v)
+    q, k, v = _qkv(seqlen=100)
+    with pytest.raises(ValueError, match="multiple"):
+        flash_attn_func(q, k, v)
+    q, k, v = _qkv()
+    with pytest.raises(ValueError, match="Hq == Hk"):
+        flash_attn_func(q, k[:, :, :2], v)
+
+
+def test_cpu_reference_path():
+    q, k, v = _qkv()
+    out = flash_attn_func(q, k, v)
+    ref = flash_attn_ref(q, k, v)
+    assert torch.equal(out, ref)
+    out2, lse = flash_attn_func(q, k, v, return_lse=True)
+    assert torch.equal(out2, ref)
+    assert lse.shape == (2, 4, 128) and lse.dtype == torch.float32
+
+
+def test_packed_wrappers_cpu():
+    q, k, v = _qkv()
+    qkv = torch.stack([q, k, v], dim=2)
+    ref = flash_attn_func(q, k, v)
+    assert torch.equal(flash_attn_qkvpacked_func(qkv), ref)
+    kv = torch.stack([k, v], dim=2)
+    assert torch.equal(flash_attn_kvpacked_func(q, kv), ref)

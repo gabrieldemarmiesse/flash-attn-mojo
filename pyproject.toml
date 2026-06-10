@@ -10,16 +10,11 @@ dependencies = [
     "torch>=2,<3",
     "mojo-compiler==1.0.0b1",
     "mojo-compiler-mojo-libs==1.0.0b1",
-    # Modular MAX kernel libraries — ships `nn.mojopkg`, `linalg.mojopkg`,
-    # `kv_cache.mojopkg`, etc. We import `nn.softmax` and
-    # `linalg.matmul.gpu._multistage_gemm_gpu` from these for the
-    # multi-warp flash-attn fwd kernel (modular's `mha_single_batch`
-    # template — see `fwd/kernel.mojo`).
+    # Modular MAX kernel libraries — ships `layout.mojopkg` etc.; the
+    # FA4 kernels import `layout.tensor_core_async` / `layout.tma_async`
+    # from these.
     "max-mojo-libs==26.3.0",
 ]
-
-[project.scripts]
-flash-attn-mojo = "flash_attn_mojo._cli:main"
 
 [project.optional-dependencies]
 nvidia = [

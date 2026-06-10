@@ -1,328 +1,205 @@
 # CLAUDE.md
 
-Guidance for working on this repo: a Mojo port of Tri Dao's
-`flash-attn`.
+Guidance for working on this repo: FlashAttention-4-class attention
+kernels written from scratch in Mojo.
 
-## Current focus: matching FlashAttention-4 on H100 (2026-06)
+## State (2026-06-10): parity with FlashAttention-4 on H100
 
-The active work is `src/flash_attn_mojo/fwd_fa4/`: a from-scratch
-Hopper forward kernel racing Tri Dao's **FlashAttention-4**
-(`flash_attn.cute`, CuTe DSL) at one minimalist config — bf16,
-head_dim=128, non-causal, contiguous, seqlen % 128 == 0, Hq == Hk.
-Canonical benchmark shape: **B=2, S=8192, H=16, D=128**. Everything
-below the "Legacy" line is the earlier FA2-vs-mojo work and can be
-treated as throwaway reference.
+The package races Tri Dao's **FlashAttention-4** (`flash_attn.cute`,
+CuTe DSL) at one minimalist config — bf16, head_dim=128, non-causal,
+contiguous, seqlen % 128 == 0, Hq == Hk. Canonical benchmark shape:
+**B=2, S=8192, H=16, D=128**. Both kernels are AT PARITY within
+run-to-run variance (locked clocks, interleaved):
 
-- **Master iteration script: `scripts/master_bench.sh`** — clears
-  the flash_attn_mojo JIT cache (not the mojo compiler cache),
-  recompiles, benches mojo vs FA4 (CUPTI kernel-only time +
-  correctness), dumps the mojo kernel's PTX to
-  `ptx/mojo_fwd_fa4.ptx`, prints a PTX instruction-mix diff vs the
-  committed FA4 reference, and (unless `--no-ncu`) side-by-side ncu
-  stats. The loop: edit `fwd_fa4/kernel.mojo`, run the script, read
-  the summary, repeat.
-- **FA4 reference PTX**: `reference_ptx/` (committed; see its
-  README for the target numbers and how to regenerate).
-- **PTX dump plumbing**: set `MOJO_DUMP_PTX=<path>` in the env; the
-  `_jit.py` forwards it as a `-D` define and `launch.mojo` passes it
-  to `compile_function(dump_asm=...)`.
-- **`./modular` checkout**: the modular repo pinned at `d86df2b645`
-  (`mojo/v1.0.0b1` == `max/v26.3.0` release tags) — matches the
-  pinned `mojo-compiler==1.0.0b1` / `max-mojo-libs==26.3.0` wheels,
-  so stdlib/kernel sources there are exactly what we compile
-  against. Key references inside: `mojo/stdlib/std/gpu/`,
-  `max/kernels/src/layout/{tma_async,tensor_core_async}.mojo`,
-  `max/kernels/src/nn/attention/gpu/nvidia/sm90/` (modular's own
-  warp-specialized MHA — API usage reference; its algorithm is
-  slower than FA4, don't follow it blindly).
-- **FA4 source**: `flash-attention/flash_attn/cute/` (gitignored
-  clone) — `flash_fwd_sm90.py` is the algorithm we mirror
-  (warp-specialized producer + 2 MMA warpgroups, intra-warpgroup
-  overlap, pingpong scheduler barriers, PV-RS).
+- fwd: 2237–2276 µs vs FA4 2206–2255 (1.00–1.03x)
+- bwd: 6148–6250 µs vs FA4 5913–6176 (1.00–1.06x); preprocess and
+  dq-convert at parity too.
 
-Status (2026-06-10): fwd_fa4 v7 is correct (bf16 noise floor vs fp32
-SDPA and vs FA4) and at **~1.02-1.05x FA4 kernel time** on this
-H100 PCIe (~2280-2440 us vs FA4's ~2240-2350 us depending on
-sustained-load clocks; ~480 vs ~490 TFLOPS). ncu: identical
-tensor-pipe work, regs/thread (168), occupancy and launch shape;
-remaining gap is a few % more ALU/FMA instructions + 'wait' stalls.
-Ideas not yet tried: L2 cache hints on TMA loads (FA4's
-`cp.async.bulk.tensor...L2::cache_hint`), 32-bit smem index types,
-further softmax dependency-chain tuning (naive 4-way tree made it
-*slower*; revisit with PTX in hand).
+`HANDOFF.md` is the full race log: architecture, the perf journey,
+the codegen lessons (uniform-register file capacity, the
+tid-widening trap, descriptor rematerialization), the measurement
+protocol, and the complete negative-results list — **read it before
+attempting any perf change**.
 
-## Legacy (FA2-vs-mojo work below)
+## Measurement protocol (non-negotiable)
 
-**Status: fwd kernel at perf parity, bwd kernel feature-complete (correctness first; perf optimization pending).**
+1. `sudo nvidia-smi --lock-gpu-clocks=1500,1500` first (persistence
+   mode is off — relock every session). Unlocked, this H100 drifts
+   ±4–5% and fakes wins/losses below ~3%.
+2. Even locked, both kernels wobble ~2–4% run-to-run: always bench
+   A/B interleaved (`master_bench.sh` does) and quote 3-run spreads.
+3. After every kernel edit:
+   `ptxas -arch=sm_90a -v ptx/mojo_*.ptx` — the spill-bytes line is
+   the canary (both kernels must stay at 0).
 
-The fwd kernel ships at perf parity (~1.06x upstream geomean across
-the canonical shape grid at nheads=8). The bwd kernel is structured
-as Tri Dao's 3-kernel pipeline (preprocess -> main -> convert_dq) and
-covers the same feature envelope as fwd, modulo perf — the bwd
-currently uses scalar arithmetic loops inside the kernel rather than
-tensor-core MMA via `multistage_mma`. Correctness is at bf16 noise
-floor vs both upstream flash-attn 2 and a fp32 SDPA reference; perf
-optimization (multistage_mma + cp.async pipelining like the fwd
-kernel uses) is the next bwd work.
+## Iteration tooling
 
-Fwd feature matrix vs upstream flash-attn 2:
-
-| feature | status |
-|---|---|
-| bf16 | done |
-| fp16 | done (internal cast to bf16; ~5e-3 vs upstream fp16) |
-| head_dim in {32, 64, 128} | done (native) |
-| head_dim in {96, 160, 192, 224, 256} | blocked (see below) |
-| causal (with block-skip) | done |
-| MQA/GQA | done |
-| softcap | done |
-| sliding window (with KV-tile block-skip) | done |
-| ALiBi (per-head and per-batch-head) | done |
-| dropout (inline splitmix RNG, deterministic seed/offset) | done |
-| return_attn_probs (LSE) | done |
-| qkvpacked / kvpacked Python wrappers | done |
-| flash_attn_varlen_func | done (python-wrapper baseline, prefill-only) |
-| flash_attn_with_kvcache | done (prefill-only) |
-| non-contig (L, D) strides on unaligned seqlens | done |
-| backward (`bwd/`) | done (Tri Dao 3-kernel pipeline; scalar-loop MMA, not yet tensor-core) |
-| backward — causal, MQA/GQA, softcap, ALiBi, window, dropout (RNG replay), varlen, all head_dims | done |
-
-**Known blocker — head_dim in {96, 160, 192, 224, 256}.** V's smem
-tile is `Layout.row_major(BK, depth)` so V's row stride equals
-`depth`. `multistage_mma`'s `load_b` (used by the P·V MMA) goes
-through a bank-conflict swizzle that requires the row stride be a
-power of 2 in {16, 32, 64, 128, 256, 512} half-elements. Depths 96 /
-160 / 192 / 224 fail this constraint outright. Depth 256 satisfies
-the swizzle but hits the Ada ~99 KiB dynamic-smem cap with BN=64
-(104 KiB needed); the BN=32 fallback compiles but produces wrong
-output, suspected to be `multistage_mma`'s prefetch gate when
-`static_num_iters=1`. The `multistage_mma`'s `swizzle_b` template
-param is hardcoded for the B operand on NVIDIA
-(`_multistage_gemm_gpu.mojo:290`), so swizzle can't be opted out at
-the call site. Unblocking either requires (a) restructuring V's
-smem as multiple BN-wide depth strips (algorithmic change, splits
-the P·V MMA into per-strip iterations) or (b) a hand-rolled inner
-MMA loop that bypasses `multistage_mma` for the second matmul. Both
-are M-H sessions of work.
-
-**fp16 native path** (vs the current cast-to-bf16 wrapper) is
-blocked on `multistage_mma` too: `get_mma_shape[fp16, fp32]` picks
-`m16n8k16` and that intrinsic only ships for bf16 in mojo-compiler
-1.0.0b1's stdlib. A mojo bump (or hand-rolled `m16n8k8` fp16 path)
-unblocks this.
+- **Master script: `scripts/master_bench.sh [--kind bwd] [--no-ncu]`**
+  — clears the flash_attn_mojo JIT cache (not the mojo compiler
+  cache), recompiles, runs correctness checks, benches mojo vs FA4
+  interleaved (CUPTI kernel-only time), dumps the mojo kernel's PTX
+  to `ptx/`, prints a PTX op-mix diff vs the committed FA4 reference
+  and (unless `--no-ncu`) side-by-side ncu stats.
+- **Fast correctness loop**:
+  `uv run python scripts/bench_fa4.py --impl mojo --kind {fwd,bwd}
+  --check-only` — fp32-reference checks at S ∈ {128, 256, 640, 1024}
+  (640 = 8×80 exercises the bwd tile_m=80 exact-fit path; the others
+  leave partial tail m-tiles). fwd also checks LSE.
+- **`scripts/ptxas_ur_probe.py`** — generates toy wgmma-loop PTX in
+  varying dataflow shapes, compiles with ptxas, reports
+  UR-allocation / R2UR / spills. Use it to test any codegen
+  hypothesis BEFORE touching the kernels (it found both the UR-file
+  cliff and the tid-widening trap).
+- **SASS op-mix diff** — extract both kernels' innermost loop bodies
+  (same HGMMA count = same tensor work), diff opcode histograms.
+  `IMAD.U32 R,RZ,RZ,URx` = UR→R move; `R2UR` storms mean a
+  uniformity taint; see HANDOFF for the decoding table.
+- **FA4 reference PTX**: `reference_ptx/` (committed; see its README
+  for target numbers and regeneration). FA4's actual cubins can be
+  dumped with `CUTE_DSL_KEEP=cubin`.
+- **PTX dump plumbing**: `MOJO_DUMP_PTX=<path>` in the env; `_jit.py`
+  forwards it as a `-D` define and `launch.mojo` passes it to
+  `compile_function(dump_asm=...)`.
 
 ## Repository layout
 
 - `src/flash_attn_mojo/`
-  - `fwd/`, `bwd/`: GPU kernels (one subpackage each, mirroring
-    causal-conv1d-mojo's structure). Pure JIT-on-first-use — there is
-    no `dispatch.mojo` and no AOT comptime sweep. Once implemented,
-    each subpackage will have:
-    - `kernel.mojo` (the device function — comptime-parameterized
-      over dtype, head_dim, causal flag, …).
-    - `common.mojo` (shared constants/helpers).
-    - `launch.mojo` (configures `DeviceContext`, builds `TileTensor`
-      layouts, calls `compile_function` + `enqueue_function`).
-    - `variant.mojo` (the static per-subpackage entry point. Reads
-      its comptime params via `std.sys.get_defined_*` so a single
-      source file covers every config. Exports `PyInit_variant`).
-    - `_jit.py` (Python: extracts the config tuple from the call's
-      runtime args, formats a readable mod name, materialises the
-      config as `-D KEY=VALUE` pairs, and delegates to the shared
-      cache+compile+load helper).
-    - `__init__.py` (Python wrapper that builds the args tuple and
-      calls `_jit.call_<sub>(args)`).
-    The shared `mojo build` → `dlopen` plumbing lives in
-    `_jit_common.py` at the package root (`compile_and_load`).
-    Per-variant artefacts cache under
-    `$XDG_CACHE_HOME/flash_attn_mojo/<sub>/<backend>/<arch>/<cpu_tag>/<mod_name>.hash-<h>.so`.
-  - `_jit_common.py`: shared variant cache + compile + load helper.
-    Also owns the env-signature → cache-hash logic.
-  - `_fn.py`: the public `flash_attn_func` autograd op.
+  - `fwd_fa4/`, `bwd_fa4/`: the kernels (pure JIT-on-first-use; no
+    AOT sweep). Each subpackage:
+    - `kernel.mojo` — device function(s), comptime-parameterized.
+    - `common.mojo` — shared constants (tile sizes, stage counts).
+    - `launch.mojo` — TMA descriptor + smem setup,
+      `compile_function` + `enqueue_function`.
+    - `variant.mojo` — static entry point reading comptime params
+      via `std.sys.get_defined_*`; exports `PyInit_variant`.
+    - `_jit.py` — config extraction → `-D` defines → shared
+      cache+compile+load helper.
+    - `__init__.py` — Python wrapper building the args tuple.
+    The bwd is FA4's 3-kernel pipeline: preprocess (dpsum, lse·log2e,
+    dq_accum zeroing) → main (dK/dV + dQ mailbox/cp.reduce drain) →
+    convert (dq_accum fragment-dump decode → bf16 dq).
+  - `_jit_common.py`: shared variant cache + compile + load helper;
+    owns the env-signature → cache-hash logic.
+  - `_fn.py`: the public `flash_attn_func` autograd op (+ packed
+    wrappers). Envelope-checked; non-CUDA tensors fall through to
+    the reference.
   - `reference.py`: pure-PyTorch `flash_attn_ref` (SDPA-based).
-- `tests/`: pytest suite. Run with `uv run --extra nvidia pytest`
-  (the `nvidia` extra brings in upstream flash-attn for cross-
-  validation against the Mojo kernels, once implemented).
+- `tests/`: `uv run pytest tests/` — API/envelope tests (CPU) +
+  CUDA correctness vs fp32 reference + cross-check vs
+  `flash_attn.cute` when importable.
 - `compat/`: drop-in `import flash_attn` shim package
   (`flash-attn-mojo-compatibility`).
-- `flash-attention/`: vendored Tri Dao CUDA source (read-only
-  reference for kernel patterns). Cloned via
-  `git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git`;
-  gitignored, not part of the repo. The relevant subdirs:
-  - `csrc/flash_attn/src/` — the sm80 (Ampere/Ada) FA2 kernels.
-    `flash_fwd_hdim{32,64,96,128,...}_{fp16,bf16}_{,causal_}sm80.cu`
-    are the per-head-dim instantiations; the algorithm lives in
-    `flash_fwd_kernel.h` and `flash_bwd_kernel.h`.
-  - `hopper/` — the sm90 (Hopper) FA3 kernels (separate codebase
-    that uses TMA + WGMMA).
-  - `flash_attn/` — the Python wrapper (`flash_attn_interface.py`)
-    that mirrors the API surface we expose.
+- `flash-attention/`: gitignored clone of Tri Dao's repo (the
+  `flash_attn/cute/` CuTe DSL source is the algorithm reference:
+  `flash_fwd_sm90.py`, `flash_bwd_sm90.py`).
+- `./modular`: the modular repo pinned at `d86df2b645`
+  (`mojo/v1.0.0b1` == `max/v26.3.0` tags) — matches the pinned
+  wheels, so stdlib/kernel sources there are exactly what we compile
+  against. Key paths: `mojo/stdlib/std/gpu/`,
+  `max/kernels/src/layout/{tma_async,tensor_core_async}.mojo`.
 
-## Running the benches
+## Toolchain notes
 
-Always use `uv run --extra nvidia …` — the `nvidia` extra pulls in
-the upstream flash-attn wheel that the benches diff against.
-
-```bash
-# Once kernels exist:
-# Kernel-only GPU time per shape (uses torch.profiler CUPTI hooks)
-uv run --extra nvidia python benchmarks/bench_gpu_kernel_time.py
-```
+- Mojo compiles PTX→cubin in-process via the statically linked
+  `modular/lib/libNVPTX.so` (ptxas 13.1.115). Override with
+  `MODULAR_NVPTX_COMPILER_PATH` (our `__init__.py` auto-points it at
+  the `nvidia-cuda-nvcc-cu12` wheel if installed). FA4's cute DSL
+  embeds ptxas 12.9.83; the two produce byte-identical SASS on our
+  PTX — toolchain version is NOT a perf variable here.
+- `uv run --extra nvidia` is currently broken in this venv (the
+  upstream flash-attn 2 wheel is cp312, venv is cp313). FA4 itself
+  (`flash_attn.cute`) imports fine in the plain venv via the local
+  clone + `nvidia-cutlass-dsl`.
 
 ## Profiling
 
-The `scripts/` directory wraps Nsight Compute (`ncu`) so you can
+`scripts/profile_kernel.sh` wraps Nsight Compute (`ncu`) so you can
 trace a single kernel launch without fighting JIT or warmup
-pollution. Defaults assume an H100 with `RmProfilingAdminOnly=1`
-but passwordless sudo configured — adjust accordingly.
+pollution (bracketed capture via `cudaProfilerStart/Stop`,
+`--profile-from-start no`). Defaults assume an H100 with
+`RmProfilingAdminOnly=1` but passwordless sudo (the wrapper
+auto-elevates).
 
-```bash
-# bwd main kernel, default shape (B=1, L=1024, H=8, D=64), full sections
-scripts/profile_kernel.sh --kernel bwd-main -- --kind bwd
+For stall attribution use PC sampling:
+`ncu --section SourceCounters -o rep ...` then
+`ncu --import rep --page source --print-source sass --csv`, sort by
+'Warp Stall Sampling (All Samples)'. Sector tables
+(`l1tex__t_sectors_..._op_st` per request) catch coalescing bugs.
 
-# fwd, custom shape and causal
-scripts/profile_kernel.sh --kernel fwd -- --kind fwd --shape 1,2048,8,64 --causal
-
-# fast iteration: only SOL + scheduler + launch stats
-scripts/profile_kernel.sh --kernel bwd-main --set basic -- --kind bwd
-
-# summarize a captured report on the CLI (or open .ncu-rep in ncu-ui)
-scripts/profile_summary.sh /tmp/kernel_bwd_kernel_prof.ncu-rep
-```
-
-### How the bench/profiler pipeline works
-
-`scripts/profile_bench.py` is a one-shot bench (warmup + capture)
-that brackets the capture phase with `cudaProfilerStart` /
-`cudaProfilerStop`. `scripts/profile_kernel.sh` invokes ncu with
-`--profile-from-start no`, so only the post-warmup launches inside
-the bracket are recorded — no need to count launches and tune
-`--launch-skip` manually.
-
-### Kernel filter shortcuts
-
-| `--kernel`        | regex                          | what it captures              |
-|-------------------|--------------------------------|-------------------------------|
-| `fwd`             | `kernel_fwd_kernel`            | mojo fwd                      |
-| `bwd`             | `bwd`                          | mojo bwd (all 3 sub-kernels)  |
-| `bwd-main`        | `kernel_bwd_kernel`            | mojo bwd main (dK/dV/dQaccum) |
-| `bwd-preprocess`  | `preprocess_bwd_preprocess`    | mojo bwd preprocess           |
-| `bwd-convert`     | `convert_dq_bwd_convert_dq`    | mojo bwd convert_dq           |
-
-Pass `--filter '<regex>'` for anything custom (e.g. upstream's
-`flash_fwd_kernel` to compare against the reference).
-
-### The RmProfilingAdminOnly gate
-
-Most cloud GPU hosts ship with
-`/proc/driver/nvidia/params:RmProfilingAdminOnly: 1`, which makes
-ncu's metric sections return `ERR_NVGPUCTRPERM` for non-root users.
-The wrapper auto-elevates via `sudo -E` when the gate is locked and
-passwordless sudo is available. To check / unlock manually:
-
-```bash
-grep RmProfilingAdminOnly /proc/driver/nvidia/params
-# 0 → unlocked, 1 → wrapper will use sudo
-
-# permanent unlock until next nvidia.ko reload:
-sudo rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia
-sudo modprobe nvidia NVreg_RestrictProfilingToAdminUsers=0
-```
-
-### Section sets
-
-`--set full` (default) captures everything — ~30-40 passes per
-kernel, ~6-30 MiB report. Use smaller sets while iterating on a
-hypothesis:
-
-- `--set basic` — SOL + SchedulerStats + LaunchStats (~10 passes).
-- `--set detailed` — adds Memory + Compute + Occupancy.
-- `--set source` — adds SASS/PTX-level metric overlay (heavy; only
-  useful in `ncu-ui`).
+Section sets while iterating: `--set basic` (SOL + scheduler +
+launch, ~10 passes), `--set detailed` (+memory/compute/occupancy),
+`--set full` (everything, ~30–40 passes).
 
 ## Cache invalidation
 
-In most cases you should never need to manually clear the cache —
-the env signature (Python ABI, mojo version, modular SDK path, CPU
-brand, ptxas version) automatically invalidates on env shifts. If
-you suspect something stale anyway:
+You should never need to clear the cache manually — the env
+signature (Python ABI, mojo version, modular SDK path, CPU brand,
+ptxas signature) auto-invalidates on env shifts. If you suspect
+something stale anyway:
 
 ```bash
 rm -rf ~/.cache/flash_attn_mojo/
 ```
 
-### Cache-key contents
+See `_jit_common.py::_env_signature` for the authoritative key list.
+Production pattern: pre-warm the cache on a staging host, bundle it,
+set `FLASH_ATTN_MOJO_USE_CACHE_ONLY` to turn cache misses into loud
+errors instead of silent JIT compiles.
 
-Identical to causal-conv1d-mojo's. See `_jit_common.py::_env_signature`
-for the authoritative list:
+## Mojo/Hopper gotchas (hard-won — don't relearn)
 
-- **`soabi`**: Python C-extension ABI tag.
-- **`mojo_version`**: `mojo --version` output (includes git hash).
-- **`modular_root`**: path to the modular SDK install (baked into the
-  `.so`'s `RUNPATH`).
-- **`cpu_brand`**: full host-CPU brand string. Mojo's `-march=native`
-  bakes host SIMD into every `.so`; sharing the cache across CPUs
-  with fewer ISA extensions SIGILLs.
-- **`jit_common_hash`**: this file's contents (defensive).
-- **`ptxas`** (CUDA only): bundled / vendored / external.
+Codegen (the ones that cost the most time; full stories in
+HANDOFF.md and the memory notes):
 
-### Production: pre-warmed cache + `FLASH_ATTN_MOJO_USE_CACHE_ONLY`
-
-Same pattern as causal-conv1d-mojo's `CAUSAL_CONV1D_USE_CACHE_ONLY`.
-Pre-warm a staging host matching production, bundle
-`~/.cache/flash_attn_mojo/` into the image, set the flag in prod to
-turn any cache miss into a loud `RuntimeError` instead of a silent
-~1.2 s JIT compile in the request hot path.
-
-## Kernel-design patterns to mirror
-
-(From the causal-conv1d-mojo work — most of these will apply here
-too once we start writing kernels.)
-
-1. **One block per (B, H_q)** with the seqlen walked in a chunk
-   loop — keeps the K/V tile reuse high.
-2. **16-byte LDG** per thread (`kNElts = 16 // size_of[dtype]()`).
-3. **Smem ring-buffer** for K/V tiles across the seqlen iteration.
-4. **`aligned_seq` comptime gate** to drop the bounds-checked
-   tail-chunk path when seqlen is aligned to the block size.
-5. **One cubin per (dtype × head_dim × causal × …) leaf**, compiled
-   JIT on first use, cached.
-6. **`Atomic[dtype, scope="device"].fetch_add[ordering=RELAXED]`**
-   for the dq/dk/dv reduce in the backward.
-
-## Where to look first when perf regresses
-
-1. Run kernel-only timing benches and compare ratios per shape.
-2. If small shapes regress but large shapes are fine → launch
-   overhead or low-occupancy regime.
-3. If all shapes regress → check PTX. Add a temporary
-   `dump_asm=StaticString("/tmp/mojo_<sub>_%.ptx")` to the
-   `compile_function[...]` call in `<sub>/launch.mojo`, trigger
-   once, and remove. Don't commit it.
-4. The vendored Tri Dao flash-attn source (clone into a sibling
-   directory or symlink) is the reference for every algorithmic
-   choice.
-
-## Mojo gotchas hit while porting (carried over from causal-conv1d-mojo)
-
-- `DType` has no `.size_of()` method; use `from std.sys import size_of`
-  and call `size_of[dtype]()`.
-- `stack_allocation[..., address_space=AddressSpace.SHARED]()` returns
-  an `UnsafePointer` with no `.offset()` — use `ptr + i`.
-- `comptime for x, y, ... in product(...)` only handles up to 4
-  iterables. Nest loops.
-- The `mojo build` cache bakes the *build env's* modular-lib path into
-  each `.so`'s `RUNPATH`. The env signature handles env switches
-  automatically; you only need to nuke the cache for disk hygiene.
+- **Uniform-register file capacity**: the UR file is 63/warp; ≥~16
+  simultaneously-live 64-bit descriptors overflow it, ptxas spills
+  the overflow to LOCAL and reloads+R2URs per HGMMA. LLVM loves
+  hoisting loop-invariant descriptor variants — launder the smem
+  roots through a no-op `mov.b32` inline asm inside the loop so
+  descriptors are REBUILT per iteration (rematerialization is free
+  on the uniform datapath; liveness kills).
+- **The tid-widening trap**: `Int(thread_idx.x) // 128` widens tid
+  before the shift; ptxas's tid-uniformity rule only matches 32-bit
+  `shr.u32`, and LLVM re-canonicalizes 32-bit extracts back to
+  64-bit. Use `warp.broadcast(Int32(tid >> 7))` for any
+  warp/warpgroup index (convergent: LLVM keeps it; recognized
+  broadcast: ptxas uniformizes).
+- Mojo `(x - y) // 2` on Int is a SIGNED floor-div: a 17-op rounding
+  correction chain per smem address. Use `(x >> 1) - (y >> 1)`.
+- The smem 128B-swizzle XOR is computed from the ABSOLUTE address:
+  `addr ^ ((addr >> 3) & 112)`. For strided stmatrix sequences
+  re-apply it per call unless the step provably avoids addr bits
+  4–6 (2048-B steps are safe, 32-B steps are not).
+- `stack_allocation` scalar arrays in kernels land in LOCAL memory
+  (LDL/STL = long_scoreboard stalls) even with comptime indices —
+  read from smem at use sites or use SIMD values.
+- `SIMD[f32, 40]` (any non-power-of-2 width) is a comptime assert —
+  use the `StaticTuple` `wgmma_async` overload for n=80 c-regs.
+- LLVM CSEs adjacent identical `wgmma.wait_group` intrinsics and
+  floats mbarrier arrives across wgmma inline asm — source-order
+  wgmma scheduling is not guaranteed.
+- ptxas honors `setmaxnreg`: pool = 2·128·240 + 128·24 = 384·168.
+  Don't trust ncu's "registers/thread" (the static 168) as the
+  consumer budget.
+- The stdlib `cp_async_bulk_reduce_global_shared_cta` is wrongly
+  comptime-gated to SM100+ — keep the inline asm (constraints
+  "l,r,r"). Plain 1-D `cp.async.bulk` G2S with mbarrier has no
+  stdlib wrapper either ("r,l,r,r").
 - `dump_asm` paths must be `StaticString(...)`-wrapped.
-- `TileTensor` has two costs at very small kernel runtimes (a few
-  μs total):
-  1. `linear_idx_type` defaults to `DType.int64` for global-memory
-     tensors with dynamic dims → `mul.lo.s64` everywhere. Force
-     `linear_idx_type=DType.int32` if the addressable range fits.
-  2. The layout is a packed kernarg struct, accessed via offsetted
-     `ld.param.b32` loads rather than direct register loads. ~5-10
-     extra cycles in the prologue. Worth keeping the kernels that
-     run for tens-to-hundreds of μs (fwd, bwd) on TileTensor; for
-     anything microsecond-scale (like a decode-step kernel), raw
-     pointers + Int32 strides are still the right call.
+- `DType` has no `.size_of()`; use `std.sys.size_of[dtype]()`.
+- TMA OOB rows zero-fill on loads (the stdlib hardcodes
+  `OOB_FILL_NONE`); our 3-D descriptors flatten (B·S) so only the
+  last batch's tail truly zero-fills — interior batch tails read the
+  next batch's rows, which the +inf-LSE / 0-dpsum padding
+  annihilates exactly (finite-garbage assumption).
+
+## Extending the envelope (if/when)
+
+The natural next features, in rough order of value: causal masking
+(block-skip in both kernels + masked softmax), other head dims,
+MQA/GQA (Hk < Hq indexing on the K/V TMA coords), varlen. The
+FA4-class algorithm core (warp specialization, tile_m=80 bwd, the
+mailbox dQ drain) carries over; these are predicate/indexing
+variations. Keep every change inside the measurement protocol above
+— and add new seqlen/shape cases to `bench_fa4.py --check-only` and
+`tests/test_fa4.py`, not ad-hoc scripts.

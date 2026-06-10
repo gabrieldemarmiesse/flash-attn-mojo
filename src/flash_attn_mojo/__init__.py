@@ -1,9 +1,13 @@
-"""flash-attn, fused into Mojo kernels and called via direct
-Python <-> Mojo CPython extensions (no MAX framework).
+"""FlashAttention-4-class attention kernels in Mojo, called via
+direct Python <-> Mojo CPython extensions (no MAX framework).
 
-Layout: each of the public entry points lives in its own subpackage
-(`fwd/`, `bwd/`) for the actual conv kernels, with thin Python
-wrappers at the package root that handle autograd plumbing.
+The kernels (`fwd_fa4/`, `bwd_fa4/`) are from-scratch Hopper
+(TMA + WGMMA, warp-specialized) ports racing Tri Dao's
+FlashAttention-4 (`flash_attn.cute`); both match its kernel time on
+H100 within run-to-run variance at the supported envelope: bf16,
+head_dim=128, seqlen % 128 == 0, non-causal, Hq == Hk, contiguous
+(B, S, H, D). `flash_attn_func` is a differentiable autograd op over
+them.
 
 GPU subpackages use JIT-on-first-use: each runtime config compiles
 its own single-variant `.so` via `mojo build` at call time and
@@ -38,8 +42,6 @@ from flash_attn_mojo._fn import (  # noqa: E402
     flash_attn_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
-    flash_attn_varlen_func,
-    flash_attn_with_kvcache,
 )
 from flash_attn_mojo.reference import flash_attn_ref  # noqa: E402
 
@@ -50,6 +52,4 @@ __all__ = [
     "flash_attn_kvpacked_func",
     "flash_attn_qkvpacked_func",
     "flash_attn_ref",
-    "flash_attn_varlen_func",
-    "flash_attn_with_kvcache",
 ]
