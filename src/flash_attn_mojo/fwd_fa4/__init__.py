@@ -61,9 +61,6 @@ def native_fwd_fa4(
         "fwd_fa4 is bf16/fp16-only"
     )
     assert head_dim in (64, 128), "fwd_fa4 supports head_dim 64/128"
-    assert not (head_dim == 64 and causal), (
-        "hdim64 causal is pending (port step 4)"
-    )
     assert not (head_dim == 64 and q.dtype == torch.float16), (
         "hdim64 fp16 needs the n=64 RS wgmma arm"
     )

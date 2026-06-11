@@ -243,13 +243,22 @@ def fwd_fa4_kernel[
     else:
         num_kv_blocks = (seq_len + BN - 1) // BN
     comptime if causal:
-        # BM == BN: row block m attends KV tiles 0..m inclusive; the
-        # tile n == m_block is the (only) masked diagonal tile.
-        # (Varlen v1 is self-attn — seqlen_q == seqlen_k per sequence
-        # — so the dense diagonal formula carries over. The general
-        # FA4 form is min(·, ceil_div((m+1)*BM + slk - slq, BN)).)
-        comptime assert BM == BN, "causal block-skip assumes BM == BN"
-        num_kv_blocks = min(num_kv_blocks, m_block + 1)
+        comptime if BM == BN:
+            # BM == BN: row block m attends KV tiles 0..m inclusive;
+            # tile n == m_block is the (only) masked diagonal tile.
+            # (Varlen v1 is self-attn — seqlen_q == seqlen_k per
+            # sequence — so the dense diagonal formula carries over.
+            # The general FA4 form is min(·, ceil_div((m+1)*BM + slk
+            # - slq, BN)).)
+            num_kv_blocks = min(num_kv_blocks, m_block + 1)
+        else:
+            # BM=192 > BN=128 (hdim64): row block m attends kv cols
+            # < (m+1)*BM, i.e. ceil((m+1)*BM/BN) tiles; the diagonal
+            # BAND spans the last TWO tiles of the trip range.
+            num_kv_blocks = min(
+                num_kv_blocks,
+                ((m_block + 1) * BM + BN - 1) // BN,
+            )
 
     # Varlen ragged kv tail: garbage columns live only in the
     # sequence's LAST kv tile (kv tiles are seq-local). Non-causal
@@ -497,6 +506,10 @@ def fwd_fa4_kernel[
         wg * WGMMA_M + (Int(warp_id()) % 4) * 16 + Int(lane_id()) // 4
     )
     var mask_col_lo: Int = 2 * (Int(lane_id()) % 4)
+    # BM != BN causal: per-tile global offset (col_g - row_g = col +
+    # mask_d - row with mask_d = n*BN - m*BM), set before each
+    # masked-tile softmax call. Unused (and DCE'd) when BM == BN.
+    var causal_mask_d: Int = 0
 
     @parameter
     @always_inline
@@ -507,12 +520,24 @@ def fwd_fa4_kernel[
         mask_tail (varlen non-causal only): this is the sequence's
         last kv tile — mask the ragged-tail garbage columns."""
         comptime if causal:
-            if mask_diag:
-                comptime for c in range(c_frag_size_qk):
-                    comptime col_base: Int = (c // 4) * 8 + (c & 1)
-                    comptime row_off: Int = 8 if (c % 4) >= 2 else 0
-                    if col_base + mask_col_lo > mask_row_lo + row_off:
-                        s_reg.ptr[c] = neg_inf
+            comptime if BM == BN:
+                if mask_diag:
+                    comptime for c in range(c_frag_size_qk):
+                        comptime col_base: Int = (c // 4) * 8 + (c & 1)
+                        comptime row_off: Int = 8 if (c % 4) >= 2 else 0
+                        if col_base + mask_col_lo > mask_row_lo + row_off:
+                            s_reg.ptr[c] = neg_inf
+            else:
+                # Diagonal-band tile: global mask col + mask_d > row.
+                if mask_diag:
+                    comptime for c in range(c_frag_size_qk):
+                        comptime col_base: Int = (c // 4) * 8 + (c & 1)
+                        comptime row_off: Int = 8 if (c % 4) >= 2 else 0
+                        if (
+                            col_base + mask_col_lo + causal_mask_d
+                            > mask_row_lo + row_off
+                        ):
+                            s_reg.ptr[c] = neg_inf
         comptime if varlen and not causal:
             if mask_tail and vl_kv_tail < BN:
                 comptime for c in range(c_frag_size_qk):
@@ -577,11 +602,19 @@ def fwd_fa4_kernel[
     _ = empty[0].arrive()
 
     # rowmax starts at -inf -> scale_old==0, rowsum init. For causal,
-    # m_block 0's single tile IS the diagonal. Varlen non-causal
-    # walks kv in reverse, so the FIRST tile here is the sequence's
-    # ragged-tail (boundary) tile — the only one that needs the
-    # column mask; the steady loop below stays mask-free.
-    softmax_block(causal and num_kv_blocks == 1, True)
+    # m_block 0's single tile IS the diagonal (BM==BN) or may sit in
+    # the 2-tile diagonal band (BM>BN). Varlen non-causal walks kv in
+    # reverse, so the FIRST tile here is the sequence's ragged-tail
+    # (boundary) tile — the only one that needs the column mask; the
+    # steady loop below stays mask-free.
+    var prologue_diag: Bool = False
+    comptime if causal:
+        comptime if BM == BN:
+            prologue_diag = num_kv_blocks == 1
+        else:
+            prologue_diag = num_kv_blocks <= 2
+            causal_mask_d = -m_block * BM
+    softmax_block(prologue_diag, True)
     pack_p()  # P(0)
 
     # ---- Main loop: QK(n+1) + PV(n) per iteration. Ring slots and
@@ -624,9 +657,17 @@ def fwd_fa4_kernel[
         _ = empty[k_slot].arrive()
 
         # Softmax of S(n+1) overlaps PV(n). For causal the last
-        # tile (n+1 == num_kv_blocks-1 == m_block) is the diagonal.
+        # tile (BM==BN: n+1 == num_kv_blocks-1 == m_block is THE
+        # diagonal; BM>BN: the last TWO tiles form the band).
         # (Varlen's tail mask ran in the prologue — reverse order.)
-        softmax_block(causal and it == num_kv_blocks - 2, False)
+        var loop_diag: Bool = False
+        comptime if causal:
+            comptime if BM == BN:
+                loop_diag = it == num_kv_blocks - 2
+            else:
+                loop_diag = it >= num_kv_blocks - 3
+                causal_mask_d = (it + 1) * BN - m_block * BM
+        softmax_block(loop_diag, False)
 
         # PV(n) retired: p_reg and o_reg are safe to touch.
         wgmma_pv.wait_group[0]()
