@@ -46,6 +46,7 @@ def launch_fwd_fa4[
     use_external_stream: Bool,
     causal: Bool = False,
     gqa_ratio: Int = 1,
+    varlen: Bool = False,
 ](
     batch_int: Int,
     seqlen_int: Int,

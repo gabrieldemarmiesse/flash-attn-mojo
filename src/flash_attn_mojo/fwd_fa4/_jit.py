@@ -33,16 +33,17 @@ def call_fwd_fa4(args: tuple) -> None:
 
     ``args`` layout (see ``fwd_fa4/__init__.py::native_fwd_fa4``):
         0..4   q_addr, k_addr, v_addr, o_addr, lse_addr
-        4..6   batch, seqlen, nheads
-        7      softmax_scale
-        8..10  o_b_stride, o_l_stride, o_h_stride
-        11     stream_handle_addr
-        12     dtype_code     (comptime)
-        13     head_dim       (comptime)
-        14     use_external_stream (comptime)
-        15     causal         (comptime)
-        16     gqa_ratio      (comptime)
-    ``ctx_handle`` is appended as index 17 by this dispatcher.
+        5..7   batch, seqlen, nheads
+        8      softmax_scale
+        9..11  o_b_stride, o_l_stride, o_h_stride
+        12     stream_handle_addr
+        13     dtype_code     (comptime)
+        14     head_dim       (comptime)
+        15     use_external_stream (comptime)
+        16     causal         (comptime)
+        17     gqa_ratio      (comptime)
+        18     varlen         (comptime)
+    ``ctx_handle`` is appended as index 19 by this dispatcher.
     """
     variant_fn, ctx_handle = _get_variant_fn(_config_from_args(args))
     variant_fn(*args, ctx_handle)
@@ -54,23 +55,25 @@ def _config_from_args(args: tuple) -> tuple:
     use_external_stream = bool(args[15])
     causal = bool(args[16])
     gqa_ratio = int(args[17])
+    varlen = bool(args[18])
     dump_ptx = os.environ.get("MOJO_DUMP_PTX", "")
     return (
         dtype_code, head_dim, use_external_stream, causal, gqa_ratio,
-        dump_ptx,
+        varlen, dump_ptx,
     )
 
 
 def _mod_name(config: tuple) -> str:
-    (dt, hd, ues, causal, ratio, dump_ptx) = config
+    (dt, hd, ues, causal, ratio, varlen, dump_ptx) = config
     suffix = "_causal" if causal else ""
     suffix += f"_gqa{ratio}" if ratio > 1 else ""
+    suffix += "_varlen" if varlen else ""
     suffix += "_dumpptx" if dump_ptx else ""
     return f"{_DTYPE_NAME[dt]}_hd{hd}_extstr{int(ues)}{suffix}"
 
 
 def _defines(config: tuple) -> dict[str, str]:
-    (dt, hd, ues, causal, ratio, dump_ptx) = config
+    (dt, hd, ues, causal, ratio, varlen, dump_ptx) = config
 
     defines = {
         "DTYPE": _DTYPE_DEFINE[dt],
@@ -78,6 +81,7 @@ def _defines(config: tuple) -> dict[str, str]:
         "USE_EXTERNAL_STREAM": "true" if ues else "false",
         "CAUSAL": "true" if causal else "false",
         "GQA_RATIO": str(ratio),
+        "VARLEN": "true" if varlen else "false",
     }
     if dump_ptx:
         defines["MOJO_DUMP_PTX"] = dump_ptx

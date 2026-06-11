@@ -64,6 +64,7 @@ def launch_bwd_preprocess[
     use_external_stream: Bool,
     causal: Bool = False,
     gqa_ratio: Int = 1,
+    varlen: Bool = False,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -167,6 +168,7 @@ def launch_bwd_main[
     use_external_stream: Bool,
     causal: Bool = False,
     gqa_ratio: Int = 1,
+    varlen: Bool = False,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -356,6 +358,7 @@ def launch_bwd_convert[
     use_external_stream: Bool,
     causal: Bool = False,
     gqa_ratio: Int = 1,
+    varlen: Bool = False,
 ](
     batch_int: Int,
     seqlen_int: Int,

@@ -88,5 +88,6 @@ def native_fwd_fa4(
             1,  # use_external_stream
             1 if causal else 0,
             nheads // nheads_kv,  # gqa_ratio
+            0,  # varlen
         )
     )
