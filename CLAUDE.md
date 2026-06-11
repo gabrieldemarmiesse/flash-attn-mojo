@@ -150,6 +150,31 @@ run-to-run variance (locked clocks, interleaved):
   (tested). General (non-%128) window_left needs only the fwd
   trip-0 mask + the bwd guard relaxation — formulas already exact.
 
+- SOFTCAP (2026-06-11, Gemma-2, fully differentiable, composes
+  with causal/window/GQA — the causal+SWA+softcap Gemma-2 layer
+  config is tested end-to-end): mojo is FAR past parity — fwd
+  0.42x (1463 vs 3451 us), bwd 0.56x (3652 vs 6490) at canonical
+  causal cap=50 — because std.math.tanh lowers to the sm90 HW
+  tanh.approx.f32 while FA4's score_mod "fastmath" tanh EMULATES
+  via ex2 (its softcap costs +210% fwd; ours +33% fwd / +15% bwd
+  over plain causal). The cap is COMPTIME (SOFTCAP_X1000 define,
+  one JIT variant per cap value — a model constant), so it costs
+  no kernel-arg slot and composes with every slot-riding feature.
+  FA4 semantics: S_capped = cap*tanh(S*scale/cap) PRE-mask;
+  scale_log2 is repointed at cap*log2e so the existing max/exp2
+  sites fold the cap back unchanged. fwd: one tanh+mul transform
+  at the top of softmax_block (before the mask arms — masks then
+  write -1e30 into the capped domain, keeping exp2 zeros EXACT).
+  bwd: same transform pre-mask; the dS pass reorders under softcap
+  (dP retires before the exp2 so the chain factor (1 - t^2) reads
+  t before P overwrites s_reg) and the factor is max(fma(-t,t,1),0)
+  — the clamp keeps masked entries' dS exactly 0 (their (-1e30)^2
+  overflows to +inf; unclamped that's a -inf factor and NaN dS).
+  dK/dQ keep their existing softmax_scale epilogue multiplies
+  (chain rule: d(qk) = dS_capped*(1-t^2)*scale). v1 envelope:
+  dense, hdim128. LSE tol vs exact-tanh references is 1e-4 (HW
+  tanh is ~2^-11 relative).
+
 `HANDOFF.md` is the full race log: architecture, the perf journey,
 the codegen lessons (uniform-register file capacity, the
 tid-widening trap, descriptor rematerialization), the measurement
@@ -349,12 +374,13 @@ HANDOFF.md and the memory notes):
 through the varlen kernels inside flash_attn_func — one sequence
 per batch row; the %128 fast path is untouched.)
 
-(Sliding window landed 2026-06-11 — see the State entry.)
+(Sliding window and softcap landed 2026-06-11 — see the State
+entries.)
 
-The natural next features, in rough order of value: softcap,
-varlen cross-attention, hdim64 varlen + fp16 (see the
-hdim64 State note), hdim 96/256, the varlen-GQA bwd gap
-(pack-GQA-style head packing), general non-%128 window_left. The FA4-class algorithm core
+The natural next features, in rough order of value: varlen
+cross-attention, hdim64 varlen + fp16 (see the hdim64 State note),
+hdim 96/256, the varlen-GQA bwd gap (pack-GQA-style head packing),
+general non-%128 window_left, varlen softcap/window. The FA4-class algorithm core
 (warp specialization, tile_m=80 bwd, the mailbox dQ drain) carries
 over. Keep every change inside the measurement protocol above — and
 add new seqlen/shape cases to `bench_fa4.py --check-only` and

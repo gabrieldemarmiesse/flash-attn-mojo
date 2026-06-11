@@ -86,18 +86,22 @@ def _check_envelope(
 
 class _FlashAttnFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, softmax_scale, causal, window_left=0):
+    def forward(
+        ctx, q, k, v, softmax_scale, causal, window_left=0,
+        softcap=0.0,
+    ):
         from flash_attn_mojo.fwd_fa4 import fa4_fwd
 
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         out, lse = fa4_fwd(
             q, k, v, softmax_scale, causal=causal,
-            window_left=window_left,
+            window_left=window_left, softcap=softcap,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_left = window_left
+        ctx.softcap = softcap
         ctx.mark_non_differentiable(lse)
         return out, lse
 
@@ -109,8 +113,9 @@ class _FlashAttnFunc(torch.autograd.Function):
         dq, dk, dv = bwd_fa4(
             q, k, v, out, dout.contiguous(), lse, ctx.softmax_scale,
             causal=ctx.causal, window_left=ctx.window_left,
+            softcap=ctx.softcap,
         )
-        return dq, dk, dv, None, None, None
+        return dq, dk, dv, None, None, None, None
 
 
 def flash_attn_func(
@@ -120,6 +125,7 @@ def flash_attn_func(
     softmax_scale: float | None = None,
     causal: bool = False,
     window_size: tuple[int, int] = (-1, -1),
+    softcap: float = 0.0,
     *,
     return_lse: bool = False,
 ):
@@ -137,6 +143,11 @@ def flash_attn_func(
         window_size: (left, 0) with causal=True enables Mistral-style
             sliding-window attention (fully differentiable). v1
             envelope: left % 128 == 0, head_dim=128, seqlen % 128 == 0.
+        softcap: Gemma-2 attention-logit softcap, S := softcap *
+            tanh(S / softcap) (fully differentiable; composes with
+            causal/window/GQA). v1 envelope: head_dim=128,
+            seqlen % 128 == 0. The cap compiles into the kernel
+            (one JIT variant per value).
         return_lse: also return the (batch, nheads, seqlen) fp32
             natural-log row logsumexp.
 
@@ -164,6 +175,15 @@ def flash_attn_func(
             )
         window_left = int(left)
 
+    softcap = float(softcap)
+    if softcap:
+        if softcap < 0:
+            raise ValueError("softcap must be >= 0")
+        if q.shape[-1] != 128 or q.shape[1] % 128:
+            raise ValueError(
+                "softcap v1 envelope: head_dim=128, seqlen % 128 == 0"
+            )
+
     if not q.is_cuda:
         # flash_attn_ref handles GQA (repeat-interleave) and the
         # fp32 LSE internally.
@@ -172,6 +192,7 @@ def flash_attn_func(
             window_size=(
                 (window_left, 0) if window_left else (-1, -1)
             ),
+            softcap=softcap,
             return_lse=return_lse,
         )
 
@@ -203,7 +224,7 @@ def flash_attn_func(
         return out
 
     out, lse = _FlashAttnFunc.apply(
-        q, k, v, softmax_scale, causal, window_left
+        q, k, v, softmax_scale, causal, window_left, softcap
     )
     if return_lse:
         return out, lse

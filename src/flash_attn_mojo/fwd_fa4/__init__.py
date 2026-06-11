@@ -25,6 +25,7 @@ def fa4_fwd(
     softmax_scale: float | None = None,
     causal: bool = False,
     window_left: int = 0,
+    softcap: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convenience wrapper: allocate out + lse, dispatch, return both.
 
@@ -40,7 +41,9 @@ def fa4_fwd(
     lse = torch.empty(
         (batch, nheads, seqlen), dtype=torch.float32, device=q.device
     )
-    native_fwd_fa4(q, k, v, out, lse, softmax_scale, causal, window_left)
+    native_fwd_fa4(
+        q, k, v, out, lse, softmax_scale, causal, window_left, softcap
+    )
     return out, lse
 
 
@@ -53,6 +56,7 @@ def native_fwd_fa4(
     softmax_scale: float,
     causal: bool = False,
     window_left: int = 0,
+    softcap: float = 0.0,
 ) -> None:
     """JIT-compile (if needed) and dispatch a single fwd call."""
     from flash_attn_mojo.fwd_fa4._jit import call_fwd_fa4
@@ -70,6 +74,13 @@ def native_fwd_fa4(
     if window_left:
         assert causal and head_dim == 128 and window_left % 128 == 0, (
             "window v1: causal + head_dim=128 + left % 128 == 0"
+        )
+    # The cap is comptime (one JIT variant per value); x1000 keeps
+    # the define an int while representing Gemma-class caps exactly.
+    softcap_x1000 = round(float(softcap) * 1000)
+    if softcap_x1000:
+        assert softcap > 0 and head_dim == 128, (
+            "softcap v1: positive cap + head_dim=128"
         )
     assert k.shape == (batch, seqlen, nheads_kv, head_dim)
     assert v.shape == k.shape
@@ -106,6 +117,7 @@ def native_fwd_fa4(
             0,  # varlen num_tiles
             1 if window_left else 0,  # window (comptime)
             window_left,
+            softcap_x1000,  # comptime
         )
     )
 
@@ -222,6 +234,7 @@ def fa4_varlen_fwd(
             num_tiles,
             0,  # window (comptime)
             0,  # window_left
+            0,  # softcap_x1000 (comptime; varlen softcap not in v1)
         )
     )
     return out, lse

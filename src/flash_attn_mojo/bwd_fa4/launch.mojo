@@ -191,6 +191,7 @@ def launch_bwd_main[
     gqa_ratio: Int = 1,
     varlen: Bool = False,
     window: Bool = False,
+    softcap_x1000: Int = 0,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -339,6 +340,7 @@ def launch_bwd_main[
         gqa_ratio,
         varlen,
         window,
+        softcap_x1000,
     ]
 
     var compiled = ctx.compile_function[

@@ -21,6 +21,7 @@ comptime CAUSAL: Bool = get_defined_bool["CAUSAL", False]()
 comptime GQA_RATIO: Int = get_defined_int["GQA_RATIO", 1]()
 comptime VARLEN: Bool = get_defined_bool["VARLEN", False]()
 comptime WINDOW: Bool = get_defined_bool["WINDOW", False]()
+comptime SOFTCAP_X1000: Int = get_defined_int["SOFTCAP_X1000", 0]()
 
 
 def flash_attn_fwd_fa4_acquire_ctx(
@@ -54,9 +55,10 @@ def flash_attn_fwd_fa4_variant(
     var vl_total_k: Int = Int(py=args[20])
     var vl_table_addr: Int = Int(py=args[21])
     var vl_num_tiles: Int = Int(py=args[22])
-    # args[23] is the WINDOW comptime gate.
+    # args[23] is the WINDOW comptime gate; args[25] the softcap
+    # value (comptime, consumed via the SOFTCAP_X1000 define).
     var window_left: Int = Int(py=args[24])
-    var ctx_handle_addr: Int = Int(py=args[25])
+    var ctx_handle_addr: Int = Int(py=args[26])
 
     if batch_int == 0 or seqlen_int == 0 or nheads_int == 0:
         return PythonObject(None)
@@ -69,6 +71,7 @@ def flash_attn_fwd_fa4_variant(
         GQA_RATIO,
         VARLEN,
         WINDOW,
+        SOFTCAP_X1000,
     ](
         batch_int,
         seqlen_int,

@@ -43,7 +43,7 @@ or finite next-batch garbage, both annihilated by P=dS=0). All
 q/k/v/o/do/dq/dk/dv tensors are contiguous (B, S, H, D) bf16.
 """
 
-from std.math import exp2
+from std.math import exp2, tanh
 from std.math.constants import log2e
 from std.utils.numerics import inf
 from std.sys import size_of
@@ -146,6 +146,7 @@ def bwd_main_kernel[
     gqa_ratio: Int = 1,
     varlen: Bool = False,
     window: Bool = False,
+    softcap_x1000: Int = 0,
 ](
     q_tma: TMATensorTile[dtype, 3, q_tile_shape, q_desc_shape],
     do_tma: TMATensorTile[dtype, 3, q_tile_shape, q_desc_shape],
@@ -635,6 +636,20 @@ def bwd_main_kernel[
     var scale_log2: Scalar[accum_type] = (
         softmax_scale * Scalar[DType.float32](log2e)
     ).cast[accum_type]()
+    # Softcap (Gemma-2), FA4 semantics — see the fwd kernel's note.
+    # The COMPTIME cap repoints scale_log2 at cap*log2(e); s_reg
+    # holds t = tanh(s*scale/cap) through the masks; the dS pass
+    # gains the (1 - t^2) chain factor. dK/dQ keep their existing
+    # softmax_scale epilogue multiplies (the chain factor d(qk) =
+    # dS_capped * (1 - t^2) * scale preserves the plain scale).
+    comptime softcap_on: Bool = softcap_x1000 != 0
+    var t_scale: Scalar[accum_type] = Scalar[accum_type](0)
+    comptime if softcap_on:
+        comptime cap_f32: Float32 = Float32(softcap_x1000) / 1000
+        t_scale = (softmax_scale / cap_f32).cast[accum_type]()
+        scale_log2 = (
+            cap_f32 * Scalar[DType.float32](log2e)
+        ).cast[accum_type]()
 
     # ---- consumer state.
     mbar_k[0].wait(UInt32(0))
@@ -740,6 +755,15 @@ def bwd_main_kernel[
         wgmma_sdp.wait_group[1]()
         warpgroup_fence(s_reg)
 
+        comptime if softcap_on:
+            # Cap BEFORE the mask arms (FA4 pre-mask score_mod):
+            # the masks then write -1e30 into the capped domain, so
+            # the exp2 below still yields EXACT zeros for masked
+            # entries — the GQA cp.reduce no-op rows and dS
+            # exactness both rely on that.
+            comptime for c in range(c_frag_sdp):
+                s_reg.ptr[c] = tanh(s_reg.ptr[c] * t_scale)
+
         comptime if causal:
             if it < BN // BM:
                 var mask_d: Int = it * BM
@@ -794,39 +818,81 @@ def bwd_main_kernel[
                     if trow_lo + trow_off >= vl_kv_tail:
                         s_reg.ptr[c] = Scalar[accum_type](-1.0e30)
 
-        # P^T = exp2(S^T * scale_log2 - lse_log2[q col]), f32 in
-        # s_reg. NOT packed yet: FA4's order computs dS first, then
-        # packs P and dS together — keeps the f32 P and bf16 P from
-        # coexisting at the (former) register peak, and keeps the
-        # dS multiply off a bf16->f32 unpack critical path.
-        comptime for cc in range(c_frag_sdp // 4):
-            var lp2 = (lse_smem + stat_col + cc * 8).load[
-                width=2, alignment=8
-            ]()
-            comptime for ic in range(4):
-                comptime c: Int = cc * 4 + ic
-                comptime j: Int = c & 1
-                comptime if PROBE_NO_EXP2:
-                    s_reg.ptr[c] = s_reg.ptr[c].fma(scale_log2, -lp2[j])
-                else:
-                    s_reg.ptr[c] = exp2(
-                        s_reg.ptr[c].fma(scale_log2, -lp2[j])
+        comptime if softcap_on:
+            # Softcap reorder: the dS chain factor (1 - t^2) needs
+            # t (s_reg) BEFORE the exp2 overwrites it with P, so dP
+            # retires first and (dP - dpsum) * factor lands in
+            # dp_reg ahead of the P pass. max(., 0) clamps masked
+            # entries — their (-1e30)^2 overflows to +inf and the
+            # factor would otherwise be -inf (NaN against P == 0);
+            # clamped, their dS is exactly 0.
+            wgmma_sdp.wait_group[0]()
+            warpgroup_fence(dp_reg)
+            comptime for cc in range(c_frag_sdp // 4):
+                var dp2c = (dps_smem + stat_col + cc * 8).load[
+                    width=2, alignment=8
+                ]()
+                comptime for ic in range(4):
+                    comptime c: Int = cc * 4 + ic
+                    comptime j: Int = c & 1
+                    var fac: Scalar[accum_type] = max(
+                        s_reg.ptr[c].fma(
+                            -s_reg.ptr[c], Scalar[accum_type](1)
+                        ),
+                        Scalar[accum_type](0),
                     )
+                    dp_reg.ptr[c] = (dp_reg.ptr[c] - dp2c[j]) * fac
+            comptime for cc in range(c_frag_sdp // 4):
+                var lp2c = (lse_smem + stat_col + cc * 8).load[
+                    width=2, alignment=8
+                ]()
+                comptime for ic in range(4):
+                    comptime c: Int = cc * 4 + ic
+                    comptime j: Int = c & 1
+                    s_reg.ptr[c] = exp2(
+                        s_reg.ptr[c].fma(scale_log2, -lp2c[j])
+                    )
+            comptime for c in range(c_frag_sdp):
+                dp_reg.ptr[c] = s_reg.ptr[c] * dp_reg.ptr[c]
+        else:
+            # P^T = exp2(S^T * scale_log2 - lse_log2[q col]), f32 in
+            # s_reg. NOT packed yet: FA4's order computs dS first,
+            # then packs P and dS together — keeps the f32 P and
+            # bf16 P from coexisting at the (former) register peak,
+            # and keeps the dS multiply off a bf16->f32 unpack
+            # critical path.
+            comptime for cc in range(c_frag_sdp // 4):
+                var lp2 = (lse_smem + stat_col + cc * 8).load[
+                    width=2, alignment=8
+                ]()
+                comptime for ic in range(4):
+                    comptime c: Int = cc * 4 + ic
+                    comptime j: Int = c & 1
+                    comptime if PROBE_NO_EXP2:
+                        s_reg.ptr[c] = s_reg.ptr[c].fma(
+                            scale_log2, -lp2[j]
+                        )
+                    else:
+                        s_reg.ptr[c] = exp2(
+                            s_reg.ptr[c].fma(scale_log2, -lp2[j])
+                        )
 
-        # dP^T retired (wait 0: nothing else in flight — FA4's
-        # sequence; dV is committed after the dS store).
-        wgmma_sdp.wait_group[0]()
-        warpgroup_fence(dp_reg)
+            # dP^T retired (wait 0: nothing else in flight — FA4's
+            # sequence; dV is committed after the dS store).
+            wgmma_sdp.wait_group[0]()
+            warpgroup_fence(dp_reg)
 
-        # dS^T = P^T * (dP^T - dpsum[q col]); pack P and dS bf16.
-        comptime for cc in range(c_frag_sdp // 4):
-            var dp2 = (dps_smem + stat_col + cc * 8).load[
-                width=2, alignment=8
-            ]()
-            comptime for ic in range(4):
-                comptime c: Int = cc * 4 + ic
-                comptime j: Int = c & 1
-                dp_reg.ptr[c] = s_reg.ptr[c] * (dp_reg.ptr[c] - dp2[j])
+            # dS^T = P^T * (dP^T - dpsum[q col]); pack P and dS bf16.
+            comptime for cc in range(c_frag_sdp // 4):
+                var dp2 = (dps_smem + stat_col + cc * 8).load[
+                    width=2, alignment=8
+                ]()
+                comptime for ic in range(4):
+                    comptime c: Int = cc * 4 + ic
+                    comptime j: Int = c & 1
+                    dp_reg.ptr[c] = s_reg.ptr[c] * (
+                        dp_reg.ptr[c] - dp2[j]
+                    )
         comptime for c2 in range(c_frag_sdp // 2):
             var pp = SIMD[accum_type, 2](
                 s_reg.ptr[2 * c2], s_reg.ptr[2 * c2 + 1]

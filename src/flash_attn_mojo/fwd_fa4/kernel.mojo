@@ -34,7 +34,7 @@ straight indexwise cast is correct. (With >1 m_mma it would not be:
 the RS wgmma walks fragments k-major, `a_frags[m + k*num_m]`.)
 """
 
-from std.math import exp2, log
+from std.math import exp2, log, tanh
 from std.math.constants import log2e
 from std.sys import size_of
 from std.utils.index import StaticTuple, IndexList
@@ -111,6 +111,7 @@ def fwd_fa4_kernel[
     gqa_ratio: Int = 1,
     varlen: Bool = False,
     window: Bool = False,
+    softcap_x1000: Int = 0,
 ](
     q_tma: TMATensorTile[dtype, qo_rank, q_tile_shape, q_desc_shape],
     k_tma: TMATensorTile[dtype, 3, kv_tile_shape, kv_desc_shape],
@@ -456,6 +457,23 @@ def fwd_fa4_kernel[
     var scale_log2: Scalar[accum_type] = (
         softmax_scale * Scalar[DType.float32](log2e)
     ).cast[accum_type]()
+    # Softcap (Gemma-2): S_capped = cap * tanh(S_raw * scale / cap),
+    # FA4 semantics (scale applied BEFORE the tanh, score_mod
+    # pre-mask). The cap is a COMPTIME constant (one JIT variant per
+    # cap value — it is a model-architecture constant), so it costs
+    # no kernel arg slot and composes with window/GQA/varlen. The
+    # softmax then runs in the capped domain: s_reg holds
+    # t = tanh(s*scale/cap) and scale_log2 is repointed at
+    # cap * log2(e), so the existing max/exp2 sites fold the cap
+    # back in unchanged.
+    comptime softcap_on: Bool = softcap_x1000 != 0
+    var t_scale: Scalar[accum_type] = Scalar[accum_type](0)
+    comptime if softcap_on:
+        comptime cap_f32: Float32 = Float32(softcap_x1000) / 1000
+        t_scale = (softmax_scale / cap_f32).cast[accum_type]()
+        scale_log2 = (
+            cap_f32 * Scalar[DType.float32](log2e)
+        ).cast[accum_type]()
 
     @parameter
     @always_inline
@@ -542,6 +560,14 @@ def fwd_fa4_kernel[
         mask_diag (causal only): apply the diagonal-tile mask first.
         mask_tail (varlen non-causal only): this is the sequence's
         last kv tile — mask the ragged-tail garbage columns."""
+        comptime if softcap_on:
+            # Cap BEFORE the mask arms (FA4 applies score_mod
+            # pre-mask; masking after keeps -1e30 * cap_log2 = a
+            # true -inf in the exp2). tanh lowers to the sm90 HW
+            # tanh.approx.f32 — FA4's "fastmath" tanh emulates via
+            # ex2 and pays 3.1x kernel time for it.
+            comptime for c in range(c_frag_size_qk):
+                s_reg.ptr[c] = tanh(s_reg.ptr[c] * t_scale)
         comptime if causal:
             comptime if BM == BN:
                 if mask_diag:

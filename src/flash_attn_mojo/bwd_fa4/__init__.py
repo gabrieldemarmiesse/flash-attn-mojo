@@ -31,6 +31,7 @@ def bwd_fa4(
     softmax_scale: float | None = None,
     causal: bool = False,
     window_left: int = 0,
+    softcap: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute (dq, dk, dv). Mirrors
     ``flash_attn.cute.interface._flash_attn_bwd``'s simplest call.
@@ -39,6 +40,8 @@ def bwd_fa4(
     lse: (B, H, S) fp32 contiguous (natural-log LSE from the fwd).
     window_left > 0: causal sliding window (Mistral SWA) — same v1
     envelope as the fwd (causal, head_dim=128, left % 128 == 0).
+    softcap > 0: Gemma-2 attention-logit softcap (comptime variant;
+    head_dim=128).
     """
     from flash_attn_mojo.bwd_fa4._jit import (
         call_bwd_fa4_convert,
@@ -64,6 +67,11 @@ def bwd_fa4(
     if window_left:
         assert causal and head_dim == 128 and window_left % 128 == 0, (
             "window v1: causal + head_dim=128 + left % 128 == 0"
+        )
+    softcap_x1000 = round(float(softcap) * 1000)
+    if softcap_x1000:
+        assert softcap > 0 and head_dim == 128, (
+            "softcap v1: positive cap + head_dim=128"
         )
     assert k.shape == (batch, seqlen, nheads_kv, head_dim)
     assert v.shape == k.shape
@@ -113,7 +121,7 @@ def bwd_fa4(
 
     config = make_config(
         _DTYPE_CODE[q.dtype], head_dim, True, causal, gqa_ratio,
-        window=bool(window_left),
+        window=bool(window_left), softcap_x1000=softcap_x1000,
     )
     stream = torch.cuda.current_stream().cuda_stream
 

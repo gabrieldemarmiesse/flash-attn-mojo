@@ -70,6 +70,22 @@ def test_window_cpu_reference_path():
     assert torch.equal(out, ref)
 
 
+def test_softcap_envelope_errors():
+    q, k, v = _qkv()
+    with pytest.raises(ValueError, match="softcap must be >= 0"):
+        flash_attn_func(q, k, v, softcap=-1.0)
+    q, k, v = _qkv(seqlen=100)
+    with pytest.raises(ValueError, match="softcap v1"):
+        flash_attn_func(q, k, v, softcap=50.0)
+
+
+def test_softcap_cpu_reference_path():
+    q, k, v = _qkv(seqlen=256)
+    out = flash_attn_func(q, k, v, causal=True, softcap=50.0)
+    ref = flash_attn_ref(q, k, v, causal=True, softcap=50.0)
+    assert torch.equal(out, ref)
+
+
 def test_cpu_reference_path():
     q, k, v = _qkv()
     out = flash_attn_func(q, k, v)

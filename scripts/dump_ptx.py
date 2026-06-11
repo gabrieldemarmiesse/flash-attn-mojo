@@ -25,6 +25,7 @@ def main() -> None:
     p.add_argument("--varlen", action="store_true")
     p.add_argument("--window", type=int, default=0,
                    help="window_left (fwd, implies --causal semantics)")
+    p.add_argument("--softcap", type=float, default=0.0)
     p.add_argument("--hkv", type=int, default=0)
     p.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     p.add_argument("--hdim", type=int, default=128)
@@ -58,7 +59,8 @@ def main() -> None:
         from flash_attn_mojo.fwd_fa4 import fa4_fwd
 
         out, lse = fa4_fwd(
-            q, k, v, causal=args.causal, window_left=args.window
+            q, k, v, causal=args.causal, window_left=args.window,
+            softcap=args.softcap,
         )
         if args.kind == "bwd":
             from flash_attn_mojo.bwd_fa4 import bwd_fa4
@@ -66,6 +68,7 @@ def main() -> None:
             bwd_fa4(
                 q, k, v, out, torch.randn_like(q), lse,
                 causal=args.causal, window_left=args.window,
+                softcap=args.softcap,
             )
     torch.cuda.synchronize()
     print("dumped", args)

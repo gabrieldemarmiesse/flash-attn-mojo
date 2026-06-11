@@ -38,10 +38,14 @@ def _parse_shape(s: str) -> tuple[int, int, int, int]:
     return tuple(int(x) for x in parts)  # type: ignore[return-value]
 
 
-def _fa4_fwd_fn(causal: bool, window_left: int = 0):
+def _fa4_fwd_fn(
+    causal: bool, window_left: int = 0, softcap: float = 0.0
+):
     from flash_attn.cute import flash_attn_func
 
     win = {"window_size": (window_left, 0)} if window_left else {}
+    if softcap:
+        win["softcap"] = softcap
 
     def run(q, k, v):
         return flash_attn_func(
@@ -53,19 +57,22 @@ def _fa4_fwd_fn(causal: bool, window_left: int = 0):
 
 def _get_step(
     impl: str, kind: str, q, k, v, dout, causal: bool = False,
-    window_left: int = 0,
+    window_left: int = 0, softcap: float = 0.0,
 ):
     """Returns (step_fn, outputs_fn). outputs_fn() -> tensors for the
     correctness check."""
     if kind == "fwd":
         if impl == "fa4":
-            run = _fa4_fwd_fn(causal, window_left)
+            run = _fa4_fwd_fn(causal, window_left, softcap)
         else:
             from flash_attn_mojo.fwd_fa4 import fa4_fwd as _mojo_fwd
 
+            scap = {"softcap": softcap} if softcap else {}
+
             def run(q, k, v):
                 return _mojo_fwd(
-                    q, k, v, causal=causal, window_left=window_left
+                    q, k, v, causal=causal, window_left=window_left,
+                    **scap,
                 )
 
         out_holder = {}
@@ -81,6 +88,9 @@ def _get_step(
 
     win = {"window_size": (window_left, 0)} if window_left else {}
     bwin = {"window_size_left": window_left} if window_left else {}
+    if softcap:
+        win["softcap"] = softcap
+        bwin["softcap"] = softcap
     out, lse = flash_attn_func(
         q, k, v, causal=causal, return_lse=True, **win
     )
@@ -100,6 +110,8 @@ def _get_step(
         from flash_attn_mojo.bwd_fa4 import bwd_fa4
 
         mwin = {"window_left": window_left} if window_left else {}
+        if softcap:
+            mwin["softcap"] = softcap
 
         def step():
             grads["g"] = bwd_fa4(
@@ -118,7 +130,11 @@ def _run_check_suite(args) -> None:
     import subprocess
     from pathlib import Path
 
-    if args.window:
+    if args.softcap:
+        # softcap tests are their own axis (plain/causal/swa x
+        # mha/gqa at hd128).
+        parts = [args.kind, "softcap"]
+    elif args.window:
         # window tests are their own axis (always causal+mha+hd128).
         parts = [args.kind, "window"]
     else:
@@ -180,6 +196,10 @@ def main() -> None:
         "--window", type=int, default=0,
         help="sliding-window left width (causal local attention); "
         "0 = no window",
+    )
+    p.add_argument(
+        "--softcap", type=float, default=0.0,
+        help="attention logit softcap (Gemma-2 style); 0 = off",
     )
     p.add_argument(
         "--dtype", choices=["bf16", "fp16"], default="bf16",
@@ -287,7 +307,7 @@ def main() -> None:
 
         step, outputs = _get_step(
             args.impl, args.kind, q, k, v, dout, args.causal,
-            args.window,
+            args.window, args.softcap,
         )
 
     # JIT compile + allocator warmup.
@@ -345,6 +365,7 @@ def main() -> None:
         f"RESULT impl={args.impl} kind={args.kind} "
         f"shape={shape_str} causal={int(args.causal)} "
         f"hkv={hkv_str} dtype={args.dtype} window={args.window} "
+        f"softcap={args.softcap:g} "
         f"us={us:.1f} tflops={tflops:.1f}"
     )
     for e in sorted(

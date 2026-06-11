@@ -50,6 +50,7 @@ def launch_fwd_fa4[
     gqa_ratio: Int = 1,
     varlen: Bool = False,
     window: Bool = False,
+    softcap_x1000: Int = 0,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -172,8 +173,12 @@ def launch_fwd_fa4[
             gqa_ratio,
             varlen,
             window,
+            softcap_x1000,
         ]
         comptime assert not window, "window v1 is hdim128-only"
+        comptime assert softcap_x1000 == 0, (
+            "softcap v1 is hdim128-only"
+        )
         var compiled = ctx.compile_function[
             kernel_inst,
             kernel_inst,
@@ -262,6 +267,7 @@ def launch_fwd_fa4[
         gqa_ratio,
         varlen,
         window,
+        softcap_x1000,
     ]
 
     var compiled = ctx.compile_function[

@@ -401,6 +401,36 @@ def test_window_public_api(hkv):
 
 
 @requires_cuda
+def test_softcap_public_api():
+    """Gemma-2 layer config (causal + SWA + softcap) through
+    flash_attn_func end-to-end (autograd)."""
+    q, k, v = _make_gqa(640, hq=4, hkv=2, requires_grad=True)
+    dout = torch.randn_like(q)
+    out, lse = flash_attn_func(
+        q, k, v, causal=True, window_size=(256, 0), softcap=50.0,
+        return_lse=True,
+    )
+    out.backward(dout)
+    qf = q.detach().float().requires_grad_()
+    kf = k.detach().float().requires_grad_()
+    vf = v.detach().float().requires_grad_()
+    ref, ref_lse = flash_attn_ref(
+        qf, kf, vf, causal=True, window_size=(256, 0), softcap=50.0,
+        return_lse=True,
+    )
+    ref.backward(dout.float())
+    assert (out.float() - ref).abs().max().item() < 2e-2
+    assert (lse - ref_lse).abs().max().item() < 1e-4
+    for name, got, want in (
+        ("dq", q.grad, qf.grad),
+        ("dk", k.grad, kf.grad),
+        ("dv", v.grad, vf.grad),
+    ):
+        d = (got.float() - want).abs().max().item()
+        assert d < 5e-2, f"{name} maxdiff {d:.3e}"
+
+
+@requires_cuda
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("seqlen", [100, 257, 1000])
 def test_dense_arbitrary_seqlen(seqlen, causal):

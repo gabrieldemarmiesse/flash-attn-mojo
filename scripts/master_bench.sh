@@ -29,6 +29,7 @@ cd "$ROOT"
 KIND="fwd"
 CAUSAL=0
 WINDOW=0
+SOFTCAP=0
 HKV=0
 VARLEN=0
 QUICK=0
@@ -44,6 +45,7 @@ while [[ $# -gt 0 ]]; do
         --kind) KIND="$2"; shift 2 ;;
         --causal) CAUSAL=1; shift ;;
         --window) WINDOW="$2"; shift 2 ;;
+        --softcap) SOFTCAP="$2"; shift 2 ;;
         --varlen) VARLEN=1; shift ;;
         --quick) QUICK=1; shift ;;
         --hkv) HKV="$2"; shift 2 ;;
@@ -64,6 +66,7 @@ if [[ "$CAUSAL" == 1 ]]; then CSUF="causal"; MSUF="_causal"; CFLAG=(--causal); f
 if [[ "$HKV" != 0 ]]; then CSUF="${CSUF}_gqa"; MSUF="${MSUF}_gqa"; CFLAG+=(--hkv "$HKV"); fi
 if [[ "$VARLEN" == 1 ]]; then CSUF="${CSUF}_varlen"; MSUF="${MSUF}_varlen"; CFLAG+=(--varlen); fi
 if [[ "$WINDOW" != 0 ]]; then CSUF="${CSUF}_window"; MSUF="${MSUF}_win"; CFLAG+=(--window "$WINDOW"); fi
+if [[ "$SOFTCAP" != 0 ]]; then CSUF="${CSUF}_softcap"; MSUF="${MSUF}_scap"; CFLAG+=(--softcap "$SOFTCAP"); fi
 if [[ "$HDIM" != 128 ]]; then MSUF="${MSUF}_hd${HDIM}"; fi
 if [[ "$KIND" == "fwd" ]]; then
     FA4_PTX="$ROOT/reference_ptx/fa4_fwd_sm90_bf16_hdim${HDIM}_${CSUF}.ptx"

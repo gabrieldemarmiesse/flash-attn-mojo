@@ -481,6 +481,45 @@ causal_varlen by 3k lines (baseline predated a committed change).
 Fresh stash-based baselines from HEAD: both byte-identical. ALWAYS
 re-baseline via stash before believing a gate failure.
 
+## Softcap (2026-06-11, eighth session)
+
+Gemma-2 attention-logit softcap, differentiable, composing with
+causal/window/GQA. NOT a parity race — mojo wins outright: fwd
+0.42x (1457-1463 vs 3451-3454 us), bwd 0.55-0.56x (3567-3652 vs
+6471-6490) at canonical causal cap=50. Root cause, from FA4's own
+reference PTX: its score_mod "fastmath" tanh contains ZERO
+tanh.approx instructions — cute emulates tanh via ex2, tripling
+its fwd kernel time — while std.math.tanh lowers straight to the
+sm90 hardware tanh.approx.f32 (one SFU op; our softcap costs +33%
+fwd / +15% bwd over plain causal).
+
+Design choices that made it small:
+- The cap is COMPTIME (-D SOFTCAP_X1000, one JIT variant per
+  value). A cap is a model-architecture constant, so the variant
+  cache cost is one compile per model — and it needs no kernel-arg
+  slot, composing with every slot-riding feature (the window's
+  seq_len high bits stay free; Gemma-2's causal+SWA+softcap layer
+  config works end-to-end).
+- Domain repointering, not new softmax code: s_reg holds
+  t = tanh(s*scale/cap) and scale_log2 is redefined to cap*log2e,
+  so the existing rowmax/exp2/LSE sites fold the cap back in
+  UNTOUCHED (byte-gated at cap=0 across all 11 variants).
+- Masks stay pre-exp2-exact: the tanh transform runs BEFORE the
+  mask arms (FA4 applies score_mod pre-mask), so masks still write
+  -1e30 and exp2 still yields exact zeros (the GQA cp.reduce
+  no-op-row invariant survives).
+- bwd chain factor (1 - t^2): the dS pass reorders under softcap —
+  dP retires before the exp2 so the factor reads t before P
+  overwrites s_reg — and the factor is max(fma(-t, t, 1), 0). The
+  clamp matters: masked entries hold -1e30, whose square overflows
+  to +inf; unclamped, the factor is -inf and dS goes NaN (0 *
+  -inf). dK/dQ epilogue scale multiplies are unchanged (d(qk) =
+  dS_capped * (1 - t^2) * scale keeps the plain scale factor).
+
+Tolerance note: HW tanh.approx is ~2^-11 relative; vs exact-tanh
+references the LSE lands at ~1e-5..1e-4 (SOFTCAP_LSE_TOL = 1e-4);
+outputs/grads stay inside the usual masked tolerances.
+
 ## Not yet tried (fwd)
 
 - ~~L2 cache hints on TMA loads~~ DEBUNKED (third session): FA4's

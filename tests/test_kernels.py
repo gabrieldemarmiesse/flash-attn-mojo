@@ -298,6 +298,101 @@ def test_bwd_window(case, heads):
         assert d < BWD_TOL_MASKED, f"{name} maxdiff {d:.3e}"
 
 
+# -------------------------------------------------------- softcap
+# Gemma-2 attention-logit softcap. `swa` is the full Gemma-2 layer
+# config: causal + sliding window + softcap. cap=30 here vs 50 in
+# the bench — exercises a second comptime cap value.
+SOFTCAP_MODES = ["plain", "causal", "swa"]
+SOFTCAP_CAP = 30.0
+# tanh.approx.f32 (HW) vs torch's exact tanh: ~2^-11 relative on
+# the capped scores shows up in the LSE at the 1e-5 scale.
+SOFTCAP_LSE_TOL = 1e-4
+
+
+def _softcap_mode(mode):
+    causal = mode != "plain"
+    window_left = 256 if mode == "swa" else 0
+    return causal, window_left
+
+
+def _fwd_softcap(q, k, v, mode):
+    causal, wl = _softcap_mode(mode)
+    if IMPL == "fa4":
+        from flash_attn.cute import flash_attn_func
+
+        kw = {"window_size": (wl, 0)} if wl else {}
+        return flash_attn_func(
+            q, k, v, causal=causal, softcap=SOFTCAP_CAP,
+            return_lse=True, **kw,
+        )
+    from flash_attn_mojo.fwd_fa4 import fa4_fwd
+
+    return fa4_fwd(
+        q, k, v, causal=causal, window_left=wl, softcap=SOFTCAP_CAP
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("heads", ["mha", "gqa"])
+@pytest.mark.parametrize("mode", SOFTCAP_MODES)
+def test_fwd_softcap(mode, heads):
+    _skip_if_impl_unavailable()
+    torch.manual_seed(1)
+    causal, wl = _softcap_mode(mode)
+    q, k, v = _make(640, hkv=4 if heads == "mha" else 2)
+    out, lse = _fwd_softcap(q, k, v, mode)
+    ref, ref_lse = flash_attn_ref(
+        q.float(), k.float(), v.float(), causal=causal,
+        window_size=(wl, 0) if wl else (-1, -1),
+        softcap=SOFTCAP_CAP, return_lse=True,
+    )
+    d = (out.float() - ref).abs().max().item()
+    assert d < FWD_TOL_MASKED, f"out maxdiff {d:.3e}"
+    dl = (lse - ref_lse).abs().max().item()
+    assert dl < SOFTCAP_LSE_TOL, f"lse maxdiff {dl:.3e}"
+
+
+@requires_cuda
+@pytest.mark.parametrize("heads", ["mha", "gqa"])
+@pytest.mark.parametrize("mode", SOFTCAP_MODES)
+def test_bwd_softcap(mode, heads):
+    _skip_if_impl_unavailable()
+    torch.manual_seed(1)
+    causal, wl = _softcap_mode(mode)
+    q, k, v = _make(640, hkv=4 if heads == "mha" else 2)
+    dout = torch.randn_like(q)
+    out, lse = _fwd_softcap(q, k, v, mode)
+    if IMPL == "fa4":
+        from flash_attn.cute.interface import _flash_attn_bwd
+
+        kw = {"window_size_left": wl} if wl else {}
+        dq, dk, dv = _flash_attn_bwd(
+            q, k, v, out, dout, lse, causal=causal,
+            softcap=SOFTCAP_CAP, **kw,
+        )
+    else:
+        from flash_attn_mojo.bwd_fa4 import bwd_fa4
+
+        dq, dk, dv = bwd_fa4(
+            q, k, v, out, dout, lse, causal=causal, window_left=wl,
+            softcap=SOFTCAP_CAP,
+        )
+
+    qf = q.detach().float().requires_grad_()
+    kf = k.detach().float().requires_grad_()
+    vf = v.detach().float().requires_grad_()
+    ref = flash_attn_ref(
+        qf, kf, vf, causal=causal,
+        window_size=(wl, 0) if wl else (-1, -1), softcap=SOFTCAP_CAP,
+    )
+    ref.backward(dout.float())
+    for name, got, want in (
+        ("dq", dq, qf.grad), ("dk", dk, kf.grad), ("dv", dv, vf.grad)
+    ):
+        d = (got.float() - want).abs().max().item()
+        assert d < BWD_TOL_MASKED, f"{name} maxdiff {d:.3e}"
+
+
 # --------------------------------------------------------- varlen
 @requires_cuda
 @pytest.mark.parametrize("lens", VARLEN_SETS, ids=VARLEN_IDS)
