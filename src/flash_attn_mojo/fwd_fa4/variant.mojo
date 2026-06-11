@@ -20,6 +20,7 @@ comptime USE_EXTERNAL_STREAM: Bool = get_defined_bool["USE_EXTERNAL_STREAM"]()
 comptime CAUSAL: Bool = get_defined_bool["CAUSAL", False]()
 comptime GQA_RATIO: Int = get_defined_int["GQA_RATIO", 1]()
 comptime VARLEN: Bool = get_defined_bool["VARLEN", False]()
+comptime WINDOW: Bool = get_defined_bool["WINDOW", False]()
 
 
 def flash_attn_fwd_fa4_acquire_ctx(
@@ -53,7 +54,9 @@ def flash_attn_fwd_fa4_variant(
     var vl_total_k: Int = Int(py=args[20])
     var vl_table_addr: Int = Int(py=args[21])
     var vl_num_tiles: Int = Int(py=args[22])
-    var ctx_handle_addr: Int = Int(py=args[23])
+    # args[23] is the WINDOW comptime gate.
+    var window_left: Int = Int(py=args[24])
+    var ctx_handle_addr: Int = Int(py=args[25])
 
     if batch_int == 0 or seqlen_int == 0 or nheads_int == 0:
         return PythonObject(None)
@@ -65,6 +68,7 @@ def flash_attn_fwd_fa4_variant(
         CAUSAL,
         GQA_RATIO,
         VARLEN,
+        WINDOW,
     ](
         batch_int,
         seqlen_int,
@@ -84,6 +88,7 @@ def flash_attn_fwd_fa4_variant(
         vl_total_k,
         vl_table_addr,
         vl_num_tiles,
+        window_left,
     )
     return PythonObject(None)
 

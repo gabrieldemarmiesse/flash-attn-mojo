@@ -49,6 +49,7 @@ def launch_fwd_fa4[
     causal: Bool = False,
     gqa_ratio: Int = 1,
     varlen: Bool = False,
+    window: Bool = False,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -68,6 +69,7 @@ def launch_fwd_fa4[
     varlen_total_k: Int = 0,
     varlen_table_addr: Int = 0,
     varlen_num_tiles: Int = 0,
+    window_left: Int = 0,
 ) raises:
     var raw_ctx_ptr = UnsafePointer[_DeviceContextCpp, MutExternalOrigin](
         unsafe_from_address=ctx_handle_addr
@@ -169,7 +171,9 @@ def launch_fwd_fa4[
             causal,
             gqa_ratio,
             varlen,
+            window,
         ]
+        comptime assert not window, "window v1 is hdim128-only"
         var compiled = ctx.compile_function[
             kernel_inst,
             kernel_inst,
@@ -257,6 +261,7 @@ def launch_fwd_fa4[
         causal,
         gqa_ratio,
         varlen,
+        window,
     ]
 
     var compiled = ctx.compile_function[
@@ -287,9 +292,10 @@ def launch_fwd_fa4[
     comptime if varlen:
         grid = (varlen_num_tiles, nheads_int, 1)
     else:
-        comptime if causal:
+        comptime if causal and not window:
             grid = (num_m * num_hb, 1, 1)
         else:
+            # Window: per-m work is uniform — plain grid, no LPT.
             grid = (num_m, nheads_int, batch_int)
 
     # Varlen reuses three kernel arg slots (signature unchanged vs
@@ -304,6 +310,8 @@ def launch_fwd_fa4[
         seq_len_arg = varlen_total_q
         sched_swizzle_arg = varlen_table_addr
         sched_num_hb_q_arg = o_addr
+    comptime if window:
+        sched_swizzle_arg = window_left  # the LPT slot is free
 
     comptime if use_external_stream:
         var stream = ctx.create_external_stream(stream_opaque)

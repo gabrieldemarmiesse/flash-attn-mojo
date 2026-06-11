@@ -38,28 +38,35 @@ def _parse_shape(s: str) -> tuple[int, int, int, int]:
     return tuple(int(x) for x in parts)  # type: ignore[return-value]
 
 
-def _fa4_fwd_fn(causal: bool):
+def _fa4_fwd_fn(causal: bool, window_left: int = 0):
     from flash_attn.cute import flash_attn_func
+
+    win = {"window_size": (window_left, 0)} if window_left else {}
 
     def run(q, k, v):
         return flash_attn_func(
-            q, k, v, causal=causal, return_lse=True
+            q, k, v, causal=causal, return_lse=True, **win
         )  # (out, lse)
 
     return run
 
 
-def _get_step(impl: str, kind: str, q, k, v, dout, causal: bool = False):
+def _get_step(
+    impl: str, kind: str, q, k, v, dout, causal: bool = False,
+    window_left: int = 0,
+):
     """Returns (step_fn, outputs_fn). outputs_fn() -> tensors for the
     correctness check."""
     if kind == "fwd":
         if impl == "fa4":
-            run = _fa4_fwd_fn(causal)
+            run = _fa4_fwd_fn(causal, window_left)
         else:
             from flash_attn_mojo.fwd_fa4 import fa4_fwd as _mojo_fwd
 
             def run(q, k, v):
-                return _mojo_fwd(q, k, v, causal=causal)
+                return _mojo_fwd(
+                    q, k, v, causal=causal, window_left=window_left
+                )
 
         out_holder = {}
 
@@ -72,7 +79,11 @@ def _get_step(impl: str, kind: str, q, k, v, dout, causal: bool = False):
     # both impls); time only the bwd path.
     from flash_attn.cute import flash_attn_func
 
-    out, lse = flash_attn_func(q, k, v, causal=causal, return_lse=True)
+    win = {"window_size": (window_left, 0)} if window_left else {}
+    bwin = {"window_size_left": window_left} if window_left else {}
+    out, lse = flash_attn_func(
+        q, k, v, causal=causal, return_lse=True, **win
+    )
     torch.cuda.synchronize()
     grads = {}
 
@@ -81,15 +92,19 @@ def _get_step(impl: str, kind: str, q, k, v, dout, causal: bool = False):
 
         def step():
             dq, dk, dv = _flash_attn_bwd(
-                q, k, v, out, dout, lse, causal=causal
+                q, k, v, out, dout, lse, causal=causal, **bwin
             )
             grads["g"] = (dq, dk, dv)
 
     else:
         from flash_attn_mojo.bwd_fa4 import bwd_fa4
 
+        mwin = {"window_left": window_left} if window_left else {}
+
         def step():
-            grads["g"] = bwd_fa4(q, k, v, out, dout, lse, causal=causal)
+            grads["g"] = bwd_fa4(
+                q, k, v, out, dout, lse, causal=causal, **mwin
+            )
 
     return step, lambda: grads["g"]
 
@@ -103,17 +118,21 @@ def _run_check_suite(args) -> None:
     import subprocess
     from pathlib import Path
 
-    parts = [
-        args.kind,
-        "varlen" if args.varlen else "dense",
-        "causal" if args.causal else "plain",
-    ]
-    if not args.varlen:
-        parts.append("gqa" if args.hkv else "mha")
-    # dtype axis: bf16 selects bf16-id'd + un-id'd (canonical) tests;
-    # fp16 selects only the fp16-id'd ones. Same scheme for hdim.
-    parts.append("not fp16" if args.dtype == "bf16" else "fp16")
-    parts.append("hd64" if args.shape[3] == 64 else "not hd64")
+    if args.window:
+        # window tests are their own axis (always causal+mha+hd128).
+        parts = [args.kind, "window"]
+    else:
+        parts = [
+            args.kind,
+            "varlen" if args.varlen else "dense",
+            "causal" if args.causal else "plain",
+        ]
+        if not args.varlen:
+            parts.append("gqa" if args.hkv else "mha")
+        # dtype axis: bf16 selects bf16-id'd + un-id'd (canonical)
+        # tests; fp16 selects only the fp16-id'd ones. Same for hdim.
+        parts.append("not fp16" if args.dtype == "bf16" else "fp16")
+        parts.append("hd64" if args.shape[3] == 64 else "not hd64")
     kexpr = " and ".join(parts)
     tests = Path(__file__).resolve().parent.parent / "tests" / "test_kernels.py"
     print(f"CHECK pytest -k '{kexpr}' (impl={args.impl})")
@@ -157,6 +176,11 @@ def main() -> None:
         help="no timing; bracket capture iters with cudaProfilerStart/Stop",
     )
     p.add_argument("--causal", action="store_true")
+    p.add_argument(
+        "--window", type=int, default=0,
+        help="sliding-window left width (causal local attention); "
+        "0 = no window",
+    )
     p.add_argument(
         "--dtype", choices=["bf16", "fp16"], default="bf16",
         help="tensor dtype for the bench shapes",
@@ -262,7 +286,8 @@ def main() -> None:
         dout = torch.randn_like(q) if args.kind == "bwd" else None
 
         step, outputs = _get_step(
-            args.impl, args.kind, q, k, v, dout, args.causal
+            args.impl, args.kind, q, k, v, dout, args.causal,
+            args.window,
         )
 
     # JIT compile + allocator warmup.
@@ -275,10 +300,17 @@ def main() -> None:
 
     if args.varlen:
         fwd_flops = 4 * H * D * sum(L * L for L in lens)
+        if args.causal:
+            fwd_flops //= 2
+    elif args.window:
+        # causal local: row i attends min(i+1, window+1) keys.
+        W = args.window
+        attended = S * (W + 1) - W * (W + 1) // 2 if S > W else S * (S + 1) // 2
+        fwd_flops = 4 * B * H * D * attended
     else:
         fwd_flops = 4 * B * H * S * S * D
-    if args.causal:
-        fwd_flops //= 2
+        if args.causal:
+            fwd_flops //= 2
     flops = fwd_flops if args.kind == "fwd" else fwd_flops * 5 // 2
 
     if args.profile:
@@ -312,7 +344,7 @@ def main() -> None:
     print(
         f"RESULT impl={args.impl} kind={args.kind} "
         f"shape={shape_str} causal={int(args.causal)} "
-        f"hkv={hkv_str} dtype={args.dtype} "
+        f"hkv={hkv_str} dtype={args.dtype} window={args.window} "
         f"us={us:.1f} tflops={tflops:.1f}"
     )
     for e in sorted(

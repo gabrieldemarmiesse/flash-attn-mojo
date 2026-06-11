@@ -23,6 +23,8 @@ def main() -> None:
     p.add_argument("--kind", choices=["fwd", "bwd"], default="fwd")
     p.add_argument("--causal", action="store_true")
     p.add_argument("--varlen", action="store_true")
+    p.add_argument("--window", type=int, default=0,
+                   help="window_left (fwd, implies --causal semantics)")
     p.add_argument("--hkv", type=int, default=0)
     p.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     p.add_argument("--hdim", type=int, default=128)
@@ -55,7 +57,9 @@ def main() -> None:
         v = torch.randn_like(k)
         from flash_attn_mojo.fwd_fa4 import fa4_fwd
 
-        out, lse = fa4_fwd(q, k, v, causal=args.causal)
+        out, lse = fa4_fwd(
+            q, k, v, causal=args.causal, window_left=args.window
+        )
         if args.kind == "bwd":
             from flash_attn_mojo.bwd_fa4 import bwd_fa4
 

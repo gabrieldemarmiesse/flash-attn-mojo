@@ -115,6 +115,7 @@ def flash_attn_func(
     v: torch.Tensor,
     softmax_scale: float | None = None,
     causal: bool = False,
+    window_size: tuple[int, int] = (-1, -1),
     *,
     return_lse: bool = False,
 ):
@@ -139,11 +140,38 @@ def flash_attn_func(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
+    window_left = 0
+    if window_size != (-1, -1):
+        left, right = window_size
+        if not causal or right not in (0, -1):
+            raise ValueError(
+                "window_size currently requires causal=True with "
+                "right window 0 (Mistral-style SWA)"
+            )
+        if left is None or left < 0:
+            raise ValueError("window_size left must be >= 0")
+        if left % 128 != 0 or q.shape[-1] != 128 or q.shape[1] % 128:
+            raise ValueError(
+                "window v1 envelope: left % 128 == 0, head_dim=128, "
+                "seqlen % 128 == 0"
+            )
+        if torch.is_grad_enabled() and (
+            q.requires_grad or k.requires_grad or v.requires_grad
+        ):
+            raise ValueError(
+                "the windowed backward is not implemented yet — run "
+                "under torch.no_grad() (forward/inference only)"
+            )
+        window_left = int(left)
+
     if not q.is_cuda:
         # flash_attn_ref handles GQA (repeat-interleave) and the
         # fp32 LSE internally.
         return flash_attn_ref(
             q, k, v, softmax_scale=softmax_scale, causal=causal,
+            window_size=(
+                (window_left, 0) if window_left else (-1, -1)
+            ),
             return_lse=return_lse,
         )
 
@@ -172,6 +200,17 @@ def flash_attn_func(
                 .transpose(0, 1)
                 .contiguous()
             )
+        return out
+
+    if window_left:
+        from flash_attn_mojo.fwd_fa4 import fa4_fwd
+
+        out, lse = fa4_fwd(
+            q.contiguous(), k.contiguous(), v.contiguous(),
+            softmax_scale, causal=True, window_left=window_left,
+        )
+        if return_lse:
+            return out, lse
         return out
 
     out, lse = _FlashAttnFunc.apply(q, k, v, softmax_scale, causal)

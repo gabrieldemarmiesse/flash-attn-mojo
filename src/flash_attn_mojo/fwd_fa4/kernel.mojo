@@ -110,6 +110,7 @@ def fwd_fa4_kernel[
     causal: Bool = False,
     gqa_ratio: Int = 1,
     varlen: Bool = False,
+    window: Bool = False,
 ](
     q_tma: TMATensorTile[dtype, qo_rank, q_tile_shape, q_desc_shape],
     k_tma: TMATensorTile[dtype, 3, kv_tile_shape, kv_desc_shape],
@@ -214,7 +215,7 @@ def fwd_fa4_kernel[
         h_idx = Int(block_idx.y)
         b_idx = 0
     else:
-        comptime if causal:
+        comptime if causal and not window:
             # FA4's SingleTileLPTScheduler (static, non-persistent):
             # flat 1-D grid; heaviest m_blocks launch FIRST (LPT
             # reversal) and sched_swizzle (head,batch) pairs sweep
@@ -259,6 +260,20 @@ def fwd_fa4_kernel[
                 num_kv_blocks,
                 ((m_block + 1) * BM + BN - 1) // BN,
             )
+
+    # Sliding window (v1: causal + left % BN == 0): the kv trip
+    # range gains a LOWER bound; with the alignment restriction the
+    # window's left edge cuts exactly at a tile boundary minus the
+    # diagonal slope, so ONLY the first (prologue) tile needs the
+    # leading mask and the steady loop stays mask-free.
+    var win_left: Int = 0
+    var first_kv: Int = 0
+    var kv_trips: Int = num_kv_blocks
+    comptime if window:
+        comptime assert causal, "window v1 requires causal"
+        win_left = sched_swizzle  # rides the (free) LPT slot
+        first_kv = max(0, (m_block * BM - win_left) // BN)
+        kv_trips = num_kv_blocks - first_kv
 
     # Varlen ragged kv tail: garbage columns live only in the
     # sequence's LAST kv tile (kv tiles are seq-local). Non-causal
@@ -316,7 +331,9 @@ def fwd_fa4_kernel[
             var wrap: Int = 0
             var row: Int
             var row_step: Int = BN
-            comptime if varlen:
+            comptime if window:
+                row = b_idx * seq_len + first_kv * BN
+            elif varlen:
                 comptime if causal:
                     row = vl_k_base
                 else:
@@ -324,7 +341,7 @@ def fwd_fa4_kernel[
                     row_step = -BN
             else:
                 row = b_idx * seq_len
-            for _ in range(num_kv_blocks):
+            for _ in range(kv_trips):
                 empty[slot].wait(phase)
                 var k_st = LayoutTensor[
                     dtype,
@@ -510,6 +527,12 @@ def fwd_fa4_kernel[
     # mask_d - row with mask_d = n*BN - m*BM), set before each
     # masked-tile softmax call. Unused (and DCE'd) when BM == BN.
     var causal_mask_d: Int = 0
+    # Window leading-edge offset: mask col + win_mask_d < row on the
+    # prologue (first-kv) tile. left % BN == 0 keeps it out of the
+    # steady loop.
+    var win_mask_d: Int = 0
+    comptime if window:
+        win_mask_d = first_kv * BN - m_block * BM + win_left
 
     @parameter
     @always_inline
@@ -538,6 +561,18 @@ def fwd_fa4_kernel[
                             > mask_row_lo + row_off
                         ):
                             s_reg.ptr[c] = neg_inf
+        comptime if window:
+            # Leading window edge (prologue tile only): cols before
+            # row - left are outside the window.
+            if mask_tail:
+                comptime for c in range(c_frag_size_qk):
+                    comptime col_base: Int = (c // 4) * 8 + (c & 1)
+                    comptime row_off: Int = 8 if (c % 4) >= 2 else 0
+                    if (
+                        col_base + mask_col_lo + win_mask_d
+                        < mask_row_lo + row_off
+                    ):
+                        s_reg.ptr[c] = neg_inf
         comptime if varlen and not causal:
             if mask_tail and vl_kv_tail < BN:
                 comptime for c in range(c_frag_size_qk):
@@ -610,9 +645,9 @@ def fwd_fa4_kernel[
     var prologue_diag: Bool = False
     comptime if causal:
         comptime if BM == BN:
-            prologue_diag = num_kv_blocks == 1
+            prologue_diag = kv_trips == 1
         else:
-            prologue_diag = num_kv_blocks <= 2
+            prologue_diag = kv_trips <= 2
             causal_mask_d = -m_block * BM
     softmax_block(prologue_diag, True)
     pack_p()  # P(0)
@@ -627,7 +662,7 @@ def fwd_fa4_kernel[
     var v_phase: UInt32 = 0
     var v_wrap: Int = 0
 
-    for it in range(num_kv_blocks - 1):
+    for it in range(kv_trips - 1):
         # Queue QK(n+1) then PV(n) on the tensor core.
         full[k_slot].wait(k_phase)
         named_barrier[Int32(SCHED_BAR_N)](Int32(1 + wg))
@@ -663,9 +698,9 @@ def fwd_fa4_kernel[
         var loop_diag: Bool = False
         comptime if causal:
             comptime if BM == BN:
-                loop_diag = it == num_kv_blocks - 2
+                loop_diag = it == kv_trips - 2
             else:
-                loop_diag = it >= num_kv_blocks - 3
+                loop_diag = it >= kv_trips - 3
                 causal_mask_d = (it + 1) * BN - m_block * BM
         softmax_block(loop_diag, False)
 

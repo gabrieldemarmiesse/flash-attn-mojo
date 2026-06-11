@@ -24,6 +24,7 @@ def fa4_fwd(
     v: torch.Tensor,
     softmax_scale: float | None = None,
     causal: bool = False,
+    window_left: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convenience wrapper: allocate out + lse, dispatch, return both.
 
@@ -39,7 +40,7 @@ def fa4_fwd(
     lse = torch.empty(
         (batch, nheads, seqlen), dtype=torch.float32, device=q.device
     )
-    native_fwd_fa4(q, k, v, out, lse, softmax_scale, causal)
+    native_fwd_fa4(q, k, v, out, lse, softmax_scale, causal, window_left)
     return out, lse
 
 
@@ -51,6 +52,7 @@ def native_fwd_fa4(
     lse: torch.Tensor,
     softmax_scale: float,
     causal: bool = False,
+    window_left: int = 0,
 ) -> None:
     """JIT-compile (if needed) and dispatch a single fwd call."""
     from flash_attn_mojo.fwd_fa4._jit import call_fwd_fa4
@@ -65,6 +67,10 @@ def native_fwd_fa4(
         "hdim64 fp16 needs the n=64 RS wgmma arm"
     )
     assert seqlen % _BLOCK_N == 0, "fwd_fa4 needs seqlen % 128 == 0"
+    if window_left:
+        assert causal and head_dim == 128 and window_left % 128 == 0, (
+            "window v1: causal + head_dim=128 + left % 128 == 0"
+        )
     assert k.shape == (batch, seqlen, nheads_kv, head_dim)
     assert v.shape == k.shape
     assert nheads % nheads_kv == 0, "Hq must be a multiple of Hkv"
@@ -98,6 +104,8 @@ def native_fwd_fa4(
             0,  # varlen total_k
             0,  # varlen tile-table addr
             0,  # varlen num_tiles
+            1 if window_left else 0,  # window (comptime)
+            window_left,
         )
     )
 
@@ -212,6 +220,8 @@ def fa4_varlen_fwd(
             total_k,
             table.data_ptr(),
             num_tiles,
+            0,  # window (comptime)
+            0,  # window_left
         )
     )
     return out, lse
