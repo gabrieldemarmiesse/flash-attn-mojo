@@ -321,8 +321,11 @@ HANDOFF.md and the memory notes):
 
 ## Extending the envelope (if/when)
 
-The natural next features, in rough order of value: dense
-arbitrary seqlen routing through the varlen path, sliding window,
+(Dense arbitrary seqlens landed 2026-06-11: non-%128 shapes route
+through the varlen kernels inside flash_attn_func — one sequence
+per batch row; the %128 fast path is untouched.)
+
+The natural next features, in rough order of value: sliding window,
 softcap, varlen cross-attention, hdim64 varlen + fp16 (see the
 hdim64 State note), hdim 96/256, the varlen-GQA bwd gap
 (pack-GQA-style head packing). The FA4-class algorithm core

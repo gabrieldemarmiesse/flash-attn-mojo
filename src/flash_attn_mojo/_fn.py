@@ -57,9 +57,11 @@ def _check_envelope(
             "head_dim=64 is bf16-only for now (fp16 needs the n=64 "
             "RS wgmma arm)"
         )
-    if seqlen % _SEQLEN_MULTIPLE != 0:
+    if seqlen % _SEQLEN_MULTIPLE != 0 and head_dim != 128:
         raise ValueError(
-            f"seqlen must be a multiple of {_SEQLEN_MULTIPLE}, got "
+            f"seqlen must be a multiple of {_SEQLEN_MULTIPLE} at "
+            f"head_dim={head_dim} (arbitrary seqlens route through "
+            f"the varlen path, which is head_dim=128-only), got "
             f"{seqlen}"
         )
     batch, _, nheads_kv, hd_kv = (
@@ -121,7 +123,9 @@ def flash_attn_func(
     Args:
         q, k, v: bf16/fp16 CUDA tensors, q (batch, seqlen, nheads,
             head_dim), k/v (batch, seqlen, nheads_kv, head_dim) with
-            Hq % Hkv == 0 (head_dim=128, seqlen % 128 == 0).
+            Hq % Hkv == 0. head_dim 64 or 128; any seqlen at
+            head_dim=128 (non-multiples of 128 route through the
+            varlen kernels internally), seqlen % 128 == 0 at 64.
             Non-CUDA tensors run the pure-PyTorch reference instead.
         softmax_scale: defaults to head_dim**-0.5.
         causal: causal masking (fully differentiable).
@@ -142,6 +146,33 @@ def flash_attn_func(
             q, k, v, softmax_scale=softmax_scale, causal=causal,
             return_lse=return_lse,
         )
+
+    batch, seqlen, nheads, head_dim = q.shape
+    if seqlen % _SEQLEN_MULTIPLE != 0:
+        # Arbitrary seqlen: route through the varlen kernels (one
+        # sequence per batch row) — the ragged-tail machinery masks
+        # and clamps everything; semantics are identical for
+        # self-attention. The %128 fast path below is untouched.
+        nheads_kv = k.shape[2]
+        cu = torch.arange(
+            0, (batch + 1) * seqlen, seqlen,
+            dtype=torch.int32, device=q.device,
+        )
+        out_p, lse_p = _FlashAttnVarlenFunc.apply(
+            q.reshape(batch * seqlen, nheads, head_dim),
+            k.reshape(batch * seqlen, nheads_kv, head_dim),
+            v.reshape(batch * seqlen, nheads_kv, head_dim),
+            cu, cu, softmax_scale, causal,
+        )
+        out = out_p.view(batch, seqlen, nheads, head_dim)
+        if return_lse:
+            # packed (H, B*S) -> dense (B, H, S)
+            return out, (
+                lse_p.view(nheads, batch, seqlen)
+                .transpose(0, 1)
+                .contiguous()
+            )
+        return out
 
     out, lse = _FlashAttnFunc.apply(q, k, v, softmax_scale, causal)
     if return_lse:

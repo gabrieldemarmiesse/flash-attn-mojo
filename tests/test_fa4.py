@@ -370,3 +370,31 @@ def test_hdim64_public_api(causal):
     ):
         d = (got.float() - want).abs().max().item()
         assert d < 5e-2, f"{name} maxdiff {d:.3e}"
+
+
+@requires_cuda
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("seqlen", [100, 257, 1000])
+def test_dense_arbitrary_seqlen(seqlen, causal):
+    """Non-%128 dense seqlens route through the varlen kernels."""
+    q, k, v = _make(seqlen, requires_grad=True)
+    dout = torch.randn_like(q)
+    out, lse = flash_attn_func(q, k, v, causal=causal, return_lse=True)
+    out.backward(dout)
+
+    qf = q.detach().float().requires_grad_()
+    kf = k.detach().float().requires_grad_()
+    vf = v.detach().float().requires_grad_()
+    ref, ref_lse = flash_attn_ref(
+        qf, kf, vf, causal=causal, return_lse=True
+    )
+    ref.backward(dout.float())
+    assert (out.float() - ref).abs().max().item() < 2e-2
+    assert (lse - ref_lse).abs().max().item() < LSE_TOL
+    for name, got, want in (
+        ("dq", q.grad, qf.grad),
+        ("dk", k.grad, kf.grad),
+        ("dv", v.grad, vf.grad),
+    ):
+        d = (got.float() - want).abs().max().item()
+        assert d < 5e-2, f"{name} maxdiff {d:.3e} S={seqlen}"

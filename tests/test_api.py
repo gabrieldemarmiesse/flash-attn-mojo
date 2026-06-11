@@ -43,7 +43,9 @@ def test_envelope_errors():
     q, k, v = _qkv(head_dim=96)
     with pytest.raises(ValueError, match="head_dim"):
         flash_attn_func(q, k, v)
-    q, k, v = _qkv(seqlen=100)
+    # arbitrary seqlen is allowed at head_dim=128 (varlen routing);
+    # head_dim=64 still requires %128.
+    q, k, v = _qkv(seqlen=100, head_dim=64)
     with pytest.raises(ValueError, match="multiple"):
         flash_attn_func(q, k, v)
     q, k, v = _qkv()

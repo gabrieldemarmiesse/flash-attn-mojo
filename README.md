@@ -39,7 +39,9 @@ fp32 precision.
 return_lse=False)` with:
 
 - bf16 or fp16, contiguous `(batch, seqlen, nheads, head_dim)`
-- `head_dim` 64 or 128, `seqlen % 128 == 0`, MHA or GQA
+- `head_dim` 64 or 128; ANY seqlen at head_dim=128 (non-multiples
+  of 128 route through the varlen kernels internally), seqlen %
+  128 == 0 at head_dim=64; MHA or GQA
   (`Hq % Hkv == 0`)
 - causal or non-causal (both differentiable, both at parity); no
   dropout / windows / ALiBi
