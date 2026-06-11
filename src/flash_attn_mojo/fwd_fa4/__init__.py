@@ -113,10 +113,12 @@ def _build_fwd_tile_table(
     assert int(cu_q[-1]) < 2**31 and int(cu_k[-1]) < 2**31
     seqlens_q = cu_q[1:] - cu_q[:-1]
     seqlens_k = cu_k[1:] - cu_k[:-1]
-    # v1 (tile-aligned): lifted when the seqlen tail masking lands.
-    assert bool(
-        ((seqlens_q % _BLOCK_M) == 0).all() and ((seqlens_k % _BLOCK_M) == 0).all()
-    ), "fa4_varlen_fwd v1 needs every seqlen % 128 == 0"
+    # Arbitrary lengths >= 1 (ragged tails are masked in-kernel and
+    # tail tiles stored row-predicated); empty sequences are out of
+    # the envelope.
+    assert bool((seqlens_q > 0).all() and (seqlens_k > 0).all()), (
+        "fa4_varlen_fwd needs every sequence length >= 1"
+    )
     m_counts = (seqlens_q + _BLOCK_M - 1) // _BLOCK_M
     num_tiles = int(m_counts.sum())
     sidx = torch.repeat_interleave(torch.arange(len(seqlens_q)), m_counts)
@@ -149,8 +151,8 @@ def fa4_varlen_fwd(
     q/k/v: (total_tokens, H, D) bf16 contiguous, D=128.
     cu_seqlens_{q,k}: (nseq+1,) int32 CUDA, monotone, [0] == 0.
     Returns (out, lse) with lse (H, total_q) f32 (packed, FA4's
-    varlen layout). v1: every seqlen % 128 == 0 (tile-aligned) and
-    self-attn lengths (cu_seqlens_q == cu_seqlens_k elementwise).
+    varlen layout). Arbitrary sequence lengths >= 1; self-attn
+    lengths (cu_seqlens_q == cu_seqlens_k elementwise).
     """
     from flash_attn_mojo.fwd_fa4._jit import call_fwd_fa4
 

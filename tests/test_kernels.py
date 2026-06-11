@@ -32,9 +32,20 @@ IMPL = os.environ.get("FLASH_ATTN_MOJO_TEST_IMPL", "mojo")
 # 640 = 8*80 exercises the bwd tile_m=80 exact-fit path; the others
 # leave partial tail m-tiles. 128 is the minimum supported seqlen.
 SEQLENS = [128, 256, 640, 1024]
-# Tile-aligned varlen check sets (every length % 128 == 0).
-VARLEN_SETS = [[128], [128, 256, 640], [1024, 128], [256] * 16]
-VARLEN_IDS = ["L128", "L128-256-640", "L1024-128", "L256x16"]
+# Varlen check sets: tile-aligned plus ragged (arbitrary lengths;
+# sub-tile, +-1-around-tile, multi-tile-with-tail, and a TRAILING
+# partial tile — the last one turns a tail-store overshoot into an
+# OOB write instead of a maybe-masked cross-sequence race).
+VARLEN_SETS = [
+    [128], [128, 256, 640], [1024, 128], [256] * 16,
+    [100], [63, 129, 257], [1000, 24, 640], [128, 100],
+    [127, 1, 384],
+]
+VARLEN_IDS = [
+    "L128", "L128-256-640", "L1024-128", "L256x16",
+    "L100", "L63-129-257", "L1000-24-640", "L128-100",
+    "L127-1-384",
+]
 # Canonical bench shapes (B, S, H, D) and the canonical mixed
 # varlen config (8 seqs, 16384 tokens).
 CANONICAL = (2, 8192, 16, 128)

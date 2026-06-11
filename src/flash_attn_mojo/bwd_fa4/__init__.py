@@ -190,12 +190,13 @@ def _build_bwd_tables(
     cu_k = cu_seqlens_k.detach().to("cpu", torch.int64)
     seqlens_q = cu_q[1:] - cu_q[:-1]
     seqlens_k = cu_k[1:] - cu_k[:-1]
-    # v1 (tile-aligned kv + self-attn): lifted with tail masking.
-    assert bool(((seqlens_k % _BLOCK) == 0).all()), (
-        "bwd_fa4_varlen v1 needs every seqlen % 128 == 0"
+    # Arbitrary lengths >= 1 (ragged kv tails are masked in-kernel
+    # and tail tiles stored row-predicated); self-attn only.
+    assert bool((seqlens_q > 0).all()), (
+        "bwd_fa4_varlen needs every sequence length >= 1"
     )
     assert torch.equal(seqlens_q, seqlens_k), (
-        "bwd_fa4_varlen v1 is self-attn only (equal q/k lengths)"
+        "bwd_fa4_varlen is self-attn only (equal q/k lengths)"
     )
     nseq = len(seqlens_q)
     total_q = int(cu_q[-1])
@@ -227,7 +228,7 @@ def _build_bwd_tables(
     qt[:, 2] = seqlens_q[q_sidx].to(torch.int32)
     qt[:, 3] = mpad_base[q_sidx].to(torch.int32)
 
-    n_counts = seqlens_k // _BLOCK
+    n_counts = (seqlens_k + _BLOCK - 1) // _BLOCK
     num_kv_tiles, k_sidx, n_local = expand(n_counts)
     kt = torch.zeros((num_kv_tiles, 8), dtype=torch.int32)
     kt[:, 0] = n_local.to(torch.int32)
@@ -263,8 +264,8 @@ def bwd_fa4_varlen(
 
     q/k/v/out/dout: (total_tokens, H, D) bf16 contiguous, D=128.
     lse: (H, total_q) fp32 (the packed natural-log LSE from the
-    varlen fwd). v1: MHA only, every seqlen % 128 == 0, self-attn
-    lengths.
+    varlen fwd). MHA only; arbitrary sequence lengths >= 1;
+    self-attn lengths.
     """
     from flash_attn_mojo.bwd_fa4._jit import (
         call_bwd_fa4_convert,
@@ -301,6 +302,18 @@ def bwd_fa4_varlen(
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
+    # Aux work-table row (index = grid_dim.x): the raw dk/dv base
+    # addresses as two int64s, for the kernel's row-predicated
+    # ragged-tail stores.
+    aux = (
+        torch.tensor(
+            [dk.data_ptr(), dv.data_ptr(), 0, 0], dtype=torch.int64
+        )
+        .view(torch.int32)
+        .reshape(1, 8)
+        .to(q.device)
+    )
+    kv_table = torch.cat([kv_table, aux], dim=0).contiguous()
     dpsum = torch.empty(
         (nheads, total_qpad), dtype=torch.float32, device=q.device
     )

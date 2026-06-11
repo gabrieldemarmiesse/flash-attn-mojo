@@ -302,9 +302,11 @@ def bwd_main_kernel[
     # i.e. m-blocks m >= m_start. All warp roles share the offset.
     var m_start: Int = 0
     var kv_row: Int
-    # Varlen per-CTA scalars (0/unused when dense).
+    # Varlen per-CTA scalars (0/unused when dense). vl_kv_tail < BN
+    # only on a sequence's boundary (ragged-tail) kv tile.
     var vl_q_base: Int = 0
     var vl_mpad_base: Int = 0
+    var vl_kv_tail: Int = 0
     comptime if varlen:
         comptime assert gqa_ratio == 1, "varlen bwd v1 is MHA-only"
         # Host kv-tile work table, one int32[8] row per CTA:
@@ -319,12 +321,14 @@ def bwd_main_kernel[
         n_block = Int(warp.broadcast(tbl[0]))
         vl_q_base = Int(warp.broadcast(tbl[1]))
         var vl_k_base: Int = Int(warp.broadcast(tbl[2]))
+        var vl_slk: Int = Int(warp.broadcast(tbl[4]))
         num_m_blocks = Int(warp.broadcast(tbl[5]))
         m_start = Int(warp.broadcast(tbl[6]))
         vl_mpad_base = Int(warp.broadcast(tbl[7]))
         h_idx = Int(block_idx.y)
         b_idx = 0
         kv_row = vl_k_base + n_block * BN
+        vl_kv_tail = vl_slk - n_block * BN  # >= BN on full tiles
     else:
         n_block = Int(block_idx.x)
         h_idx = Int(block_idx.y)
@@ -709,6 +713,22 @@ def bwd_main_kernel[
                     ):
                         s_reg.ptr[c] = Scalar[accum_type](-1.0e30)
 
+        comptime if varlen:
+            # Ragged kv tail: garbage S^T ROWS (kv >= seqlen_k) on
+            # the boundary CTA, masked EVERY m-trip — unlike the fwd,
+            # causality does NOT subsume them (q rows below the
+            # diagonal attend everything earlier, including the
+            # garbage slots). P^T = exp2(-inf) = 0 zeroes their dV,
+            # dS and dQ contributions.
+            if vl_kv_tail < BN:
+                var trow_lo: Int = (
+                    wg * WGMMA_M + warp_in_wg * 16 + lane_group
+                )
+                comptime for c in range(c_frag_sdp):
+                    comptime trow_off: Int = 8 if (c % 4) >= 2 else 0
+                    if trow_lo + trow_off >= vl_kv_tail:
+                        s_reg.ptr[c] = Scalar[accum_type](-1.0e30)
+
         # P^T = exp2(S^T * scale_log2 - lse_log2[q col]), f32 in
         # s_reg. NOT packed yet: FA4's order computs dS first, then
         # packs P and dS together — keeps the f32 P and bf16 P from
@@ -906,7 +926,51 @@ def bwd_main_kernel[
             slot = 0
             phase ^= 1
 
-    # ---- Epilogue. The dK/dV staging below overwrites the K/V smem
+    # ---- Epilogue.
+    comptime if varlen:
+        # Ragged kv tail tile: a full-tile TMA store would overwrite
+        # the NEXT sequence's dK/dV rows — store the c-frags straight
+        # to gmem, row-predicated (no smem staging, no barrier; both
+        # warpgroups take this branch together). The raw dk/dv base
+        # addresses live in the work table's aux row (row index
+        # grid_dim.x), packed as two int64s.
+        if vl_kv_tail < BN:
+            var taux = dk_accum_ptr.bitcast[Int64]() + 4 * Int(
+                grid_dim.x
+            )
+            var dk_g = UnsafePointer[Scalar[dtype], MutAnyOrigin](
+                unsafe_from_address=Int(taux[0])
+            )
+            var dv_g = UnsafePointer[Scalar[dtype], MutAnyOrigin](
+                unsafe_from_address=Int(taux[1])
+            )
+            var vscale: Scalar[accum_type] = softmax_scale.cast[
+                accum_type
+            ]()
+            comptime for c in range(c_frag_dkv):
+                dk_acc.ptr[c] *= vscale
+            var prow_lo: Int = wg * WGMMA_M + warp_in_wg * 16 + lane_group
+            comptime for c2 in range(c_frag_dkv // 2):
+                comptime p_chunk: Int = c2 // 2
+                comptime p_bot: Int = c2 % 2
+                var prow: Int = prow_lo + (8 if p_bot == 1 else 0)
+                if prow < vl_kv_tail:
+                    var goff: Int = (
+                        (kv_row + prow) * Int(grid_dim.y) + h_idx
+                    ) * D + p_chunk * 8 + 2 * lane_pair
+                    (dv_g + goff).store[width=2, alignment=4](
+                        SIMD[accum_type, 2](
+                            dv_acc.ptr[2 * c2], dv_acc.ptr[2 * c2 + 1]
+                        ).cast[dtype]()
+                    )
+                    (dk_g + goff).store[width=2, alignment=4](
+                        SIMD[accum_type, 2](
+                            dk_acc.ptr[2 * c2], dk_acc.ptr[2 * c2 + 1]
+                        ).cast[dtype]()
+                    )
+            return
+
+    # The dK/dV staging below overwrites the K/V smem
     # areas; warpgroup 0's final dQ GEMM (retired before its barrier
     # arrival) must not still be reading kt_view -> sync first.
     named_barrier[Int32(NWG * 128)](Int32(4))

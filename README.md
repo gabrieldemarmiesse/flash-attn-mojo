@@ -50,8 +50,9 @@ preprocess → main → dq-convert, mirroring FA4's pipeline).
 `flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, ...)`
 runs packed variable-length attention over `(total_tokens, nheads,
 head_dim)` tensors (FA4's varlen layout, packed `(nheads, total_q)`
-LSE), differentiable end-to-end. Current varlen envelope: every
-sequence length a multiple of 128, self-attention lengths
+LSE), differentiable end-to-end, with ARBITRARY sequence lengths
+(>= 1 — ragged tails are masked in-kernel and tail tiles stored
+row-predicated). Current varlen envelope: self-attention lengths
 (`cu_seqlens_q == cu_seqlens_k`); the backward additionally requires
 MHA.
 

@@ -185,14 +185,18 @@ def launch_fwd_fa4[
         else:
             grid = (num_m, nheads_int, batch_int)
 
-    # Varlen reuses two kernel arg slots (signature unchanged vs
-    # dense): seq_len carries total_q (packed LSE layout) and
-    # sched_swizzle carries the work-table address.
+    # Varlen reuses three kernel arg slots (signature unchanged vs
+    # dense): seq_len carries total_q (packed LSE layout),
+    # sched_swizzle carries the work-table address, and
+    # sched_num_hb_q carries the raw O pointer (for the row-predicated
+    # ragged-tail stores; the LPT scheduler is dense-causal-only).
     var seq_len_arg: Int = seqlen_int
     var sched_swizzle_arg: Int = sched_swizzle
+    var sched_num_hb_q_arg: Int = sched_num_hb_q
     comptime if varlen:
         seq_len_arg = varlen_total_q
         sched_swizzle_arg = varlen_table_addr
+        sched_num_hb_q_arg = o_addr
 
     comptime if use_external_stream:
         var stream = ctx.create_external_stream(stream_opaque)
@@ -207,7 +211,7 @@ def launch_fwd_fa4[
             softmax_scale,
             nheads_int,
             sched_swizzle_arg,
-            sched_num_hb_q,
+            sched_num_hb_q_arg,
             sched_residual,
             grid_dim=grid,
             block_dim=(kFa4NThreads,),
@@ -225,7 +229,7 @@ def launch_fwd_fa4[
             softmax_scale,
             nheads_int,
             sched_swizzle_arg,
-            sched_num_hb_q,
+            sched_num_hb_q_arg,
             sched_residual,
             grid_dim=grid,
             block_dim=(kFa4NThreads,),

@@ -308,6 +308,45 @@ Moral: at short per-CTA trip counts, FIXED per-CTA costs dominate
 the ratio, and TMA *issue* count (not bytes) is the unit of cost —
 audit every async_store/copy for descriptor chunking.
 
+## Arbitrary sequence lengths (2026-06-11, sixth session)
+
+Lifted the varlen seqlen%128 restriction; every config stays at
+parity (aligned mixed fwd 1.002-1.003x / bwd 0.997-1.003x; ragged
+mixed fwd 1.002x / causal 0.980x / bwd 0.997x both).
+
+Design (survived a 35-agent adversarial review with zero real
+findings):
+- fwd non-causal: ragged kv columns masked in softmax_block on the
+  boundary tile ONLY — the kv walk is REVERSED under varlen
+  non-causal so the boundary tile is processed in the consumer
+  prologue and the steady loop stays mask-free. The first version
+  branched per-iteration instead and cost a consistent 3.5%
+  (1.034x): a single predicated block in the softmax hot path is
+  measurable — FA4's PTX rule ("steady loop setp count identical to
+  dense") is the real parity constraint. Online softmax is
+  order-independent, so reversal is free.
+- fwd causal: NO kv mask needed — with BM == BN == 128 and
+  self-attn lengths the sequence's last kv tile is only ever
+  processed as the last m-block's diagonal tile, where col > row
+  already kills every garbage column for stored rows. (PROVED, and
+  re-verified by the review panel.)
+- bwd: S^T kv-ROW mask every m-trip on boundary CTAs — causality
+  does NOT subsume here (q below the diagonal attends everything
+  earlier, including garbage slots). q-side ragged tails need
+  nothing: the per-seq +inf-LSE/0-dpsum padded stats windows
+  already annihilate partial m-tiles.
+- Partial tail tiles bypass smem staging + TMA and store c-frags
+  straight to gmem row-predicated (cross-seq overwrite is the top
+  hazard; the trailing-partial test set turns an overshoot into an
+  OOB). Raw pointers ride free slots: O = sched_num_hb_q (LPT is
+  dense-causal-only); dk/dv = an aux row appended to the kv work
+  table (two int64s at row index grid_dim.x).
+- Hosts: kv tile counts go ceil; envelope drops to lengths >= 1
+  (zero-length rejected at the API).
+
+Kernel signatures still byte-identical to dense (gate: 0 diff
+lines), 0 spills / 168 regs on all varlen variants.
+
 ## Not yet tried (fwd)
 
 - ~~L2 cache hints on TMA loads~~ DEBUNKED (third session): FA4's

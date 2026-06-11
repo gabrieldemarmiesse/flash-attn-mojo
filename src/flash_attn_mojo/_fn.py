@@ -239,8 +239,8 @@ def flash_attn_varlen_func(
     Args:
         q, k, v: bf16 CUDA tensors packed as (total_tokens, nheads,
             head_dim) / (total_tokens, nheads_kv, head_dim);
-            head_dim=128. Current envelope: every sequence length a
-            multiple of 128, self-attention lengths (cu_seqlens_q ==
+            head_dim=128. Current envelope: arbitrary sequence
+            lengths >= 1, self-attention lengths (cu_seqlens_q ==
             cu_seqlens_k); the backward additionally requires MHA.
             Non-CUDA tensors run the pure-PyTorch reference instead.
         cu_seqlens_q, cu_seqlens_k: (nseq+1,) int32 cumulative
@@ -279,11 +279,10 @@ def flash_attn_varlen_func(
             f"cu_seqlens_q[-1] ({int(cu_q_host[-1])}) must equal "
             f"total_tokens ({q.shape[0]})"
         )
-    if bool((seqlens_q % _SEQLEN_MULTIPLE != 0).any()):
+    if bool((seqlens_q == 0).any()):
         raise ValueError(
-            "the current varlen envelope needs every sequence length "
-            f"to be a multiple of {_SEQLEN_MULTIPLE}, got "
-            f"{seqlens_q[:8].tolist()}..."
+            "empty (zero-length) sequences are not supported — drop "
+            "them from cu_seqlens"
         )
     max_len = int(seqlens_q.max()) if len(seqlens_q) else 0
     if max_seqlen_q is not None and max_seqlen_q < max_len:

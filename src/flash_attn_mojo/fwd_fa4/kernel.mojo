@@ -180,6 +180,7 @@ def fwd_fa4_kernel[
     # table otherwise).
     var vl_q_base: Int = 0
     var vl_k_base: Int = 0
+    var vl_seqlen_q: Int = 0
     var vl_seqlen_k: Int = 0
     comptime if varlen:
         # Host work-item table, one int32[8] row per CTA: (m_block,
@@ -199,6 +200,7 @@ def fwd_fa4_kernel[
         m_block = Int(warp.broadcast(tbl[0]))
         vl_q_base = Int(warp.broadcast(tbl[1]))
         vl_k_base = Int(warp.broadcast(tbl[2]))
+        vl_seqlen_q = Int(warp.broadcast(tbl[3]))
         vl_seqlen_k = Int(warp.broadcast(tbl[4]))
         h_idx = Int(block_idx.y)
         b_idx = 0
@@ -240,6 +242,17 @@ def fwd_fa4_kernel[
         comptime assert BM == BN, "causal block-skip assumes BM == BN"
         num_kv_blocks = min(num_kv_blocks, m_block + 1)
 
+    # Varlen ragged kv tail: garbage columns live only in the
+    # sequence's LAST kv tile (kv tiles are seq-local). Non-causal
+    # masks them there; causal needs NO extra mask — with BM == BN
+    # and self-attn lengths, the last kv tile is only ever processed
+    # as the last m-block's diagonal tile, where col > row already
+    # covers every col >= seqlen_k for the stored (row < seqlen_q ==
+    # seqlen_k) rows.
+    var vl_kv_tail: Int = 0
+    comptime if varlen and not causal:
+        vl_kv_tail = vl_seqlen_k - (num_kv_blocks - 1) * BN
+
     # shfl-broadcast warpgroup index (the bwd's tid-widening trap:
     # ptxas's tid-uniformity rule only matches 32-bit shr.u32, and
     # LLVM re-widens any 32-bit extract; the convergent shfl is
@@ -266,12 +279,22 @@ def fwd_fa4_kernel[
                 )
             # Incremental ring state: K(n) in slot 2n%6, V(n) in
             # (2n+1)%6; the empty-barrier phase flips every 3 tiles.
+            # Varlen non-causal walks the kv tiles in REVERSE so the
+            # sequence's ragged-tail (boundary) tile is processed in
+            # the consumer PROLOGUE — its column mask then never
+            # touches the steady loop (FA4's design: the hot loop
+            # stays mask-free; online softmax is order-independent).
             var slot: Int = 0
             var phase: UInt32 = 0
             var wrap: Int = 0
             var row: Int
+            var row_step: Int = BN
             comptime if varlen:
-                row = vl_k_base
+                comptime if causal:
+                    row = vl_k_base
+                else:
+                    row = vl_k_base + (num_kv_blocks - 1) * BN
+                    row_step = -BN
             else:
                 row = b_idx * seq_len
             for _ in range(num_kv_blocks):
@@ -301,7 +324,7 @@ def fwd_fa4_kernel[
                     v_st, full[slot + 1], (0, h_idx // gqa_ratio, row)
                 )
 
-                row += BN
+                row += row_step
                 slot += 2
                 wrap += 1
                 if wrap == 3:
@@ -417,16 +440,24 @@ def fwd_fa4_kernel[
 
     @parameter
     @always_inline
-    def softmax_block(mask_diag: Bool):
+    def softmax_block(mask_diag: Bool, mask_tail: Bool):
         """Online softmax over s_reg (S just retired): update
         rowmax/rowsum/scale_old, write P (f32) back into s_reg.
-        mask_diag (causal only): apply the diagonal-tile mask first."""
+        mask_diag (causal only): apply the diagonal-tile mask first.
+        mask_tail (varlen non-causal only): this is the sequence's
+        last kv tile — mask the ragged-tail garbage columns."""
         comptime if causal:
             if mask_diag:
                 comptime for c in range(c_frag_size_qk):
                     comptime col_base: Int = (c // 4) * 8 + (c & 1)
                     comptime row_off: Int = 8 if (c % 4) >= 2 else 0
                     if col_base + mask_col_lo > mask_row_lo + row_off:
+                        s_reg.ptr[c] = neg_inf
+        comptime if varlen and not causal:
+            if mask_tail and vl_kv_tail < BN:
+                comptime for c in range(c_frag_size_qk):
+                    comptime col_base: Int = (c // 4) * 8 + (c & 1)
+                    if col_base + mask_col_lo >= vl_kv_tail:
                         s_reg.ptr[c] = neg_inf
         var local_max = stack_allocation[
             rows_per_thread, Scalar[accum_type]
@@ -486,8 +517,11 @@ def fwd_fa4_kernel[
     _ = empty[0].arrive()
 
     # rowmax starts at -inf -> scale_old==0, rowsum init. For causal,
-    # m_block 0's single tile IS the diagonal.
-    softmax_block(causal and num_kv_blocks == 1)
+    # m_block 0's single tile IS the diagonal. Varlen non-causal
+    # walks kv in reverse, so the FIRST tile here is the sequence's
+    # ragged-tail (boundary) tile — the only one that needs the
+    # column mask; the steady loop below stays mask-free.
+    softmax_block(causal and num_kv_blocks == 1, True)
     pack_p()  # P(0)
 
     # ---- Main loop: QK(n+1) + PV(n) per iteration. Ring slots and
@@ -525,7 +559,8 @@ def fwd_fa4_kernel[
 
         # Softmax of S(n+1) overlaps PV(n). For causal the last
         # tile (n+1 == num_kv_blocks-1 == m_block) is the diagonal.
-        softmax_block(causal and it == num_kv_blocks - 2)
+        # (Varlen's tail mask ran in the prologue — reverse order.)
+        softmax_block(causal and it == num_kv_blocks - 2, False)
 
         # PV(n) retired: p_reg and o_reg are safe to touch.
         wgmma_pv.wait_group[0]()
@@ -578,26 +613,62 @@ def fwd_fa4_kernel[
     var lane_pair: Int = lane % 4
     var row_warp_base: Int = wg * WGMMA_M + warp_in_wg * 16
 
-    var st_row: Int = (
-        row_warp_base + ((lane // 8) % 2) * 8 + (lane % 8)
-    )
-    var st_off_raw: Int = st_row * 64 + (lane // 16) * 8
-    var o_raw: Int = Int(smem_base) + 2 * st_off_raw
-    comptime for i in range(c_frag_size_pv // 8):
-        var packed = SIMD[DType.float32, 4](0)
-        comptime for jm in range(4):
-            comptime p: Int = 4 * i + jm
-            packed[jm] = bitcast[DType.float32, 1](
-                SIMD[accum_type, 2](
-                    o_reg.ptr[2 * p], o_reg.ptr[2 * p + 1]
-                ).cast[dtype]()
+    # Varlen ragged q tail: the sequence's last m-tile may be partial
+    # (vl_rows < BM). A full-tile TMA store would overwrite the NEXT
+    # sequence's rows, so the partial tile bypasses the smem staging
+    # and stores its c-frags straight to gmem, row-predicated (the O
+    # raw pointer rides the sched_num_hb_q slot; boundary-tile-only,
+    # at most one per sequence).
+    var vl_rows: Int = BM
+    comptime if varlen:
+        vl_rows = vl_seqlen_q - m_block * BM
+    var full_tile_store: Bool = True
+    comptime if varlen:
+        if vl_rows < BM:
+            full_tile_store = False
+            var o_gptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
+                unsafe_from_address=sched_num_hb_q
             )
-        var raw_i: Int = o_raw + (i % 4) * 32 + (i // 4) * (BM * 128)
-        var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
-        st_matrix[simd_width=4](
-            smem_base + ((sw_i >> 1) - (Int(smem_base) >> 1)),
-            packed,
+            var o_row0: Int = vl_q_base + m_block * BM
+            comptime for c2 in range(c_frag_size_pv // 2):
+                comptime col_chunk: Int = c2 // 2
+                comptime is_bot: Int = c2 % 2
+                var row: Int = (
+                    row_warp_base + lane_group + (8 if is_bot == 1 else 0)
+                )
+                if row < vl_rows:
+                    var pair = SIMD[dtype, 2](
+                        o_reg.ptr[2 * c2].cast[dtype](),
+                        o_reg.ptr[2 * c2 + 1].cast[dtype](),
+                    )
+                    (
+                        o_gptr
+                        + ((o_row0 + row) * nheads + h_idx) * D
+                        + col_chunk * 8
+                        + 2 * lane_pair
+                    ).store[width=2, alignment=4](pair)
+
+    if full_tile_store:
+        var st_row: Int = (
+            row_warp_base + ((lane // 8) % 2) * 8 + (lane % 8)
         )
+        var st_off_raw: Int = st_row * 64 + (lane // 16) * 8
+        var o_raw: Int = Int(smem_base) + 2 * st_off_raw
+        comptime for i in range(c_frag_size_pv // 8):
+            var packed = SIMD[DType.float32, 4](0)
+            comptime for jm in range(4):
+                comptime p: Int = 4 * i + jm
+                packed[jm] = bitcast[DType.float32, 1](
+                    SIMD[accum_type, 2](
+                        o_reg.ptr[2 * p], o_reg.ptr[2 * p + 1]
+                    ).cast[dtype]()
+                )
+            var raw_i: Int = o_raw + (i % 4) * 32 + (i // 4) * (BM * 128)
+            var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
+            st_matrix[simd_width=4](
+                smem_base + ((sw_i >> 1) - (Int(smem_base) >> 1)),
+                packed,
+            )
 
     # ---- LSE (natural log), one f32 per row: rowmax is kept in the
     # scaled log2 domain (max*scale*log2e) and rowsum is already
@@ -613,15 +684,21 @@ def fwd_fa4_kernel[
         comptime LN2: Scalar[accum_type] = 0.6931471805599453
         comptime for i in range(rows_per_thread):
             var r: Int = row_warp_base + lane_group + 8 * i
-            (lse_ptr + lse_row_base + r)[0] = (
-                rowmax[i] * LN2 + log(rowsum[i])
-            ).cast[DType.float32]()
+            # Varlen: rows past the sequence's end belong to the NEXT
+            # sequence's packed LSE rows — predicate them off.
+            var lse_ok: Bool = True
+            comptime if varlen:
+                lse_ok = r < vl_rows
+            if lse_ok:
+                (lse_ptr + lse_row_base + r)[0] = (
+                    rowmax[i] * LN2 + log(rowsum[i])
+                ).cast[DType.float32]()
 
     fence_async_view_proxy()
     # Producer warpgroup may have exited -> consumer-only barrier.
     # (id 3: ids 1-2 are the scheduler pingpong barriers.)
     named_barrier[Int32(NWG * 128)](Int32(3))
-    if thread_idx.x == 128:
+    if full_tile_store and thread_idx.x == 128:
         var o_st = LayoutTensor[
             dtype,
             q_smem_layout,

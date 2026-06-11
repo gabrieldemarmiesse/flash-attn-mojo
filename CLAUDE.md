@@ -45,9 +45,21 @@ run-to-run variance (locked clocks, interleaved):
   ((cu_q[i]+i*BM)//BM)*BM`, host-precomputed — no device //80);
   packed (H, total_q) LSE; our +inf-LSE/0-dpsum per-seq window
   padding (NOT FA4's lse=0 + in-loop mask — the two are coupled;
-  documented at the preprocess write site). v1 envelope: every
-  seqlen % 128 == 0, self-attn lengths, bwd MHA-only (fwd takes
-  GQA). All per-CTA table scalars are warp.broadcast-laundered.
+  documented at the preprocess write site). ARBITRARY LENGTHS
+  (2026-06-11, every config at parity: aligned + ragged mixed all
+  ~1.00x, causal fwd 0.98x): ragged kv tails are masked
+  boundary-tile-only — the fwd walks kv tiles in REVERSE under
+  varlen non-causal so the boundary tile lands in the consumer
+  PROLOGUE and the steady loop stays mask-free (an in-loop mask
+  branch cost 3.5%; online softmax is order-independent); causal
+  fwd needs NO kv mask (the diagonal mask subsumes it — BM == BN +
+  self-attn); the bwd masks S^T kv rows every m-trip on boundary
+  CTAs (causality does NOT subsume there). Partial tail tiles store
+  c-frags straight to gmem row-predicated (raw ptrs: O rides
+  sched_num_hb_q; dk/dv ride an aux work-table row at index
+  grid_dim.x). Envelope: any lengths >= 1, self-attn lengths, bwd
+  MHA-only (fwd takes GQA). All per-CTA table scalars are
+  warp.broadcast-laundered.
 
 - SHORT-SEQ FWD (2026-06-11, resolved): the fwd trailed 1.05–1.22x
   at short sequences (B=1 S=512 single-wave: +2.5 µs/CTA,
@@ -257,12 +269,10 @@ HANDOFF.md and the memory notes):
 
 ## Extending the envelope (if/when)
 
-The natural next features, in rough order of value: arbitrary
-(non-%128) seqlens via varlen tail masking (lifts the
-varlen v1 envelope: boundary-tile-only kv mask + predicated tail
-stores — the audit's steps 2/5b), varlen GQA (the bwd needs
-`total_k_rounded_padded`/`padded_offset_k` accum windows; the fwd
-already takes GQA), other head dims. The FA4-class algorithm core
+The natural next features, in rough order of value: varlen GQA
+(the bwd needs `total_k_rounded_padded`/`padded_offset_k` accum
+windows; the fwd already takes GQA), other head dims, dense
+arbitrary seqlen routing through the varlen path. The FA4-class algorithm core
 (warp specialization, tile_m=80 bwd, the mailbox dQ drain) carries
 over. Keep every change inside the measurement protocol above — and
 add new seqlen/shape cases to `bench_fa4.py --check-only` and

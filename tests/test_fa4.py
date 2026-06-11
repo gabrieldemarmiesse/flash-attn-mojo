@@ -213,8 +213,11 @@ def test_gqa_vs_fa4_when_available():
 
 
 # ---- varlen (packed cu_seqlens) ----
-# v1 envelope: every length % 128 == 0, self-attn lengths, MHA bwd.
-VARLEN_SETS = [[128], [128, 256, 640], [1024, 128]]
+# Envelope: arbitrary lengths >= 1, self-attn lengths, MHA bwd.
+VARLEN_SETS = [
+    [128], [128, 256, 640], [1024, 128],
+    [63, 129, 257], [128, 100],
+]
 
 
 def _make_varlen(lens, requires_grad=False):
