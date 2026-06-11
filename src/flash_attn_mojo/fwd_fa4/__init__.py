@@ -109,6 +109,8 @@ def _build_fwd_tile_table(
     D2H sync). Returns (device table, num_tiles, max_seqlen_q)."""
     cu_q = cu_seqlens_q.detach().to("cpu", torch.int64)
     cu_k = cu_seqlens_k.detach().to("cpu", torch.int64)
+    # Table fields are int32 row indices; .to(int32) wraps silently.
+    assert int(cu_q[-1]) < 2**31 and int(cu_k[-1]) < 2**31
     seqlens_q = cu_q[1:] - cu_q[:-1]
     seqlens_k = cu_k[1:] - cu_k[:-1]
     # v1 (tile-aligned): lifted when the seqlen tail masking lands.

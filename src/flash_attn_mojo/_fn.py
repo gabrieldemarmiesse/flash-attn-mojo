@@ -273,7 +273,44 @@ def flash_attn_varlen_func(
     _check_varlen_envelope(q, k, v, cu_seqlens_q, cu_seqlens_k)
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
-    _ = max_seqlen_q, max_seqlen_k
+
+    # Value-level envelope checks (one tiny D2H copy; the kernel
+    # wrappers sync on cu_seqlens anyway). Kept at the API boundary
+    # so violations raise clear ValueErrors, not deep AssertionErrors.
+    cu_q_host = cu_seqlens_q.detach().cpu()
+    cu_k_host = cu_seqlens_k.detach().cpu()
+    seqlens_q = cu_q_host[1:] - cu_q_host[:-1]
+    if int(cu_q_host[0]) != 0 or int(cu_k_host[0]) != 0:
+        raise ValueError("cu_seqlens must start at 0")
+    if bool((seqlens_q < 0).any()):
+        raise ValueError("cu_seqlens must be non-decreasing")
+    if not torch.equal(cu_q_host, cu_k_host):
+        raise ValueError(
+            "the current varlen envelope is self-attention only: "
+            "cu_seqlens_q must equal cu_seqlens_k elementwise"
+        )
+    if int(cu_q_host[-1]) != q.shape[0]:
+        raise ValueError(
+            f"cu_seqlens_q[-1] ({int(cu_q_host[-1])}) must equal "
+            f"total_tokens ({q.shape[0]})"
+        )
+    if bool((seqlens_q % _SEQLEN_MULTIPLE != 0).any()):
+        raise ValueError(
+            "the current varlen envelope needs every sequence length "
+            f"to be a multiple of {_SEQLEN_MULTIPLE}, got "
+            f"{seqlens_q[:8].tolist()}..."
+        )
+    max_len = int(seqlens_q.max()) if len(seqlens_q) else 0
+    if max_seqlen_q is not None and max_seqlen_q < max_len:
+        raise ValueError(
+            f"max_seqlen_q ({max_seqlen_q}) is smaller than the "
+            f"longest sequence ({max_len})"
+        )
+    if max_seqlen_k is not None and max_seqlen_k < max_len:
+        raise ValueError(
+            f"max_seqlen_k ({max_seqlen_k}) is smaller than the "
+            f"longest sequence ({max_len})"
+        )
 
     if not q.is_cuda:
         from flash_attn_mojo.reference import flash_attn_varlen_ref
@@ -308,6 +345,19 @@ def flash_attn_varlen_func(
                 lse[:, s:e] = torch.logsumexp(scores, dim=-1)
             return out, lse
         return out
+
+    # The varlen backward is MHA-only for now: refuse GQA up front
+    # when gradients are live instead of failing inside backward().
+    if (
+        q.shape[1] != k.shape[1]
+        and torch.is_grad_enabled()
+        and (q.requires_grad or k.requires_grad or v.requires_grad)
+    ):
+        raise ValueError(
+            "the varlen backward does not support GQA yet — run GQA "
+            "varlen inference under torch.no_grad(), or use MHA for "
+            "training"
+        )
 
     out, lse = _FlashAttnVarlenFunc.apply(
         q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale, causal

@@ -102,3 +102,36 @@ def test_varlen_cpu_reference_path():
         q[:128].unsqueeze(0), k[:128].unsqueeze(0), v[:128].unsqueeze(0)
     )[0]
     assert (out[:128] - ref0).abs().max().item() < 1e-6
+
+
+def test_varlen_value_envelope_errors():
+    from flash_attn_mojo import flash_attn_varlen_func
+
+    q = torch.randn(256, 4, 128, dtype=torch.bfloat16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    cu = torch.tensor([0, 128, 256], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="self-attention only"):
+        flash_attn_varlen_func(
+            q, k, v, cu, torch.tensor([0, 64, 256], dtype=torch.int32)
+        )
+    with pytest.raises(ValueError, match="multiple of 128"):
+        flash_attn_varlen_func(
+            q[:200], k[:200], v[:200],
+            torch.tensor([0, 100, 200], dtype=torch.int32),
+            torch.tensor([0, 100, 200], dtype=torch.int32),
+        )
+    with pytest.raises(ValueError, match="start at 0"):
+        flash_attn_varlen_func(
+            q, k, v,
+            torch.tensor([128, 256], dtype=torch.int32),
+            torch.tensor([128, 256], dtype=torch.int32),
+        )
+    with pytest.raises(ValueError, match="total_tokens"):
+        flash_attn_varlen_func(
+            q, k, v,
+            torch.tensor([0, 128], dtype=torch.int32),
+            torch.tensor([0, 128], dtype=torch.int32),
+        )
+    with pytest.raises(ValueError, match="max_seqlen_q"):
+        flash_attn_varlen_func(q, k, v, cu, cu, max_seqlen_q=64)

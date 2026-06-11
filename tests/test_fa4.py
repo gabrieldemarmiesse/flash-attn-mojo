@@ -383,3 +383,35 @@ def test_varlen_vs_fa4_when_available(causal):
     )
     assert (out - ref_out).abs().max().item() < 2e-2
     assert (lse - ref_lse).abs().max().item() < 1e-5
+
+
+@requires_cuda
+def test_varlen_gqa_fwd_only():
+    """Varlen GQA: forward works under no_grad; with live grads the
+    API refuses up front (the varlen backward is MHA-only)."""
+    from flash_attn_mojo import flash_attn_varlen_func
+
+    cu = torch.tensor([0, 256], dtype=torch.int32, device="cuda")
+    q = torch.randn(
+        256, 4, 128, dtype=torch.bfloat16, device="cuda",
+        requires_grad=True,
+    )
+    k = torch.randn(
+        256, 2, 128, dtype=torch.bfloat16, device="cuda",
+        requires_grad=True,
+    )
+    v = torch.randn_like(k, requires_grad=True)
+
+    with pytest.raises(ValueError, match="GQA"):
+        flash_attn_varlen_func(q, k, v, cu, cu)
+
+    with torch.no_grad():
+        out = flash_attn_varlen_func(q, k, v, cu, cu)
+    g = 2
+    ref = _sdpa_varlen_fp32(
+        q.detach(),
+        k.detach().repeat_interleave(g, dim=1),
+        v.detach().repeat_interleave(g, dim=1),
+        [0, 256],
+    )
+    assert (out.float() - ref).abs().max().item() < 2e-2

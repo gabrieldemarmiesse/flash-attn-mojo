@@ -203,6 +203,8 @@ def _build_bwd_tables(
     m_counts = (seqlens_q + block_m - 1) // block_m
     mpad_base = (cu_q[:-1] + torch.arange(nseq) * block_m) // block_m
     num_mpad = -(-(total_q + (nseq + 1) * block_m) // block_m)
+    # Table fields are int32; .to(int32) wraps silently on overflow.
+    assert num_mpad * block_m < 2**31 and int(cu_k[-1]) < 2**31
     # Window-fit (the slack formula guarantees this; assert anyway —
     # an overlap silently corrupts the next sequence's stats).
     ends = mpad_base + m_counts
