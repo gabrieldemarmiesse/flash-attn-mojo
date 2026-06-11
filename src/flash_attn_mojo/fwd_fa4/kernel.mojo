@@ -100,20 +100,21 @@ comptime WGMMA_K: Int = 16
 def fwd_fa4_kernel[
     dtype: DType,
     head_dim: Int,
-    q_tile_shape: IndexList[3],
-    q_desc_shape: IndexList[3],
+    qo_rank: Int,
+    q_tile_shape: IndexList[qo_rank],
+    q_desc_shape: IndexList[qo_rank],
     kv_tile_shape: IndexList[3],
     kv_desc_shape: IndexList[3],
-    o_tile_shape: IndexList[3],
-    o_desc_shape: IndexList[3],
+    o_tile_shape: IndexList[qo_rank],
+    o_desc_shape: IndexList[qo_rank],
     causal: Bool = False,
     gqa_ratio: Int = 1,
     varlen: Bool = False,
 ](
-    q_tma: TMATensorTile[dtype, 3, q_tile_shape, q_desc_shape],
+    q_tma: TMATensorTile[dtype, qo_rank, q_tile_shape, q_desc_shape],
     k_tma: TMATensorTile[dtype, 3, kv_tile_shape, kv_desc_shape],
     v_tma: TMATensorTile[dtype, 3, kv_tile_shape, kv_desc_shape],
-    o_tma: TMATensorTile[dtype, 3, o_tile_shape, o_desc_shape],
+    o_tma: TMATensorTile[dtype, qo_rank, o_tile_shape, o_desc_shape],
     lse_ptr: UnsafePointer[Float32, MutAnyOrigin],
     seq_len: Int,
     softmax_scale: Float32,
@@ -275,7 +276,16 @@ def fwd_fa4_kernel[
         warpgroup_reg_dealloc[NUM_PRODUCER_REGS]()
         if thread_idx.x == 0:
             mbar_q[0].expect_bytes(Int32(BM * D * size_of[dtype]()))
-            comptime if varlen:
+            comptime if qo_rank == 4:
+                # Dense hdim64: S is its own TMA dim (BM=192 does not
+                # divide the seqlen envelope; OOB tail rows zero-fill
+                # here and the store-side clamps).
+                q_tma.async_copy_4d(
+                    q_smem,
+                    mbar_q[0],
+                    (0, h_idx, m_block * BM, b_idx),
+                )
+            elif varlen:
                 q_tma.async_copy_3d(
                     q_smem, mbar_q[0], (0, h_idx, vl_q_base + m_block * BM)
                 )
@@ -349,13 +359,18 @@ def fwd_fa4_kernel[
     comptime for s in range(STAGES):
         _ = empty[s].arrive()
 
+    # Scheduler-pingpong barrier participant count: each barrier id
+    # is waited by ONE warpgroup (128) and armed by its predecessor
+    # (128) — 256 regardless of NWG (== NWG*128 only at NWG == 2).
+    comptime SCHED_BAR_N: Int = 2 * 128
+
     # Warp-scheduler pingpong (FA4's use_scheduler_barrier): named
     # barrier 1+wg gates each warpgroup's GEMM-issue phase; a
     # warpgroup arrives at the *other* one's barrier after committing
     # its GEMM pair, so issue phases alternate and each warpgroup's
     # softmax overlaps the other's GEMMs. WG0 self-arms its barrier.
     if wg == 0:
-        named_barrier_arrive[Int32(NWG * 128)](Int32(1))
+        named_barrier_arrive[Int32(SCHED_BAR_N)](Int32(1))
 
     var wgmma_qk = TensorCoreAsync[
         accum_type,
@@ -454,6 +469,9 @@ def fwd_fa4_kernel[
     @always_inline
     def pv_gemm(slot_arg: Int):
         comptime if dtype == DType.float16:
+            comptime assert head_dim == 128, (
+                "fp16 hdim64 needs an m64n64 RS arm in _wgmma_f16"
+            )
             var b_desc = _wgmma_descriptor[v_canonical, False, swizzle](
                 kv_smem_base + slot_arg * kv_slot_size
             )
@@ -579,7 +597,7 @@ def fwd_fa4_kernel[
     for it in range(num_kv_blocks - 1):
         # Queue QK(n+1) then PV(n) on the tensor core.
         full[k_slot].wait(k_phase)
-        named_barrier[Int32(NWG * 128)](Int32(1 + wg))
+        named_barrier[Int32(SCHED_BAR_N)](Int32(1 + wg))
         warpgroup_fence(s_reg)
         wgmma_qk.arrive()
         wgmma_qk.wgmma[num_warp_groups=NWG, scale_c=0](
@@ -592,7 +610,13 @@ def fwd_fa4_kernel[
         wgmma_pv.arrive()
         pv_gemm(v_slot)
         wgmma_pv.commit_group()
-        named_barrier_arrive[Int32(NWG * 128)](Int32(2 - wg))
+        # Arrive at the SUCCESSOR's sync barrier: ring W0->W1->...->W0.
+        comptime if NWG == 2:
+            named_barrier_arrive[Int32(SCHED_BAR_N)](Int32(2 - wg))
+        else:
+            named_barrier_arrive[Int32(SCHED_BAR_N)](
+                Int32(wg + 2 if wg < NWG - 1 else 1)
+            )
 
         # QK(n+1) retired (PV(n) still running on the tensor core).
         wgmma_qk.wait_group[1]()
@@ -664,6 +688,13 @@ def fwd_fa4_kernel[
     var vl_rows: Int = BM
     comptime if varlen:
         vl_rows = vl_seqlen_q - m_block * BM
+    # Dense hdim64 (BM=192): the last m-tile is partial whenever
+    # seq_len % BM != 0 — rank-4 TMA clamps the O store, but the LSE
+    # writes still need the row predicate (vl_rows doubles as the
+    # valid-row count for both paths).
+    comptime if qo_rank == 4:
+        vl_rows = seq_len - m_block * BM
+
     var full_tile_store: Bool = True
     comptime if varlen:
         if vl_rows < BM:
@@ -691,32 +722,63 @@ def fwd_fa4_kernel[
                     ).store[width=2, alignment=4](pair)
 
     if full_tile_store:
-        var st_row: Int = (
-            row_warp_base + ((lane // 8) % 2) * 8 + (lane % 8)
-        )
-        var st_off_raw: Int = st_row * 64 + (lane // 16) * 8
-        var o_raw: Int = Int(smem_base) + 2 * st_off_raw
-        comptime for i in range(c_frag_size_pv // 8):
-            var packed = SIMD[DType.float32, 4](0)
-            comptime for jm in range(4):
-                comptime p: Int = 4 * i + jm
-                packed[jm] = bitcast[DType.float32, 1](
-                    SIMD[accum_type, 2](
-                        o_reg.ptr[2 * p], o_reg.ptr[2 * p + 1]
-                    ).cast[dtype]()
+        comptime if D == 64:
+            # D=64: stage via plain paired stores at the canonical
+            # SW128 k-major addresses (64-elem rows = one 128-B
+            # swizzle period; XOR re-applied per 16-B store). The
+            # stmatrix scheme below encodes D=128 geometry —
+            # revisit only if the parity bench demands it.
+            comptime for c2 in range(c_frag_size_pv // 2):
+                comptime col_chunk: Int = c2 // 2
+                comptime is_bot: Int = c2 % 2
+                var row: Int = (
+                    row_warp_base + lane_group + (8 if is_bot == 1 else 0)
                 )
-            var raw_i: Int = o_raw + (i % 4) * 32 + (i // 4) * (BM * 128)
-            var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
-            # .bitcast[BFloat16]: the stdlib st_matrix comptime-
-            # asserts bf16/f32, but stmatrix.b16 is dtype-agnostic
-            # (raw 16-bit stores; the payload is already bit-packed)
-            # — the cast unblocks fp16 and is a no-op for bf16.
-            st_matrix[simd_width=4](
+                var col: Int = col_chunk * 8 + 2 * lane_pair
+                var pair = SIMD[dtype, 2](
+                    o_reg.ptr[2 * c2].cast[dtype](),
+                    o_reg.ptr[2 * c2 + 1].cast[dtype](),
+                )
+                var b_addr: Int = (
+                    Int(smem_base)
+                    + (row >> 3) * 1024
+                    + (row & 7) * 128
+                    + 2 * col
+                )
+                var b_sw: Int = b_addr ^ ((b_addr >> 3) & 112)
                 (
-                    smem_base + ((sw_i >> 1) - (Int(smem_base) >> 1))
-                ).bitcast[BFloat16](),
-                packed,
+                    smem_base + ((b_sw >> 1) - (Int(smem_base) >> 1))
+                ).store[width=2, alignment=4](pair)
+        else:
+            var st_row: Int = (
+                row_warp_base + ((lane // 8) % 2) * 8 + (lane % 8)
             )
+            var st_off_raw: Int = st_row * 64 + (lane // 16) * 8
+            var o_raw: Int = Int(smem_base) + 2 * st_off_raw
+            comptime for i in range(c_frag_size_pv // 8):
+                var packed = SIMD[DType.float32, 4](0)
+                comptime for jm in range(4):
+                    comptime p: Int = 4 * i + jm
+                    packed[jm] = bitcast[DType.float32, 1](
+                        SIMD[accum_type, 2](
+                            o_reg.ptr[2 * p], o_reg.ptr[2 * p + 1]
+                        ).cast[dtype]()
+                    )
+                var raw_i: Int = (
+                    o_raw + (i % 4) * 32 + (i // 4) * (BM * 128)
+                )
+                var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
+                # .bitcast[BFloat16]: the stdlib st_matrix comptime-
+                # asserts bf16/f32, but stmatrix.b16 is dtype-agnostic
+                # (raw 16-bit stores; the payload is already bit-packed)
+                # — the cast unblocks fp16 and is a no-op for bf16.
+                st_matrix[simd_width=4](
+                    (
+                        smem_base
+                        + ((sw_i >> 1) - (Int(smem_base) >> 1))
+                    ).bitcast[BFloat16](),
+                    packed,
+                )
 
     # ---- LSE (natural log), one f32 per row: rowmax is kept in the
     # scaled log2 domain (max*scale*log2e) and rowsum is already
@@ -735,7 +797,7 @@ def fwd_fa4_kernel[
             # Varlen: rows past the sequence's end belong to the NEXT
             # sequence's packed LSE rows — predicate them off.
             var lse_ok: Bool = True
-            comptime if varlen:
+            comptime if varlen or qo_rank == 4:
                 lse_ok = r < vl_rows
             if lse_ok:
                 (lse_ptr + lse_row_base + r)[0] = (
@@ -744,8 +806,8 @@ def fwd_fa4_kernel[
 
     fence_async_view_proxy()
     # Producer warpgroup may have exited -> consumer-only barrier.
-    # (id 3: ids 1-2 are the scheduler pingpong barriers.)
-    named_barrier[Int32(NWG * 128)](Int32(3))
+    # (id NWG+1: ids 1..NWG are the scheduler pingpong barriers.)
+    named_barrier[Int32(NWG * 128)](Int32(NWG + 1))
     if full_tile_store and thread_idx.x == 128:
         var o_st = LayoutTensor[
             dtype,
@@ -754,7 +816,12 @@ def fwd_fa4_kernel[
             address_space=AddressSpace.SHARED,
             alignment=128,
         ](smem_base)
-        comptime if varlen:
+        comptime if qo_rank == 4:
+            # S its own dim: the partial tail tile clamps in hardware.
+            o_tma.async_store_4d(
+                o_st, (0, h_idx, m_block * BM, b_idx)
+            )
+        elif varlen:
             o_tma.async_store_3d(
                 o_st, (0, h_idx, vl_q_base + m_block * BM)
             )

@@ -25,6 +25,8 @@ from std.utils.index import IndexList
 from layout import UNKNOWN_VALUE
 from layout.tma_async import create_split_tma
 
+from _tma4 import create_split_tma_4d
+
 from kernel import fwd_fa4_kernel
 from common import kFa4NThreads, kFa4BlockM, kFa4BlockN, kFa4KVStages
 
@@ -120,9 +122,6 @@ def launch_fwd_fa4[
     comptime if varlen:
         rows = varlen_total_q
         rows_kv = varlen_total_k
-    var q_tma = create_split_tma[
-        q_smem_shape, gmem_shape, swizzle_mode=swizzle
-    ](ctx, q_ptr, rows, nheads_int)
     var nheads_kv: Int = nheads_int // gqa_ratio
     var k_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
@@ -131,13 +130,116 @@ def launch_fwd_fa4[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
     ](ctx, v_ptr, rows_kv, nheads_kv)
     # O store descriptor: SWIZZLE_128B like the loads — the kernel
-    # stmatrix-stages O into the dead (swizzled) Q tile and issues
-    # ONE whole-tile TMA store. (The previous unswizzled 16B-chunk
+    # stages O into the dead (swizzled) Q tile and issues ONE
+    # whole-tile TMA store. (The previous unswizzled 16B-chunk
     # descriptor cost 16 serialized UTMASTG issues per CTA — ~8% of
     # a short-seq CTA, PC-sampling-verified.)
     var o_imm_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=o_addr
     )
+    # Dense hdim64 gives Q/O RANK-4 descriptors (B, S, H, D): with
+    # BM=192 not dividing the seqlen envelope, S must be its own TMA
+    # dim so tail-tile loads zero-fill and stores CLAMP (a flattened
+    # B*S descriptor would clobber the next batch's O rows).
+    comptime QO_RANK: Int = 4 if (head_dim == 64 and not varlen) else 3
+    comptime gmem_shape4 = IndexList[4](
+        UNKNOWN_VALUE, UNKNOWN_VALUE, UNKNOWN_VALUE, head_dim
+    )
+    comptime q_smem_shape4 = IndexList[4](
+        1, kFa4BlockM(head_dim), 1, head_dim
+    )
+
+    comptime if QO_RANK == 4:
+        var q_tma = create_split_tma_4d[
+            q_smem_shape4, gmem_shape4, swizzle_mode=swizzle
+        ](ctx, q_ptr, batch_int, seqlen_int, nheads_int)
+        var o_tma = create_split_tma_4d[
+            q_smem_shape4, gmem_shape4, swizzle_mode=swizzle
+        ](ctx, o_imm_ptr, batch_int, seqlen_int, nheads_int)
+        comptime kernel_inst = fwd_fa4_kernel[
+            dtype,
+            head_dim,
+            4,
+            type_of(q_tma).tile_shape,
+            type_of(q_tma).desc_shape,
+            type_of(k_tma).tile_shape,
+            type_of(k_tma).desc_shape,
+            type_of(o_tma).tile_shape,
+            type_of(o_tma).desc_shape,
+            causal,
+            gqa_ratio,
+            varlen,
+        ]
+        var compiled = ctx.compile_function[
+            kernel_inst,
+            kernel_inst,
+            dump_asm = _dump_ptx_path(),
+        ](
+            func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
+                UInt32(smem_bytes)
+            )
+        )
+        var num_m: Int = ceildiv(
+            seqlen_int, Int(kFa4BlockM(head_dim))
+        )
+        var size_one_kv_head: Int = (
+            seqlen_int * 2 * head_dim * size_of[dtype]()
+        )
+        var l2_ratio: Int = (50 * 1024 * 1024) // size_one_kv_head
+        var sched_swizzle: Int = 1
+        while sched_swizzle * 2 <= l2_ratio:
+            sched_swizzle *= 2
+        var num_hb: Int = nheads_int * batch_int
+        var sched_num_hb_q: Int = num_hb // sched_swizzle
+        var sched_residual: Int = max(num_hb % sched_swizzle, 1)
+        var grid: Tuple[Int, Int, Int]
+        comptime if causal:
+            grid = (num_m * num_hb, 1, 1)
+        else:
+            grid = (num_m, nheads_int, batch_int)
+        comptime if use_external_stream:
+            var stream = ctx.create_external_stream(stream_opaque)
+            stream.enqueue_function(
+                compiled,
+                q_tma,
+                k_tma,
+                v_tma,
+                o_tma,
+                lse_ptr,
+                seqlen_int,
+                softmax_scale,
+                nheads_int,
+                sched_swizzle,
+                sched_num_hb_q,
+                sched_residual,
+                grid_dim=grid,
+                block_dim=(kFa4NThreads(head_dim),),
+                shared_mem_bytes=smem_bytes,
+            )
+        else:
+            ctx.enqueue_function(
+                compiled,
+                q_tma,
+                k_tma,
+                v_tma,
+                o_tma,
+                lse_ptr,
+                seqlen_int,
+                softmax_scale,
+                nheads_int,
+                sched_swizzle,
+                sched_num_hb_q,
+                sched_residual,
+                grid_dim=grid,
+                block_dim=(kFa4NThreads(head_dim),),
+                shared_mem_bytes=smem_bytes,
+            )
+            ctx.synchronize()
+        return
+
+    var q_tma = create_split_tma[
+        q_smem_shape, gmem_shape, swizzle_mode=swizzle
+    ](ctx, q_ptr, rows, nheads_int)
     var o_tma = create_split_tma[
         q_smem_shape, gmem_shape, swizzle_mode=swizzle
     ](ctx, o_imm_ptr, rows, nheads_int)
@@ -145,6 +247,7 @@ def launch_fwd_fa4[
     comptime kernel_inst = fwd_fa4_kernel[
         dtype,
         head_dim,
+        3,
         type_of(q_tma).tile_shape,
         type_of(q_tma).desc_shape,
         type_of(k_tma).tile_shape,
