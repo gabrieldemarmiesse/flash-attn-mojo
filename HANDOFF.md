@@ -520,6 +520,30 @@ Tolerance note: HW tanh.approx is ~2^-11 relative; vs exact-tanh
 references the LSE lands at ~1e-5..1e-4 (SOFTCAP_LSE_TOL = 1e-4);
 outputs/grads stay inside the usual masked tolerances.
 
+## Varlen cross-attention (2026-06-11, eighth session)
+
+cu_q != cu_k with FA4's bottom-right diagonal, differentiable,
+MHA+GQA, arbitrary lengths; causal requires slq <= slk per
+sequence (v1). The generalization is small because the varlen
+tables already carried slq and slk separately: the fwd trip clamp
+and band mask gain a +offs term (varlen causal now always takes
+the band arm — at BM == BN the offset can straddle the diagonal
+across two tiles); the bwd gains a host-side m_start offset and a
+general S^T mask base read from the table. Self-attn parity
+re-verified unchanged (fwd 0.980x, bwd 1.005x); dense and
+varlen-non-causal byte-identical; 0 spills.
+
+Debugging lesson worth the price of admission: the first cross
+runs failed with EXACT LSE and wrong out. That signature uniquely
+fingerprints a mask-alignment split between two consumers of the
+same scores — and it was the REFERENCE, not the kernel:
+flash_attn_ref's SDPA fast path uses torch's is_causal (TOP-LEFT
+aligned for Lq != Lk) while its own LSE builds the bottom-right
+triu(Lk-Lq+1) mask. The uniform-K + index-valued-V probe (out[i] =
+mean attended index) proved the kernel's attended sets exact
+before touching any kernel code. Cross-length causal now routes
+through the reference's explicit-mask branch.
+
 ## Not yet tried (fwd)
 
 - ~~L2 cache hints on TMA loads~~ DEBUNKED (third session): FA4's

@@ -213,13 +213,18 @@ def _build_bwd_tables(
     seqlens_q = cu_q[1:] - cu_q[:-1]
     seqlens_k = cu_k[1:] - cu_k[:-1]
     # Arbitrary lengths >= 1 (ragged kv tails are masked in-kernel
-    # and tail tiles stored row-predicated); self-attn only.
-    assert bool((seqlens_q > 0).all()), (
+    # and tail tiles stored row-predicated); self- or
+    # cross-attention.
+    assert bool((seqlens_q > 0).all() and (seqlens_k > 0).all()), (
         "bwd_fa4_varlen needs every sequence length >= 1"
     )
-    assert torch.equal(seqlens_q, seqlens_k), (
-        "bwd_fa4_varlen is self-attn only (equal q/k lengths)"
-    )
+    if causal:
+        # Bottom-right diagonal; slq > slk would need empty-q-row
+        # (out=0/lse=-inf) handling — not in the v1 envelope.
+        assert bool((seqlens_q <= seqlens_k).all()), (
+            "causal varlen cross-attention requires seqlen_q <= "
+            "seqlen_k per sequence"
+        )
     nseq = len(seqlens_q)
     total_q = int(cu_q[-1])
 
@@ -262,7 +267,14 @@ def _build_bwd_tables(
     kt[:, 4] = seqlens_k[k_sidx].to(torch.int32)
     kt[:, 5] = m_counts[k_sidx].to(torch.int32)
     if causal:
-        kt[:, 6] = ((n_local * _BLOCK) // block_m).to(torch.int32)
+        # First q tile attending kv tile n (bottom-right diagonal):
+        # q row i attends kv j <= i + offs, so kv tile n's first
+        # attending row is n*BN - offs (offs = slk - slq; 0 for
+        # self-attn, where this reduces to (n*BN)//BM).
+        offs = seqlens_k[k_sidx] - seqlens_q[k_sidx]
+        kt[:, 6] = (
+            torch.clamp(n_local * _BLOCK - offs, min=0) // block_m
+        ).to(torch.int32)
     kt[:, 7] = mpad_base[k_sidx].to(torch.int32)
 
     dev = cu_seqlens_q.device

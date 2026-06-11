@@ -146,9 +146,13 @@ def test_varlen_value_envelope_errors():
     k, v = torch.randn_like(q), torch.randn_like(q)
     cu = torch.tensor([0, 128, 256], dtype=torch.int32)
 
-    with pytest.raises(ValueError, match="self-attention only"):
+    # cross-attention lengths are allowed non-causally; causal
+    # requires seqlen_q <= seqlen_k per sequence.
+    with pytest.raises(ValueError, match="seqlen_q <= seqlen_k"):
         flash_attn_varlen_func(
-            q, k, v, cu, torch.tensor([0, 64, 256], dtype=torch.int32)
+            q, k[:192], v[:192], cu,
+            torch.tensor([0, 64, 192], dtype=torch.int32),
+            causal=True,
         )
     with pytest.raises(ValueError, match="zero-length"):
         flash_attn_varlen_func(

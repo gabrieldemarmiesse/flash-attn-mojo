@@ -441,6 +441,111 @@ def test_bwd_varlen(lens, mask, heads):
         assert d < tol, f"{name} maxdiff {d:.3e} lens={lens}"
 
 
+# ----------------------------------- varlen cross-attention
+# (lens_q, lens_k) pairs — bottom-right diagonal under causal
+# (seqlen_q <= seqlen_k per sequence; host-asserted).
+XATTN_SETS = [
+    ([128], [256]),
+    ([100, 50], [300, 50]),
+    ([1, 200, 64], [333, 200, 512]),
+    ([128], [129]),  # offs=1: the diagonal band straddles 2 tiles
+    ([60], [377]),
+]
+XATTN_IDS = ["X128-256", "Xmixed", "Xdecode", "X128-129", "X60-377"]
+
+
+def _make_xattn(lens_q, lens_k, hq=4, hkv=4):
+    def cu_of(lens):
+        cu = [0]
+        for L in lens:
+            cu.append(cu[-1] + L)
+        return torch.tensor(cu, dtype=torch.int32, device="cuda")
+
+    cu_q, cu_k = cu_of(lens_q), cu_of(lens_k)
+    q = torch.randn(
+        int(cu_q[-1]), hq, 128, dtype=torch.bfloat16, device="cuda"
+    )
+    k = torch.randn(
+        int(cu_k[-1]), hkv, 128, dtype=torch.bfloat16, device="cuda"
+    )
+    return q, k, torch.randn_like(k), cu_q, cu_k
+
+
+def _xattn_fwd(q, k, v, cu_q, cu_k, causal):
+    if IMPL == "fa4":
+        from flash_attn.cute import flash_attn_varlen_func
+
+        return flash_attn_varlen_func(
+            q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=int((cu_q[1:] - cu_q[:-1]).max()),
+            max_seqlen_k=int((cu_k[1:] - cu_k[:-1]).max()),
+            causal=causal, return_lse=True,
+        )
+    from flash_attn_mojo.fwd_fa4 import fa4_varlen_fwd
+
+    return fa4_varlen_fwd(q, k, v, cu_q, cu_k, causal=causal)
+
+
+@requires_cuda
+@pytest.mark.parametrize("case", XATTN_SETS, ids=XATTN_IDS)
+@pytest.mark.parametrize("mask", ["plain", "causal"])
+def test_fwd_varlen_xattn(case, mask):
+    _skip_if_impl_unavailable()
+    torch.manual_seed(5)
+    causal = mask == "causal"
+    lens_q, lens_k = case
+    q, k, v, cu_q, cu_k = _make_xattn(lens_q, lens_k)
+    out, lse = _xattn_fwd(q, k, v, cu_q, cu_k, causal)
+    ref, ref_lse = flash_attn_varlen_ref(
+        q.float(), k.float(), v.float(), cu_q, cu_k, causal=causal,
+        return_lse=True,
+    )
+    d = (out.float() - ref).abs().max().item()
+    assert d < FWD_TOL_MASKED, f"out maxdiff {d:.3e}"
+    dl = (lse - ref_lse).abs().max().item()
+    assert dl < LSE_TOL, f"lse maxdiff {dl:.3e}"
+
+
+@requires_cuda
+@pytest.mark.parametrize("case", XATTN_SETS, ids=XATTN_IDS)
+@pytest.mark.parametrize("mask", ["plain", "causal"])
+def test_bwd_varlen_xattn(case, mask):
+    _skip_if_impl_unavailable()
+    torch.manual_seed(5)
+    causal = mask == "causal"
+    lens_q, lens_k = case
+    q, k, v, cu_q, cu_k = _make_xattn(lens_q, lens_k)
+    dout = torch.randn_like(q)
+    out, lse = _xattn_fwd(q, k, v, cu_q, cu_k, causal)
+    if IMPL == "fa4":
+        from flash_attn.cute.interface import _flash_attn_bwd
+
+        dq, dk, dv = _flash_attn_bwd(
+            q, k, v, out, dout, lse,
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=int((cu_q[1:] - cu_q[:-1]).max()),
+            max_seqlen_k=int((cu_k[1:] - cu_k[:-1]).max()),
+            causal=causal,
+        )
+    else:
+        from flash_attn_mojo.bwd_fa4 import bwd_fa4_varlen
+
+        dq, dk, dv = bwd_fa4_varlen(
+            q, k, v, out, dout, lse, cu_q, cu_k, causal=causal
+        )
+
+    qf = q.detach().float().requires_grad_()
+    kf = k.detach().float().requires_grad_()
+    vf = v.detach().float().requires_grad_()
+    ref = flash_attn_varlen_ref(qf, kf, vf, cu_q, cu_k, causal=causal)
+    ref.backward(dout.float())
+    for name, got, want in (
+        ("dq", dq, qf.grad), ("dk", dk, kf.grad), ("dv", dv, vf.grad)
+    ):
+        d = (got.float() - want).abs().max().item()
+        assert d < BWD_TOL_MASKED, f"{name} maxdiff {d:.3e}"
+
+
 # ----------------------- canonical-shape cross-checks (mojo vs fa4)
 def _skip_unless_cross_check():
     if IMPL != "mojo":

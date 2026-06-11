@@ -239,19 +239,34 @@ def fwd_fa4_kernel[
             m_block = Int(block_idx.x)
             h_idx = Int(block_idx.y)
             b_idx = Int(block_idx.z)
+    # Cross-attention diagonal offset (FA4's bottom-right
+    # alignment): row i attends col j iff j <= i + (slk - slq).
+    # 0 for self-attention; only the causal arms consume it. v1
+    # envelope: slq <= slk per sequence under causal
+    # (host-asserted), so every q row attends >= 1 key.
+    var vl_offs: Int = 0
+    comptime if varlen and causal:
+        vl_offs = vl_seqlen_k - vl_seqlen_q
     var num_kv_blocks: Int
     comptime if varlen:
         num_kv_blocks = (vl_seqlen_k + BN - 1) // BN
     else:
         num_kv_blocks = (seq_len + BN - 1) // BN
     comptime if causal:
-        comptime if BM == BN:
+        comptime if varlen:
+            # Cross-attention general form (bottom-right diagonal):
+            # row block m attends kv cols < (m+1)*BM + (slk - slq),
+            # so the band may straddle two tiles even at BM == BN
+            # (offs % BN != 0) — varlen causal always takes the
+            # BAND mask arms below. Self-attn (offs == 0) degrades
+            # to the dense count with one extra no-op masked tile.
+            num_kv_blocks = min(
+                num_kv_blocks,
+                ((m_block + 1) * BM + vl_offs + BN - 1) // BN,
+            )
+        elif BM == BN:
             # BM == BN: row block m attends KV tiles 0..m inclusive;
             # tile n == m_block is the (only) masked diagonal tile.
-            # (Varlen v1 is self-attn — seqlen_q == seqlen_k per
-            # sequence — so the dense diagonal formula carries over.
-            # The general FA4 form is min(·, ceil_div((m+1)*BM + slk
-            # - slq, BN)).)
             num_kv_blocks = min(num_kv_blocks, m_block + 1)
         else:
             # BM=192 > BN=128 (hdim64): row block m attends kv cols
@@ -278,11 +293,12 @@ def fwd_fa4_kernel[
 
     # Varlen ragged kv tail: garbage columns live only in the
     # sequence's LAST kv tile (kv tiles are seq-local). Non-causal
-    # masks them there; causal needs NO extra mask — with BM == BN
-    # and self-attn lengths, the last kv tile is only ever processed
-    # as the last m-block's diagonal tile, where col > row already
-    # covers every col >= seqlen_k for the stored (row < seqlen_q ==
-    # seqlen_k) rows.
+    # masks them there; causal needs NO extra mask — bottom-right
+    # alignment means garbage col j >= slk is attended only by rows
+    # i >= j - offs >= slk - (slk - slq) = slq, i.e. never by a
+    # STORED row; and the last kv tile, when processed, is always
+    # within the band-masked trailing trips, whose col + mask_d >
+    # row predicate covers exactly j > i + offs.
     var vl_kv_tail: Int = 0
     comptime if varlen and not causal:
         vl_kv_tail = vl_seqlen_k - (num_kv_blocks - 1) * BN
@@ -569,7 +585,7 @@ def fwd_fa4_kernel[
             comptime for c in range(c_frag_size_qk):
                 s_reg.ptr[c] = tanh(s_reg.ptr[c] * t_scale)
         comptime if causal:
-            comptime if BM == BN:
+            comptime if BM == BN and not varlen:
                 if mask_diag:
                     comptime for c in range(c_frag_size_qk):
                         comptime col_base: Int = (c // 4) * 8 + (c & 1)
@@ -578,6 +594,9 @@ def fwd_fa4_kernel[
                             s_reg.ptr[c] = neg_inf
             else:
                 # Diagonal-band tile: global mask col + mask_d > row.
+                # (Varlen causal always uses this arm — the
+                # cross-attention offset shifts the diagonal off the
+                # n == m tile and the band may straddle two tiles.)
                 if mask_diag:
                     comptime for c in range(c_frag_size_qk):
                         comptime col_base: Int = (c // 4) * 8 + (c & 1)
@@ -670,11 +689,13 @@ def fwd_fa4_kernel[
     # steady loop below stays mask-free.
     var prologue_diag: Bool = False
     comptime if causal:
-        comptime if BM == BN:
+        comptime if BM == BN and not varlen:
             prologue_diag = kv_trips == 1
         else:
             prologue_diag = kv_trips <= 2
             causal_mask_d = -m_block * BM
+            comptime if varlen:
+                causal_mask_d -= vl_offs
     softmax_block(prologue_diag, True)
     pack_p()  # P(0)
 
@@ -723,11 +744,13 @@ def fwd_fa4_kernel[
         # (Varlen's tail mask ran in the prologue — reverse order.)
         var loop_diag: Bool = False
         comptime if causal:
-            comptime if BM == BN:
+            comptime if BM == BN and not varlen:
                 loop_diag = it == kv_trips - 2
             else:
                 loop_diag = it >= kv_trips - 3
                 causal_mask_d = (it + 1) * BN - m_block * BM
+                comptime if varlen:
+                    causal_mask_d -= vl_offs
         softmax_block(loop_diag, False)
 
         # PV(n) retired: p_reg and o_reg are safe to touch.

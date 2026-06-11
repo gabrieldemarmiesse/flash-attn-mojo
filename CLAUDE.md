@@ -150,6 +150,28 @@ run-to-run variance (locked clocks, interleaved):
   (tested). General (non-%128) window_left needs only the fwd
   trip-0 mask + the bwd guard relaxation — formulas already exact.
 
+- VARLEN CROSS-ATTENTION (2026-06-11, cu_q != cu_k, fully
+  differentiable, MHA + GQA, arbitrary lengths): FA4's bottom-right
+  diagonal (row i attends j <= i + offs, offs = slk - slq); v1
+  envelope adds slq <= slk per sequence under causal (slq > slk
+  would need empty-row out=0/lse=-inf handling). fwd: varlen causal
+  now ALWAYS uses the band-mask arm (the offset shifts the diagonal
+  off the n == m tile and the band can straddle 2 tiles when
+  offs % BN != 0) with causal_mask_d = n*BN - m*BM - offs and trip
+  clamp ceil(((m+1)*BM + offs)/BN); ragged-tail subsumption
+  generalizes (garbage j >= slk is attended only by i >= slq). bwd:
+  host m_start = max(0, (n*BN - offs))//BM; S^T mask mask_dv =
+  (m_start*BM - n*BN + offs) + it*BM, guard mask_dv < BN (self-attn
+  degenerates to it < BN/BM exactly). Self-attn re-bench after the
+  generalization: fwd 0.980x / bwd 1.005x — unchanged parity; dense
+  + varlen-non-causal byte-identical. LESSON: flash_attn_ref's SDPA
+  fast path was WRONG for cross lengths (torch is_causal is
+  TOP-LEFT aligned; FA semantics + the ref's own LSE are
+  bottom-right `triu(Lk-Lq+1)`) — cross-length causal now routes
+  through the explicit-mask branch. The exact-LSE/wrong-out failure
+  signature identifies reference-vs-kernel mask-alignment splits.
+  DEFERRED from this task: seqused_q/seqused_k.
+
 - SOFTCAP (2026-06-11, Gemma-2, fully differentiable, composes
   with causal/window/GQA — the causal+SWA+softcap Gemma-2 layer
   config is tested end-to-end): mojo is FAR past parity — fwd

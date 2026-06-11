@@ -326,6 +326,7 @@ def bwd_main_kernel[
     var vl_q_base: Int = 0
     var vl_mpad_base: Int = 0
     var vl_kv_tail: Int = 0
+    var vl_mask_base: Int = 0
     comptime if varlen:
         # Host kv-tile work table, one int32[8] row per CTA:
         # (n_block, q_row_base, k_row_base, seqlen_q, seqlen_k,
@@ -347,6 +348,16 @@ def bwd_main_kernel[
         b_idx = 0
         kv_row = vl_k_base + n_block * BN
         vl_kv_tail = vl_slk - n_block * BN  # >= BN on full tiles
+        comptime if causal:
+            # Cross-attention diagonal (bottom-right, FA4): kv row
+            # j receives gradient from q cols i >= j - offs (offs =
+            # slk - slq; host-asserted slq <= slk). The S^T mask
+            # base for trip 0 — self-attn (offs == 0, m_start*BM ==
+            # n*BN) reduces to 0, i.e. mask_d = it*BM as in dense.
+            var vl_slq: Int = Int(warp.broadcast(tbl[3]))
+            vl_mask_base = (
+                m_start * BM - n_block * BN + (vl_slk - vl_slq)
+            )
     else:
         n_block = Int(block_idx.x)
         h_idx = Int(block_idx.y)
@@ -765,18 +776,37 @@ def bwd_main_kernel[
                 s_reg.ptr[c] = tanh(s_reg.ptr[c] * t_scale)
 
         comptime if causal:
-            if it < BN // BM:
-                var mask_d: Int = it * BM
-                var mrow_lo: Int = (
-                    wg * WGMMA_M + warp_in_wg * 16 + lane_group
-                )
-                comptime for c in range(c_frag_sdp):
-                    comptime ccol_base: Int = (c // 4) * 8 + (c & 1)
-                    comptime crow_off: Int = 8 if (c % 4) >= 2 else 0
-                    if mrow_lo + crow_off > (
-                        ccol_base + 2 * lane_pair + mask_d
-                    ):
-                        s_reg.ptr[c] = Scalar[accum_type](-1.0e30)
+            comptime if varlen:
+                # Cross-attention general form: masked iff kv_abs >
+                # q_abs + offs, i.e. mrow > ccol + (vl_mask_base +
+                # it*BM). Self-attn: vl_mask_base == 0 and the guard
+                # degenerates to it < BN//BM as in dense; cross
+                # offsets shift which trips the band lands on.
+                var mask_dv: Int = vl_mask_base + it * BM
+                if mask_dv < BN:
+                    var vrow_lo: Int = (
+                        wg * WGMMA_M + warp_in_wg * 16 + lane_group
+                    )
+                    comptime for c in range(c_frag_sdp):
+                        comptime vcol_base: Int = (c // 4) * 8 + (c & 1)
+                        comptime vrow_off: Int = 8 if (c % 4) >= 2 else 0
+                        if vrow_lo + vrow_off > (
+                            vcol_base + 2 * lane_pair + mask_dv
+                        ):
+                            s_reg.ptr[c] = Scalar[accum_type](-1.0e30)
+            else:
+                if it < BN // BM:
+                    var mask_d: Int = it * BM
+                    var mrow_lo: Int = (
+                        wg * WGMMA_M + warp_in_wg * 16 + lane_group
+                    )
+                    comptime for c in range(c_frag_sdp):
+                        comptime ccol_base: Int = (c // 4) * 8 + (c & 1)
+                        comptime crow_off: Int = 8 if (c % 4) >= 2 else 0
+                        if mrow_lo + crow_off > (
+                            ccol_base + 2 * lane_pair + mask_d
+                        ):
+                            s_reg.ptr[c] = Scalar[accum_type](-1.0e30)
 
         comptime if window:
             # Trailing window-edge trips: q cols past kv row +

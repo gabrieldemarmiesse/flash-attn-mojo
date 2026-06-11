@@ -69,9 +69,9 @@ runs packed variable-length attention over `(total_tokens, nheads,
 head_dim)` tensors (FA4's varlen layout, packed `(nheads, total_q)`
 LSE), differentiable end-to-end, with ARBITRARY sequence lengths
 (>= 1 — ragged tails are masked in-kernel and tail tiles stored
-row-predicated). Current varlen envelope: self-attention lengths
-(`cu_seqlens_q == cu_seqlens_k`); the backward additionally requires
-MHA.
+row-predicated), self- OR cross-attention (`cu_seqlens_q !=
+cu_seqlens_k`; causal cross uses the flash-attn bottom-right
+diagonal and requires `seqlen_q <= seqlen_k` per sequence).
 
 ## Install
 

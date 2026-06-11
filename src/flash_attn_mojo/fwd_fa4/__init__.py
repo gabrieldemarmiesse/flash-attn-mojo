@@ -126,7 +126,9 @@ _BLOCK_M = 128  # fwd m-tile (kFa4BlockM)
 
 
 def _build_fwd_tile_table(
-    cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    causal: bool = False,
 ) -> tuple[torch.Tensor, int, int]:
     """Host work-item table: one int32[8] row per CTA m-tile —
     (m_block, q_row_base, k_row_base, seqlen_q, seqlen_k, 0, 0, 0).
@@ -144,6 +146,14 @@ def _build_fwd_tile_table(
     assert bool((seqlens_q > 0).all() and (seqlens_k > 0).all()), (
         "fa4_varlen_fwd needs every sequence length >= 1"
     )
+    if causal:
+        # Bottom-right diagonal: slq > slk would leave the first
+        # (slq - slk) q rows attending nothing (out=0/lse=-inf
+        # semantics) — not in the v1 envelope.
+        assert bool((seqlens_q <= seqlens_k).all()), (
+            "causal varlen cross-attention requires seqlen_q <= "
+            "seqlen_k per sequence"
+        )
     m_counts = (seqlens_q + _BLOCK_M - 1) // _BLOCK_M
     num_tiles = int(m_counts.sum())
     sidx = torch.repeat_interleave(torch.arange(len(seqlens_q)), m_counts)
@@ -176,8 +186,9 @@ def fa4_varlen_fwd(
     q/k/v: (total_tokens, H, D) bf16 contiguous, D=128.
     cu_seqlens_{q,k}: (nseq+1,) int32 CUDA, monotone, [0] == 0.
     Returns (out, lse) with lse (H, total_q) f32 (packed, FA4's
-    varlen layout). Arbitrary sequence lengths >= 1; self-attn
-    lengths (cu_seqlens_q == cu_seqlens_k elementwise).
+    varlen layout). Arbitrary sequence lengths >= 1, self- or
+    cross-attention (causal cross uses FA4's bottom-right diagonal
+    and requires seqlen_q <= seqlen_k per sequence).
     """
     from flash_attn_mojo.fwd_fa4._jit import call_fwd_fa4
 
@@ -199,7 +210,7 @@ def fa4_varlen_fwd(
     assert cu_seqlens_q.shape == cu_seqlens_k.shape
 
     table, num_tiles, max_seqlen_q = _build_fwd_tile_table(
-        cu_seqlens_q, cu_seqlens_k
+        cu_seqlens_q, cu_seqlens_k, causal
     )
 
     out = torch.empty_like(q)

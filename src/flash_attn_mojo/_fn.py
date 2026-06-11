@@ -331,9 +331,11 @@ def flash_attn_varlen_func(
         q, k, v: bf16 CUDA tensors packed as (total_tokens, nheads,
             head_dim) / (total_tokens, nheads_kv, head_dim);
             head_dim=128. Current envelope: arbitrary sequence
-            lengths >= 1, self-attention lengths (cu_seqlens_q ==
-            cu_seqlens_k), MHA or GQA (fully differentiable).
-            Non-CUDA tensors run the pure-PyTorch reference instead.
+            lengths >= 1, self- OR cross-attention (causal cross
+            uses the bottom-right diagonal and requires seqlen_q <=
+            seqlen_k per sequence), MHA or GQA (fully
+            differentiable). Non-CUDA tensors run the pure-PyTorch
+            reference instead.
         cu_seqlens_q, cu_seqlens_k: (nseq+1,) int32 cumulative
             sequence lengths, starting at 0.
         max_seqlen_q, max_seqlen_k: accepted for flash-attn signature
@@ -356,35 +358,44 @@ def flash_attn_varlen_func(
     cu_q_host = cu_seqlens_q.detach().cpu()
     cu_k_host = cu_seqlens_k.detach().cpu()
     seqlens_q = cu_q_host[1:] - cu_q_host[:-1]
+    seqlens_k = cu_k_host[1:] - cu_k_host[:-1]
     if int(cu_q_host[0]) != 0 or int(cu_k_host[0]) != 0:
         raise ValueError("cu_seqlens must start at 0")
-    if bool((seqlens_q < 0).any()):
+    if bool((seqlens_q < 0).any()) or bool((seqlens_k < 0).any()):
         raise ValueError("cu_seqlens must be non-decreasing")
-    if not torch.equal(cu_q_host, cu_k_host):
+    if causal and bool((seqlens_q > seqlens_k).any()):
         raise ValueError(
-            "the current varlen envelope is self-attention only: "
-            "cu_seqlens_q must equal cu_seqlens_k elementwise"
+            "causal varlen cross-attention requires seqlen_q <= "
+            "seqlen_k for every sequence (bottom-right diagonal; "
+            "seqlen_q > seqlen_k would leave query rows attending "
+            "nothing)"
         )
     if int(cu_q_host[-1]) != q.shape[0]:
         raise ValueError(
             f"cu_seqlens_q[-1] ({int(cu_q_host[-1])}) must equal "
-            f"total_tokens ({q.shape[0]})"
+            f"q total_tokens ({q.shape[0]})"
         )
-    if bool((seqlens_q == 0).any()):
+    if int(cu_k_host[-1]) != k.shape[0]:
+        raise ValueError(
+            f"cu_seqlens_k[-1] ({int(cu_k_host[-1])}) must equal "
+            f"k total_tokens ({k.shape[0]})"
+        )
+    if bool((seqlens_q == 0).any()) or bool((seqlens_k == 0).any()):
         raise ValueError(
             "empty (zero-length) sequences are not supported — drop "
             "them from cu_seqlens"
         )
-    max_len = int(seqlens_q.max()) if len(seqlens_q) else 0
-    if max_seqlen_q is not None and max_seqlen_q < max_len:
+    max_len_q = int(seqlens_q.max()) if len(seqlens_q) else 0
+    max_len_k = int(seqlens_k.max()) if len(seqlens_k) else 0
+    if max_seqlen_q is not None and max_seqlen_q < max_len_q:
         raise ValueError(
             f"max_seqlen_q ({max_seqlen_q}) is smaller than the "
-            f"longest sequence ({max_len})"
+            f"longest sequence ({max_len_q})"
         )
-    if max_seqlen_k is not None and max_seqlen_k < max_len:
+    if max_seqlen_k is not None and max_seqlen_k < max_len_k:
         raise ValueError(
             f"max_seqlen_k ({max_seqlen_k}) is smaller than the "
-            f"longest sequence ({max_len})"
+            f"longest sequence ({max_len_k})"
         )
 
     if not q.is_cuda:

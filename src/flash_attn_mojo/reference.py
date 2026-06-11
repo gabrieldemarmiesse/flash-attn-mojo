@@ -60,9 +60,17 @@ def flash_attn_ref(
         k_h = k_h.repeat_interleave(repeat, dim=1)
         v_h = v_h.repeat_interleave(repeat, dim=1)
 
-    if alibi_slopes is not None or softcap > 0 or window_size != (-1, -1):
+    if (
+        alibi_slopes is not None
+        or softcap > 0
+        or window_size != (-1, -1)
+        or (causal and q_h.shape[2] != k_h.shape[2])
+    ):
         # These features aren't supported by torch SDPA — do the
-        # matmul by hand.
+        # matmul by hand. (Cross-length causal too: SDPA's
+        # is_causal is TOP-LEFT aligned for Lq != Lk, but flash-attn
+        # semantics — and the LSE below — use the BOTTOM-RIGHT
+        # diagonal triu(Lk - Lq + 1).)
         scores = torch.matmul(q_h * softmax_scale, k_h.transpose(-1, -2))
 
         if softcap > 0:
