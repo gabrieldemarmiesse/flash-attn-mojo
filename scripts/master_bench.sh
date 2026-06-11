@@ -57,16 +57,18 @@ while [[ $# -gt 0 ]]; do
 done
 
 CSUF="noncausal"; MSUF=""; CFLAG=()
+HDIM="${SHAPE##*,}"
 if [[ "$CAUSAL" == 1 ]]; then CSUF="causal"; MSUF="_causal"; CFLAG=(--causal); fi
 if [[ "$HKV" != 0 ]]; then CSUF="${CSUF}_gqa"; MSUF="${MSUF}_gqa"; CFLAG+=(--hkv "$HKV"); fi
 if [[ "$VARLEN" == 1 ]]; then CSUF="${CSUF}_varlen"; MSUF="${MSUF}_varlen"; CFLAG+=(--varlen); fi
+if [[ "$HDIM" != 128 ]]; then MSUF="${MSUF}_hd${HDIM}"; fi
 if [[ "$KIND" == "fwd" ]]; then
-    FA4_PTX="$ROOT/reference_ptx/fa4_fwd_sm90_bf16_hdim128_${CSUF}.ptx"
+    FA4_PTX="$ROOT/reference_ptx/fa4_fwd_sm90_bf16_hdim${HDIM}_${CSUF}.ptx"
     MOJO_PTX="$ROOT/ptx/mojo_fwd_fa4${MSUF}.ptx"
     FA4_NCU_FILTER='FlashAttentionForwardSm90'
     MOJO_NCU_FILTER='fwd_fa4_kernel'
 else
-    FA4_PTX="$ROOT/reference_ptx/fa4_bwd_sm90_bf16_hdim128_${CSUF}.ptx"
+    FA4_PTX="$ROOT/reference_ptx/fa4_bwd_sm90_bf16_hdim${HDIM}_${CSUF}.ptx"
     MOJO_PTX="$ROOT/ptx/mojo_bwd_fa4${MSUF}.ptx"
     # ncu compares the *main* bwd kernel (>95% of bwd time).
     FA4_NCU_FILTER='FlashAttentionBackwardSm90'
