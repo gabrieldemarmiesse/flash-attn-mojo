@@ -18,6 +18,7 @@ comptime DTYPE: DType = get_defined_dtype["DTYPE", DType.bfloat16]()
 comptime HEAD_DIM: Int = get_defined_int["HEAD_DIM"]()
 comptime USE_EXTERNAL_STREAM: Bool = get_defined_bool["USE_EXTERNAL_STREAM"]()
 comptime CAUSAL: Bool = get_defined_bool["CAUSAL", False]()
+comptime GQA_RATIO: Int = get_defined_int["GQA_RATIO", 1]()
 
 
 def flash_attn_fwd_fa4_acquire_ctx(
@@ -45,8 +46,8 @@ def flash_attn_fwd_fa4_variant(
     var o_l_stride: Int = Int(py=args[10])
     var o_h_stride: Int = Int(py=args[11])
     var stream_handle_addr: Int = Int(py=args[12])
-    # args[13..16] are comptime gates (read via get_defined_*).
-    var ctx_handle_addr: Int = Int(py=args[17])
+    # args[13..17] are comptime gates (read via get_defined_*).
+    var ctx_handle_addr: Int = Int(py=args[18])
 
     if batch_int == 0 or seqlen_int == 0 or nheads_int == 0:
         return PythonObject(None)
@@ -56,6 +57,7 @@ def flash_attn_fwd_fa4_variant(
         HEAD_DIM,
         USE_EXTERNAL_STREAM,
         CAUSAL,
+        GQA_RATIO,
     ](
         batch_int,
         seqlen_int,

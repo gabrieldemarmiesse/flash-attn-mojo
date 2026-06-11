@@ -99,6 +99,7 @@ def fwd_fa4_kernel[
     o_tile_shape: IndexList[3],
     o_desc_shape: IndexList[3],
     causal: Bool = False,
+    gqa_ratio: Int = 1,
 ](
     q_tma: TMATensorTile[dtype, 3, q_tile_shape, q_desc_shape],
     k_tma: TMATensorTile[dtype, 3, kv_tile_shape, kv_desc_shape],
@@ -235,7 +236,9 @@ def fwd_fa4_kernel[
                     alignment=128,
                 ](kv_smem_base + slot * kv_slot_size)
                 full[slot].expect_bytes(Int32(BN * D * size_of[dtype]()))
-                k_tma.async_copy_3d(k_st, full[slot], (0, h_idx, row))
+                k_tma.async_copy_3d(
+                    k_st, full[slot], (0, h_idx // gqa_ratio, row)
+                )
 
                 empty[slot + 1].wait(phase)
                 var v_st = LayoutTensor[
@@ -246,7 +249,9 @@ def fwd_fa4_kernel[
                     alignment=128,
                 ](kv_smem_base + (slot + 1) * kv_slot_size)
                 full[slot + 1].expect_bytes(Int32(BN * D * size_of[dtype]()))
-                v_tma.async_copy_3d(v_st, full[slot + 1], (0, h_idx, row))
+                v_tma.async_copy_3d(
+                    v_st, full[slot + 1], (0, h_idx // gqa_ratio, row)
+                )
 
                 row += BN
                 slot += 2

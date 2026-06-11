@@ -9,7 +9,7 @@ errors):
     * seqlen % 128 == 0
     * causal or non-causal (both at FA4 kernel-time parity, fwd
       and bwd); no dropout/window/alibi
-    * Hq == Hk (no MQA/GQA)
+    * MHA or GQA (Hq % Hkv == 0)
     * CUDA sm90 (Hopper)
 
 Non-CUDA tensors fall through to `flash_attn_ref` (pure-PyTorch SDPA,
@@ -42,7 +42,7 @@ def _check_envelope(
             f"q must be (batch, seqlen, nheads, head_dim), got "
             f"{tuple(q.shape)}"
         )
-    _batch, seqlen, _nheads, head_dim = q.shape
+    _batch, seqlen, _nheads, head_dim = q.shape  # noqa: F841
     if q.dtype != torch.bfloat16:
         raise ValueError(f"only bf16 is supported, got {q.dtype}")
     if head_dim != _SUPPORTED_HEAD_DIM:
@@ -55,9 +55,20 @@ def _check_envelope(
             f"seqlen must be a multiple of {_SEQLEN_MULTIPLE}, got "
             f"{seqlen}"
         )
-    if k.shape != q.shape or v.shape != q.shape:
+    batch, _, nheads_kv, hd_kv = (
+        k.shape if k.dim() == 4 else (0, 0, 0, 0)
+    )
+    if (
+        k.dim() != 4
+        or v.shape != k.shape
+        or k.shape[0] != q.shape[0]
+        or k.shape[1] != seqlen
+        or hd_kv != head_dim
+        or _nheads % max(nheads_kv, 1) != 0
+    ):
         raise ValueError(
-            "k and v must match q's shape (Hq == Hk; no MQA/GQA): "
+            "k/v must be (batch, seqlen, nheads_kv, head_dim) with "
+            "Hq % Hkv == 0 (MHA or GQA): "
             f"q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
         )
     if k.dtype != q.dtype or v.dtype != q.dtype:
@@ -101,9 +112,10 @@ def flash_attn_func(
     """Scaled-dot-product attention via the FA4-class Mojo kernels.
 
     Args:
-        q, k, v: (batch, seqlen, nheads, head_dim) bf16 CUDA tensors
-            (head_dim=128, seqlen % 128 == 0, Hq == Hk). Non-CUDA
-            tensors run the pure-PyTorch reference instead.
+        q, k, v: bf16 CUDA tensors, q (batch, seqlen, nheads,
+            head_dim), k/v (batch, seqlen, nheads_kv, head_dim) with
+            Hq % Hkv == 0 (head_dim=128, seqlen % 128 == 0).
+            Non-CUDA tensors run the pure-PyTorch reference instead.
         softmax_scale: defaults to head_dim**-0.5.
         causal: causal masking (fully differentiable).
         return_lse: also return the (batch, nheads, seqlen) fp32
@@ -117,12 +129,17 @@ def flash_attn_func(
         softmax_scale = q.shape[-1] ** -0.5
 
     if not q.is_cuda:
+        g = q.shape[2] // k.shape[2]
+        k_r = k.repeat_interleave(g, dim=2) if g > 1 else k
+        v_r = v.repeat_interleave(g, dim=2) if g > 1 else v
         out = flash_attn_ref(
-            q, k, v, softmax_scale=softmax_scale, causal=causal
+            q, k_r, v_r, softmax_scale=softmax_scale, causal=causal
         )
         if return_lse:
             scores = (
-                torch.einsum("bshd,bthd->bhst", q.float(), k.float())
+                torch.einsum(
+                    "bshd,bthd->bhst", q.float(), k_r.float()
+                )
                 * softmax_scale
             )
             if causal:

@@ -140,6 +140,7 @@ def bwd_main_kernel[
     st_tile_shape: IndexList[3],
     st_desc_shape: IndexList[3],
     causal: Bool = False,
+    gqa_ratio: Int = 1,
 ](
     q_tma: TMATensorTile[dtype, 3, q_tile_shape, q_desc_shape],
     do_tma: TMATensorTile[dtype, 3, q_tile_shape, q_desc_shape],
@@ -150,6 +151,8 @@ def bwd_main_kernel[
     lse_log2_ptr: UnsafePointer[Float32, ImmutAnyOrigin],
     dpsum_ptr: UnsafePointer[Float32, ImmutAnyOrigin],
     dq_accum_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    dk_accum_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    dv_accum_ptr: UnsafePointer[Float32, MutAnyOrigin],
     seq_len: Int,
     softmax_scale: Float32,
 ):
@@ -321,9 +324,13 @@ def bwd_main_kernel[
             var lane: Int = Int(thread_idx.x)
             if lane == 0:
                 mbar_k[0].expect_bytes(Int32(BN * D * size_of[dtype]()))
-                k_tma.async_copy_3d(k_smem, mbar_k[0], (0, h_idx, kv_row))
+                k_tma.async_copy_3d(
+                    k_smem, mbar_k[0], (0, h_idx // gqa_ratio, kv_row)
+                )
                 mbar_v[0].expect_bytes(Int32(BN * D * size_of[dtype]()))
-                v_tma.async_copy_3d(v_smem, mbar_v[0], (0, h_idx, kv_row))
+                v_tma.async_copy_3d(
+                    v_smem, mbar_v[0], (0, h_idx // gqa_ratio, kv_row)
+                )
 
             var slot: Int = 0
             var phase: UInt32 = 0
@@ -867,6 +874,65 @@ def bwd_main_kernel[
     # 16384 B never touch addr bits 7-9).
     var scale_acc: Scalar[accum_type] = softmax_scale.cast[accum_type]()
 
+    comptime if gqa_ratio > 1:
+        # GQA epilogue: multiple q-head CTAs accumulate into the same
+        # kv-head's dK/dV (FA4's fp32-accum + postprocess design).
+        # Stage each tensor as a row-major 128x128 f32 tile in the
+        # dead K+V smem (exactly 64 KiB) and bulk-reduce-add it into
+        # the per-kv-head accumulator; a torch permute-cast converts.
+        comptime for c in range(c_frag_dkv):
+            dk_acc.ptr[c] *= scale_acc
+        var acc32 = k_base.bitcast[Float32]()
+        var kv_acc_base: Int = (
+            (b_idx * (Int(grid_dim.y) // gqa_ratio) + h_idx // gqa_ratio)
+            * seq_len
+            + n_block * BN
+        ) * D * 4
+        comptime for t in range(2):  # 0 = dV, 1 = dK
+            comptime for c2 in range(c_frag_dkv // 2):
+                comptime g_chunk: Int = c2 // 2
+                comptime g_bot: Int = c2 % 2
+                var g_row: Int = (
+                    wg * WGMMA_M + warp_in_wg * 16 + lane_group
+                    + (8 if g_bot == 1 else 0)
+                )
+                var g_col: Int = g_chunk * 8 + 2 * lane_pair
+                var g_pr: SIMD[accum_type, 2]
+                comptime if t == 0:
+                    g_pr = SIMD[accum_type, 2](
+                        dv_acc.ptr[2 * c2], dv_acc.ptr[2 * c2 + 1]
+                    )
+                else:
+                    g_pr = SIMD[accum_type, 2](
+                        dk_acc.ptr[2 * c2], dk_acc.ptr[2 * c2 + 1]
+                    )
+                (acc32 + g_row * D + g_col).store[width=2, alignment=8](
+                    g_pr
+                )
+            fence_async_view_proxy()
+            named_barrier[Int32(NWG * 128)](Int32(4))
+            if thread_idx.x == 128:
+                inlined_assembly[
+                    "cp.reduce.async.bulk.global.shared::cta"
+                    + ".bulk_group.add.f32 [$0], [$1], $2;",
+                    NoneType,
+                    constraints="l,r,r",
+                ](
+                    Int64(
+                        Int(
+                            dv_accum_ptr if t == 0 else dk_accum_ptr
+                        )
+                        + kv_acc_base
+                    ),
+                    Int32(Int(acc32)),
+                    Int32(BN * D * 4),
+                )
+                cp_async_bulk_commit_group()
+                cp_async_bulk_wait_group[0]()
+            # All threads wait for the bulk read before restaging.
+            named_barrier[Int32(NWG * 128)](Int32(4))
+        return
+
     var st_lane: Int = lane
     var st_row: Int = (
         wg * WGMMA_M + warp_in_wg * 16 + ((st_lane // 8) % 2) * 8
@@ -955,6 +1021,7 @@ def bwd_preprocess_kernel[
     dtype: DType,
     head_dim: Int,
     causal: Bool = False,
+    gqa_ratio: Int = 1,
 ](
     o_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     do_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -962,6 +1029,8 @@ def bwd_preprocess_kernel[
     dpsum_ptr: UnsafePointer[Float32, MutAnyOrigin],
     lse_log2_ptr: UnsafePointer[Float32, MutAnyOrigin],
     dq_accum_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    dk_accum_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    dv_accum_ptr: UnsafePointer[Float32, MutAnyOrigin],
     seq_len: Int,
     nheads: Int,
 ):
@@ -1032,6 +1101,29 @@ def bwd_preprocess_kernel[
                 SIMD[DType.float32, ZVEC](0)
             )
         zoff += ZCHUNK
+
+    # GQA: zero this (b, h_kv) slice of the fp32 dK/dV accumulators
+    # (the main kernel bulk-reduce-ADDS into them). Done by the
+    # h % ratio == 0 grid columns, split across their m-blocks.
+    comptime if gqa_ratio > 1:
+        if h_idx % gqa_ratio == 0:
+            var kvtot: Int = seq_len * D
+            var kvbase: Int = (
+                b_idx * (nheads // gqa_ratio) + h_idx // gqa_ratio
+            ) * kvtot
+            var kpasses: Int = (
+                kvtot + nb * ZCHUNK - 1
+            ) // (nb * ZCHUNK)
+            var koff: Int = m_block * kpasses * ZCHUNK + tid * ZVEC
+            for _ in range(kpasses):
+                if koff < kvtot:
+                    (dk_accum_ptr + kvbase + koff).store[width=ZVEC](
+                        SIMD[DType.float32, ZVEC](0)
+                    )
+                    (dv_accum_ptr + kvbase + koff).store[width=ZVEC](
+                        SIMD[DType.float32, ZVEC](0)
+                    )
+                koff += ZCHUNK
 
 
 # ===================================================================

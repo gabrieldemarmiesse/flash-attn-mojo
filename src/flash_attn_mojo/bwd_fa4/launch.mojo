@@ -63,6 +63,7 @@ def launch_bwd_preprocess[
     head_dim: Int,
     use_external_stream: Bool,
     causal: Bool = False,
+    gqa_ratio: Int = 1,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -73,6 +74,8 @@ def launch_bwd_preprocess[
     dpsum_addr: Int,
     lse_log2_addr: Int,
     dq_accum_addr: Int,
+    dk_accum_addr: Int,
+    dv_accum_addr: Int,
     stream_handle_addr: Int,
     ctx_handle_addr: Int,
 ) raises:
@@ -81,6 +84,12 @@ def launch_bwd_preprocess[
         unsafe_from_address=stream_handle_addr
     )
 
+    var dk_accum_ptr = UnsafePointer[Float32, MutAnyOrigin](
+        unsafe_from_address=dk_accum_addr
+    )
+    var dv_accum_ptr = UnsafePointer[Float32, MutAnyOrigin](
+        unsafe_from_address=dv_accum_addr
+    )
     var o_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=o_addr
     )
@@ -100,7 +109,9 @@ def launch_bwd_preprocess[
         unsafe_from_address=dq_accum_addr
     )
 
-    comptime kernel_inst = bwd_preprocess_kernel[dtype, head_dim, causal]
+    comptime kernel_inst = bwd_preprocess_kernel[
+        dtype, head_dim, causal, gqa_ratio
+    ]
     var compiled = ctx.compile_function[kernel_inst, kernel_inst]()
     # Grid covers Spad rows (side buffers padded to the main-kernel
     # m-block size; pad rows get lse=+inf / dpsum=0).
@@ -124,6 +135,8 @@ def launch_bwd_preprocess[
             dpsum_ptr,
             lse_log2_ptr,
             dq_accum_ptr,
+            dk_accum_ptr,
+            dv_accum_ptr,
             seqlen_int,
             nheads_int,
             grid_dim=grid,
@@ -138,6 +151,8 @@ def launch_bwd_preprocess[
             dpsum_ptr,
             lse_log2_ptr,
             dq_accum_ptr,
+            dk_accum_ptr,
+            dv_accum_ptr,
             seqlen_int,
             nheads_int,
             grid_dim=grid,
@@ -151,6 +166,7 @@ def launch_bwd_main[
     head_dim: Int,
     use_external_stream: Bool,
     causal: Bool = False,
+    gqa_ratio: Int = 1,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -231,6 +247,17 @@ def launch_bwd_main[
     comptime kv_smem_shape = IndexList[3](kBwdBlockN, 1, head_dim)
 
     var rows: Int = batch_int * seqlen_int
+    var nheads_kv: Int = nheads_int // gqa_ratio
+    # Under GQA the dk/dv addresses carry the fp32 per-kv-head
+    # accumulators (the epilogue bulk-reduce-adds into them; a torch
+    # permute-cast converts). The bf16 TMA descriptors below are
+    # then unused by the kernel (comptime-dead store path).
+    var dk_accum_ptr = UnsafePointer[Float32, MutAnyOrigin](
+        unsafe_from_address=dk_addr
+    )
+    var dv_accum_ptr = UnsafePointer[Float32, MutAnyOrigin](
+        unsafe_from_address=dv_addr
+    )
     var q_tma = create_split_tma[
         q_smem_shape, gmem_shape, swizzle_mode=swizzle
     ](ctx, q_ptr, rows, nheads_int)
@@ -239,16 +266,16 @@ def launch_bwd_main[
     ](ctx, do_ptr, rows, nheads_int)
     var k_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
-    ](ctx, k_ptr, rows, nheads_int)
+    ](ctx, k_ptr, rows, nheads_kv)
     var v_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
-    ](ctx, v_ptr, rows, nheads_int)
+    ](ctx, v_ptr, rows, nheads_kv)
     var dk_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
-    ](ctx, dk_ptr, rows, nheads_int)
+    ](ctx, dk_ptr, rows, nheads_kv)
     var dv_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
-    ](ctx, dv_ptr, rows, nheads_int)
+    ](ctx, dv_ptr, rows, nheads_kv)
 
     comptime kernel_inst = bwd_main_kernel[
         dtype,
@@ -260,6 +287,7 @@ def launch_bwd_main[
         type_of(dk_tma).tile_shape,
         type_of(dk_tma).desc_shape,
         causal,
+        gqa_ratio,
     ]
 
     var compiled = ctx.compile_function[
@@ -291,6 +319,8 @@ def launch_bwd_main[
             lse_log2_ptr,
             dpsum_ptr,
             dq_accum_ptr,
+            dk_accum_ptr,
+            dv_accum_ptr,
             seqlen_int,
             softmax_scale,
             grid_dim=grid,
@@ -309,6 +339,8 @@ def launch_bwd_main[
             lse_log2_ptr,
             dpsum_ptr,
             dq_accum_ptr,
+            dk_accum_ptr,
+            dv_accum_ptr,
             seqlen_int,
             softmax_scale,
             grid_dim=grid,
@@ -323,6 +355,7 @@ def launch_bwd_convert[
     head_dim: Int,
     use_external_stream: Bool,
     causal: Bool = False,
+    gqa_ratio: Int = 1,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -350,6 +383,7 @@ def launch_bwd_convert[
     comptime cvt_smem_bytes: Int = bm_cvt * (head_dim + 4) * 4
 
     comptime kernel_inst = bwd_convert_kernel[dtype, head_dim, causal]
+    _ = gqa_ratio  # dq convert is ratio-independent
     var compiled = ctx.compile_function[kernel_inst, kernel_inst](
         func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
             UInt32(cvt_smem_bytes)

@@ -56,10 +56,13 @@ def native_fwd_fa4(
     from flash_attn_mojo.fwd_fa4._jit import call_fwd_fa4
 
     batch, seqlen, nheads, head_dim = q.shape
-    assert q.dtype == torch.bfloat16, "fwd_fa4 v1 is bf16-only"
-    assert head_dim == 128, "fwd_fa4 v1 is head_dim=128-only"
-    assert seqlen % _BLOCK_N == 0, "fwd_fa4 v1 needs seqlen % 128 == 0"
-    assert k.shape == q.shape and v.shape == q.shape, "Hq must equal Hk in v1"
+    nheads_kv = k.shape[2]
+    assert q.dtype == torch.bfloat16, "fwd_fa4 is bf16-only"
+    assert head_dim == 128, "fwd_fa4 is head_dim=128-only"
+    assert seqlen % _BLOCK_N == 0, "fwd_fa4 needs seqlen % 128 == 0"
+    assert k.shape == (batch, seqlen, nheads_kv, head_dim)
+    assert v.shape == k.shape
+    assert nheads % nheads_kv == 0, "Hq must be a multiple of Hkv"
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     assert out.is_contiguous()
     assert lse.shape == (batch, nheads, seqlen) and lse.dtype == torch.float32
@@ -84,5 +87,6 @@ def native_fwd_fa4(
             head_dim,
             1,  # use_external_stream
             1 if causal else 0,
+            nheads // nheads_kv,  # gqa_ratio
         )
     )

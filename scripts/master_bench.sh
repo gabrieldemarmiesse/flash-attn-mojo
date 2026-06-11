@@ -28,6 +28,8 @@ cd "$ROOT"
 
 KIND="fwd"
 CAUSAL=0
+HKV=0
+QUICK=0
 SHAPE="2,8192,16,128"
 ITERS=20
 RUN_NCU=1
@@ -39,6 +41,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --kind) KIND="$2"; shift 2 ;;
         --causal) CAUSAL=1; shift ;;
+        --quick) QUICK=1; shift ;;
+        --hkv) HKV="$2"; shift 2 ;;
         --shape) SHAPE="$2"; shift 2 ;;
         --iters) ITERS="$2"; shift 2 ;;
         --no-ncu) RUN_NCU=0; shift ;;
@@ -52,6 +56,7 @@ done
 
 CSUF="noncausal"; MSUF=""; CFLAG=()
 if [[ "$CAUSAL" == 1 ]]; then CSUF="causal"; MSUF="_causal"; CFLAG=(--causal); fi
+if [[ "$HKV" != 0 ]]; then CSUF="${CSUF}_gqa"; MSUF="${MSUF}_gqa"; CFLAG+=(--hkv "$HKV"); fi
 if [[ "$KIND" == "fwd" ]]; then
     FA4_PTX="$ROOT/reference_ptx/fa4_fwd_sm90_bf16_hdim128_${CSUF}.ptx"
     MOJO_PTX="$ROOT/ptx/mojo_fwd_fa4${MSUF}.ptx"
@@ -72,8 +77,13 @@ CHECK_FLAG=(); [[ "$CHECK" == 1 ]] && CHECK_FLAG=(--check)
 step() { printf '\n\033[1m==== %s ====\033[0m\n' "$*"; }
 
 # ---------------------------------------------------------------- 1
-step "1. clear flash_attn_mojo JIT cache + recompile"
-rm -rf ~/.cache/flash_attn_mojo
+if [[ "$QUICK" == 1 ]]; then
+    step "1. quick mode: keeping JIT cache, skipping checks"
+    CHECK_FLAG=()
+else
+    step "1. clear flash_attn_mojo JIT cache + recompile"
+    rm -rf ~/.cache/flash_attn_mojo
+fi
 # ------------------------------------------------------------- 2+3
 # A single bench run compiles the kernel (cache was just cleared),
 # dumps its PTX (MOJO_DUMP_PTX define), checks correctness vs fp32

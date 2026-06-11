@@ -14,6 +14,14 @@ run-to-run variance (locked clocks, interleaved):
 - fwd: 2237–2276 µs vs FA4 2206–2255 (1.00–1.03x)
 - bwd: 6148–6250 µs vs FA4 5913–6176 (1.00–1.06x); preprocess and
   dq-convert at parity too.
+- GQA (2026-06-10, Hq % Hkv == 0, fully differentiable; canonical
+  Hq=16/Hkv=4): fwd 1.034x plain / 0.984x causal; bwd 0.980x plain
+  / 1.005x causal. fwd = h_kv = h_q // ratio on the K/V TMA coords
+  (comptime ratio variant). bwd = FA4's fp32-accum design: grid
+  stays per-q-head; the epilogue stages dK/dV as row-major f32 in
+  the dead K+V smem (exactly 64 KiB) and cp.reduce.async.bulk-adds
+  into per-kv-head accumulators (cross-CTA L2 reduction, no
+  atomics); preprocess zeroes them; a torch permute-cast converts.
 - CAUSAL (2026-06-10, both differentiable end-to-end): fwd
   1253–1256 µs vs ~1238 (1.011–1.016x; LPT scheduler was the parity
   gate); bwd 3146–3242 vs 3129–3204 (0.988–1.048x across 6 runs —
@@ -203,8 +211,9 @@ HANDOFF.md and the memory notes):
 
 ## Extending the envelope (if/when)
 
-The natural next features, in rough order of value: other head dims,
-MQA/GQA (Hk < Hq indexing on the K/V TMA coords), varlen. The
+The natural next features, in rough order of value: varlen
+(cu_seqlens; the big one for packed training), other head dims,
+arbitrary seqlen. The
 FA4-class algorithm core (warp specialization, tile_m=80 bwd, the
 mailbox dQ drain) carries over; these are predicate/indexing
 variations. Keep every change inside the measurement protocol above

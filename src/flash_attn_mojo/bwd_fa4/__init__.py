@@ -45,21 +45,42 @@ def bwd_fa4(
     )
 
     batch, seqlen, nheads, head_dim = q.shape
+    nheads_kv = k.shape[2]
+    gqa_ratio = nheads // nheads_kv
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    assert q.dtype == torch.bfloat16, "bwd_fa4 v1 is bf16-only"
-    assert head_dim == 128, "bwd_fa4 v1 is head_dim=128-only"
-    assert seqlen % _BLOCK == 0, "bwd_fa4 v1 needs seqlen % 128 == 0"
-    assert k.shape == q.shape and v.shape == q.shape, "Hq must equal Hk"
+    assert q.dtype == torch.bfloat16, "bwd_fa4 is bf16-only"
+    assert head_dim == 128, "bwd_fa4 is head_dim=128-only"
+    assert seqlen % _BLOCK == 0, "bwd_fa4 needs seqlen % 128 == 0"
+    assert k.shape == (batch, seqlen, nheads_kv, head_dim)
+    assert v.shape == k.shape
+    assert nheads % nheads_kv == 0, "Hq must be a multiple of Hkv"
     assert lse.shape == (batch, nheads, seqlen) and lse.dtype == torch.float32
     for t in (q, k, v, out, dout):
         assert t.is_contiguous()
     assert lse.is_contiguous()
 
     dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    if gqa_ratio > 1:
+        # fp32 accumulators (B, Hkv, S, D): every q-head CTA of a
+        # group bulk-reduce-adds its dK/dV into them; converted to
+        # bf16 (B, S, Hkv, D) below.
+        dk_accum = torch.empty(
+            (batch, nheads_kv, seqlen, head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        dv_accum = torch.empty_like(dk_accum)
+        dk_main_addr = dk_accum.data_ptr()
+        dv_main_addr = dv_accum.data_ptr()
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+    else:
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        dk_main_addr = dk.data_ptr()
+        dv_main_addr = dv.data_ptr()
     # Causal uses FA4's tile_m=64 (divides any supported seqlen: no
     # padding); non-causal tile_m=80 pads.
     block_m = 64 if causal else _BLOCK_M
@@ -78,7 +99,9 @@ def bwd_fa4(
         device=q.device,
     )
 
-    config = make_config(_DTYPE_CODE[q.dtype], head_dim, True, causal)
+    config = make_config(
+        _DTYPE_CODE[q.dtype], head_dim, True, causal, gqa_ratio
+    )
     stream = torch.cuda.current_stream().cuda_stream
 
     call_bwd_fa4_preprocess(
@@ -92,6 +115,8 @@ def bwd_fa4(
             dpsum.data_ptr(),
             lse_log2.data_ptr(),
             dq_accum.data_ptr(),
+            dk_main_addr if gqa_ratio > 1 else 0,
+            dv_main_addr if gqa_ratio > 1 else 0,
             stream,
         ),
         config,
@@ -106,8 +131,8 @@ def bwd_fa4(
             k.data_ptr(),
             v.data_ptr(),
             dout.data_ptr(),
-            dk.data_ptr(),
-            dv.data_ptr(),
+            dk_main_addr,
+            dv_main_addr,
             lse_log2.data_ptr(),
             dpsum.data_ptr(),
             dq_accum.data_ptr(),
@@ -127,4 +152,10 @@ def bwd_fa4(
         ),
         config,
     )
+    if gqa_ratio > 1:
+        # (B, Hkv, S, D) fp32 -> (B, S, Hkv, D) bf16, one fused
+        # copy-cast each (the timed FA4 path runs its own
+        # postprocess for the same conversion).
+        dk.copy_(dk_accum.permute(0, 2, 1, 3))
+        dv.copy_(dv_accum.permute(0, 2, 1, 3))
     return dq, dk, dv

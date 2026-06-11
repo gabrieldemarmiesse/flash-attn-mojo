@@ -43,6 +43,17 @@ non-causal, torch.profiler CUPTI):
   24x m64n64k16 + 8x m64n128k16 per iteration; plain 3-D grid (no
   LPT for bwd). Target: ~3129–3204 µs main kernel.
 
+## GQA counterparts (2026-06-10, dumped at ratio 4: Hq=16/Hkv=4)
+
+`fa4_{fwd,bwd}_sm90_bf16_hdim128_{causal,noncausal}_gqa.ptx` — same
+tile geometry and TMA structure as the MHA kernels (identical wgmma
+inventories); the deltas are pack-GQA addressing in the fwd and the
+fp32 dK/dV accumulation + postprocess path in the bwd ("multiple Q
+heads accumulate into the same dK/dV"). FA4 GQA targets at the
+canonical shape (locked clocks): fwd 2200 µs / causal 1241; bwd
+6659 / causal 3596 — essentially identical to MHA (GQA is free at
+training shapes).
+
 ## Canonical config ("the simplest call")
 
 ```python

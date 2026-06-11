@@ -46,7 +46,7 @@ def test_envelope_errors():
     with pytest.raises(ValueError, match="multiple"):
         flash_attn_func(q, k, v)
     q, k, v = _qkv()
-    with pytest.raises(ValueError, match="Hq == Hk"):
+    with pytest.raises(ValueError, match="MHA or GQA"):
         flash_attn_func(q, k[:, :, :2], v)
 
 

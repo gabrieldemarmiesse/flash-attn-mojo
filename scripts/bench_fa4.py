@@ -94,14 +94,20 @@ def _get_step(impl: str, kind: str, q, k, v, dout, causal: bool = False):
     return step, lambda: grads["g"]
 
 
+def _rep_kv(t, nheads_q):
+    """repeat_interleave KV heads up to nheads_q (GQA reference)."""
+    g = nheads_q // t.shape[2]
+    return t.repeat_interleave(g, dim=2) if g > 1 else t
+
+
 def _sdpa_fp32(q, k, v, causal: bool = False):
     import torch.nn.functional as F
 
     return (
         F.scaled_dot_product_attention(
             q.transpose(1, 2).float(),
-            k.transpose(1, 2).float(),
-            v.transpose(1, 2).float(),
+            _rep_kv(k, q.shape[2]).transpose(1, 2).float(),
+            _rep_kv(v, q.shape[2]).transpose(1, 2).float(),
             is_causal=causal,
         )
         .transpose(1, 2)
@@ -109,11 +115,22 @@ def _sdpa_fp32(q, k, v, causal: bool = False):
 
 
 def _check_small(
-    impl: str, kind: str, D: int, seqlen: int = 512, causal: bool = False
+    impl: str,
+    kind: str,
+    D: int,
+    seqlen: int = 512,
+    causal: bool = False,
+    hkv: int = 0,
 ) -> None:
     torch.manual_seed(1)
-    qs = torch.randn(2, seqlen, 4, D, dtype=torch.bfloat16, device="cuda")
-    ks, vs = torch.randn_like(qs), torch.randn_like(qs)
+    hq = 4
+    qs = torch.randn(2, seqlen, hq, D, dtype=torch.bfloat16, device="cuda")
+    h_kv = hkv if hkv else hq
+    # small-shape GQA uses ratio Hq/Hkv = 4/2 when --hkv is set
+    if hkv:
+        h_kv = 2
+    ks = torch.randn(2, seqlen, h_kv, D, dtype=torch.bfloat16, device="cuda")
+    vs = torch.randn_like(ks)
     if kind == "fwd":
         step, outputs = _get_step(impl, "fwd", qs, ks, vs, None, causal)
         step()
@@ -121,7 +138,12 @@ def _check_small(
         d = (out.float() - _sdpa_fp32(qs, ks, vs, causal)).abs().max().item()
         scale = qs.shape[-1] ** -0.5
         scores = (
-            torch.einsum("bshd,bthd->bhst", qs.float(), ks.float()) * scale
+            torch.einsum(
+                "bshd,bthd->bhst",
+                qs.float(),
+                _rep_kv(ks, qs.shape[2]).float(),
+            )
+            * scale
         )
         if causal:
             s_q = scores.shape[-2]
@@ -148,7 +170,9 @@ def _check_small(
     import torch.nn.functional as F
 
     of = F.scaled_dot_product_attention(
-        qf.transpose(1, 2), kf.transpose(1, 2), vf.transpose(1, 2),
+        qf.transpose(1, 2),
+        _rep_kv(kf, qf.shape[2]).transpose(1, 2),
+        _rep_kv(vf, qf.shape[2]).transpose(1, 2),
         is_causal=causal,
     ).transpose(1, 2)
     of.backward(dos.float())
@@ -196,6 +220,12 @@ def main() -> None:
         help="no timing; bracket capture iters with cudaProfilerStart/Stop",
     )
     p.add_argument("--causal", action="store_true")
+    p.add_argument(
+        "--hkv",
+        type=int,
+        default=0,
+        help="KV heads (GQA); 0 = same as Hq (MHA)",
+    )
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -207,13 +237,15 @@ def main() -> None:
         # the others all leave a partial tail m-tile (S % 80 != 0).
         for s_len in (128, 256, 640, 1024):
             _check_small(
-                args.impl, args.kind, D, seqlen=s_len, causal=args.causal
+                args.impl, args.kind, D, seqlen=s_len,
+                causal=args.causal, hkv=args.hkv,
             )
         return
 
     q = torch.randn(B, S, H, D, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
+    h_kv = args.hkv if args.hkv else H
+    k = torch.randn(B, S, h_kv, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn_like(k)
     dout = torch.randn_like(q) if args.kind == "bwd" else None
 
     step, outputs = _get_step(
@@ -225,7 +257,9 @@ def main() -> None:
     torch.cuda.synchronize()
 
     if args.check:
-        _check_small(args.impl, args.kind, D, causal=args.causal)
+        _check_small(
+            args.impl, args.kind, D, causal=args.causal, hkv=args.hkv
+        )
         if args.impl == "mojo":
             ref_step, ref_outputs = _get_step(
                 "fa4", args.kind, q, k, v, dout, args.causal
@@ -280,6 +314,7 @@ def main() -> None:
     print(
         f"RESULT impl={args.impl} kind={args.kind} "
         f"shape={B},{S},{H},{D} causal={int(args.causal)} "
+        f"hkv={h_kv} "
         f"us={us:.1f} tflops={tflops:.1f}"
     )
     for e in sorted(

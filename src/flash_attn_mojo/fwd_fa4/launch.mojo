@@ -45,6 +45,7 @@ def launch_fwd_fa4[
     head_dim: Int,
     use_external_stream: Bool,
     causal: Bool = False,
+    gqa_ratio: Int = 1,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -106,12 +107,13 @@ def launch_fwd_fa4[
     var q_tma = create_split_tma[
         q_smem_shape, gmem_shape, swizzle_mode=swizzle
     ](ctx, q_ptr, rows, nheads_int)
+    var nheads_kv: Int = nheads_int // gqa_ratio
     var k_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
-    ](ctx, k_ptr, rows, nheads_int)
+    ](ctx, k_ptr, rows, nheads_kv)
     var v_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
-    ](ctx, v_ptr, rows, nheads_int)
+    ](ctx, v_ptr, rows, nheads_kv)
     # O store descriptor: unswizzled, so the kernel can stage O in a
     # plain row-major smem tile (one whole-tile bulk store).
     var o_imm_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
@@ -131,6 +133,7 @@ def launch_fwd_fa4[
         type_of(o_tma).tile_shape,
         type_of(o_tma).desc_shape,
         causal,
+        gqa_ratio,
     ]
 
     var compiled = ctx.compile_function[

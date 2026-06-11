@@ -15,6 +15,8 @@ FA4's kernel time within run-to-run variance:
 | bwd          | 6148–6250   | 5913–6176   | 1.00–1.06x  |
 | fwd (causal) | 1253–1256   | ~1238       | 1.01–1.02x  |
 | bwd (causal) | 3146–3242   | 3129–3204   | 0.99–1.05x  |
+| fwd (GQA 4x) | 2253 / 1221 | 2201 / 1240 | 1.03 / 0.98x (plain/causal) |
+| bwd (GQA 4x) | 6526 / 3615 | 6659 / 3596 | 0.98 / 1.01x (plain/causal) |
 
 (Locked clocks, interleaved kernel-only CUPTI timing; both kernels
 wobble ~2–4% run to run. The bwd main loop executes 448
@@ -31,7 +33,8 @@ fp32 precision.
 return_lse=False)` with:
 
 - bf16, contiguous `(batch, seqlen, nheads, head_dim)`
-- `head_dim == 128`, `seqlen % 128 == 0`, `Hq == Hk`
+- `head_dim == 128`, `seqlen % 128 == 0`, MHA or GQA
+  (`Hq % Hkv == 0`)
 - causal or non-causal (both differentiable, both at parity); no
   dropout / windows / ALiBi
 - CUDA sm90 (Hopper); non-CUDA tensors run a pure-PyTorch reference

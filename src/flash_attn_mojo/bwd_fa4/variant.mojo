@@ -18,6 +18,7 @@ comptime DTYPE: DType = get_defined_dtype["DTYPE", DType.bfloat16]()
 comptime HEAD_DIM: Int = get_defined_int["HEAD_DIM"]()
 comptime USE_EXTERNAL_STREAM: Bool = get_defined_bool["USE_EXTERNAL_STREAM"]()
 comptime CAUSAL: Bool = get_defined_bool["CAUSAL", False]()
+comptime GQA_RATIO: Int = get_defined_int["GQA_RATIO", 1]()
 
 
 def flash_attn_bwd_fa4_acquire_ctx(
@@ -32,7 +33,7 @@ def flash_attn_bwd_fa4_preprocess(
     mut py_self: PythonObject,
     mut args: PythonObject,
 ) raises -> PythonObject:
-    launch_bwd_preprocess[DTYPE, HEAD_DIM, USE_EXTERNAL_STREAM, CAUSAL](
+    launch_bwd_preprocess[DTYPE, HEAD_DIM, USE_EXTERNAL_STREAM, CAUSAL, GQA_RATIO](
         Int(py=args[0]),  # batch
         Int(py=args[1]),  # seqlen
         Int(py=args[2]),  # nheads
@@ -42,8 +43,10 @@ def flash_attn_bwd_fa4_preprocess(
         Int(py=args[6]),  # dpsum_addr
         Int(py=args[7]),  # lse_log2_addr
         Int(py=args[8]),  # dq_accum_addr
-        Int(py=args[9]),  # stream
-        Int(py=args[10]),  # ctx handle
+        Int(py=args[9]),  # dk_accum_addr (GQA; 0 otherwise)
+        Int(py=args[10]),  # dv_accum_addr (GQA; 0 otherwise)
+        Int(py=args[11]),  # stream
+        Int(py=args[12]),  # ctx handle
     )
     return PythonObject(None)
 
@@ -52,7 +55,7 @@ def flash_attn_bwd_fa4_main(
     mut py_self: PythonObject,
     mut args: PythonObject,
 ) raises -> PythonObject:
-    launch_bwd_main[DTYPE, HEAD_DIM, USE_EXTERNAL_STREAM, CAUSAL](
+    launch_bwd_main[DTYPE, HEAD_DIM, USE_EXTERNAL_STREAM, CAUSAL, GQA_RATIO](
         Int(py=args[0]),  # batch
         Int(py=args[1]),  # seqlen
         Int(py=args[2]),  # nheads
@@ -76,7 +79,7 @@ def flash_attn_bwd_fa4_convert(
     mut py_self: PythonObject,
     mut args: PythonObject,
 ) raises -> PythonObject:
-    launch_bwd_convert[DTYPE, HEAD_DIM, USE_EXTERNAL_STREAM, CAUSAL](
+    launch_bwd_convert[DTYPE, HEAD_DIM, USE_EXTERNAL_STREAM, CAUSAL, GQA_RATIO](
         Int(py=args[0]),  # batch
         Int(py=args[1]),  # seqlen
         Int(py=args[2]),  # nheads
