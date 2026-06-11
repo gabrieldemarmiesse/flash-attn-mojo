@@ -57,7 +57,9 @@ from std.gpu.memory import (
     fence_async_view_proxy,
 )
 from std.gpu.sync import named_barrier, named_barrier_arrive
-from std.memory import stack_allocation
+from std.memory import bitcast, stack_allocation
+
+from std.gpu.compute.mma import st_matrix
 
 from layout import Layout, LayoutTensor
 from layout.tensor_core_async import (
@@ -564,39 +566,38 @@ def fwd_fa4_kernel[
         comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
         o_reg.ptr[c] *= inv_rowsum[row_idx]
 
-    # ---- Store: stage O in smem (reusing the dead Q tile region)
-    # and TMA bulk-store the whole tile. The unswizzled O descriptor
-    # copies in 16B chunks along D (desc_shape = (BM, 1, 8)), chunk
-    # j contiguous at offset j*BM*8: smem offset of (row, col) =
-    # (col/8)*BM*8 + row*8 + col%8. A warp's 32-bit paired stores
-    # land 512B-contiguous -> conflict-free. c-frag walk: col_chunk
-    # = c/4 covers cols [8*col_chunk, 8*col_chunk+8) = exactly one
-    # 16B chunk.
-    var o_smem = LayoutTensor[
-        dtype,
-        Layout.row_major(BM, D),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-        alignment=128,
-    ](smem_base)
-
+    # ---- Store: stmatrix-stage O into the dead Q tile (same SW128
+    # k-major layout it was loaded with — the bwd dK/dV epilogue's
+    # scheme) and issue ONE whole-tile TMA store. 8x stmatrix.x4
+    # (non-trans) per thread; the 128B swizzle XOR is taken from the
+    # ABSOLUTE address and re-applied per call (32-B column steps
+    # live in the swizzled bits 4-6).
     var lane: Int = Int(lane_id())
     var warp_in_wg: Int = Int(warp_id()) % 4
     var lane_group: Int = lane // 4
     var lane_pair: Int = lane % 4
     var row_warp_base: Int = wg * WGMMA_M + warp_in_wg * 16
 
-    comptime for c2 in range(c_frag_size_pv // 2):
-        comptime col_chunk: Int = c2 // 2
-        comptime is_bot: Int = c2 % 2
-        var row: Int = row_warp_base + lane_group + (8 if is_bot == 1 else 0)
-        var pair = SIMD[dtype, 2](
-            o_reg.ptr[2 * c2].cast[dtype](),
-            o_reg.ptr[2 * c2 + 1].cast[dtype](),
+    var st_row: Int = (
+        row_warp_base + ((lane // 8) % 2) * 8 + (lane % 8)
+    )
+    var st_off_raw: Int = st_row * 64 + (lane // 16) * 8
+    var o_raw: Int = Int(smem_base) + 2 * st_off_raw
+    comptime for i in range(c_frag_size_pv // 8):
+        var packed = SIMD[DType.float32, 4](0)
+        comptime for jm in range(4):
+            comptime p: Int = 4 * i + jm
+            packed[jm] = bitcast[DType.float32, 1](
+                SIMD[accum_type, 2](
+                    o_reg.ptr[2 * p], o_reg.ptr[2 * p + 1]
+                ).cast[dtype]()
+            )
+        var raw_i: Int = o_raw + (i % 4) * 32 + (i // 4) * (BM * 128)
+        var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
+        st_matrix[simd_width=4](
+            smem_base + ((sw_i >> 1) - (Int(smem_base) >> 1)),
+            packed,
         )
-        (
-            o_smem.ptr + col_chunk * (BM * 8) + row * 8 + 2 * lane_pair
-        ).store[width=2, alignment=4](pair)
 
     # ---- LSE (natural log), one f32 per row: rowmax is kept in the
     # scaled log2 domain (max*scale*log2e) and rowsum is already
@@ -621,13 +622,20 @@ def fwd_fa4_kernel[
     # (id 3: ids 1-2 are the scheduler pingpong barriers.)
     named_barrier[Int32(NWG * 128)](Int32(3))
     if thread_idx.x == 128:
+        var o_st = LayoutTensor[
+            dtype,
+            q_smem_layout,
+            MutAnyOrigin,
+            address_space=AddressSpace.SHARED,
+            alignment=128,
+        ](smem_base)
         comptime if varlen:
             o_tma.async_store_3d(
-                o_smem, (0, h_idx, vl_q_base + m_block * BM)
+                o_st, (0, h_idx, vl_q_base + m_block * BM)
             )
         else:
             o_tma.async_store_3d(
-                o_smem, (0, h_idx, b_idx * seq_len + m_block * BM)
+                o_st, (0, h_idx, b_idx * seq_len + m_block * BM)
             )
         o_tma.commit_group()
         o_tma.wait_group()

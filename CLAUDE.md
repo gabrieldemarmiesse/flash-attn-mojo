@@ -11,7 +11,8 @@ contiguous, seqlen % 128 == 0, Hq == Hk. Canonical benchmark shape:
 **B=2, S=8192, H=16, D=128**. Both kernels are AT PARITY within
 run-to-run variance (locked clocks, interleaved):
 
-- fwd: 2237–2276 µs vs FA4 2206–2255 (1.00–1.03x)
+- fwd: 0.991–0.992x (mojo FASTER; 2226 µs vs FA4 2202 after the
+  2026-06-11 O-store epilogue fix — see below)
 - bwd: 6148–6250 µs vs FA4 5913–6176 (1.00–1.06x); preprocess and
   dq-convert at parity too.
 - GQA (2026-06-10, Hq % Hkv == 0, fully differentiable; canonical
@@ -22,8 +23,8 @@ run-to-run variance (locked clocks, interleaved):
   the dead K+V smem (exactly 64 KiB) and cp.reduce.async.bulk-adds
   into per-kv-head accumulators (cross-CTA L2 reduction, no
   atomics); preprocess zeroes them; a torch permute-cast converts.
-- CAUSAL (2026-06-10, both differentiable end-to-end): fwd
-  1253–1256 µs vs ~1238 (1.011–1.016x; LPT scheduler was the parity
+- CAUSAL (2026-06-10, both differentiable end-to-end): fwd 0.986x
+  post-epilogue-fix (the LPT scheduler was the original parity
   gate); bwd 3146–3242 vs 3129–3204 (0.988–1.048x across 6 runs —
   straddles 1.0). Causal bwd uses FA4's tile_m=64 but KEEPS our
   swapped dQ^T (deliberate: same wgmma inventory, identical mailbox;
@@ -31,13 +32,11 @@ run-to-run variance (locked clocks, interleaved):
   causal-bwd audit if ever needed). Causal bwd scheduler: plain 3-D
   grid — FA4 uses NO LPT for the bwd (PTX-verified).
 - VARLEN (2026-06-11, packed cu_seqlens, `flash_attn_varlen_func`,
-  fully differentiable): bwd at parity at the canonical mixed
-  16384-token config (0.981x noncausal — mojo faster — / 1.003x
-  causal); the fwd varlen machinery itself is FREE
-  (degenerate-uniform [8192,8192] = 0.988x, mojo faster) but the
-  mixed config shows ~1.04x — that is the pre-existing
-  SHORT-SEQUENCE fwd amortization gap (dense B=8 S=2048 is 1.054x
-  too; open task, not varlen-specific). Design: host work-item
+  fully differentiable): fwd AND bwd at parity at the canonical
+  mixed 16384-token config (fwd 0.997–1.001x / 0.978–0.981x causal;
+  bwd 0.981x / 1.003x causal — mojo faster on most). The varlen
+  machinery itself is FREE (degenerate-uniform [8192,8192] = 0.988x,
+  mojo faster). Design: host work-item
   tables (int32[8] rows; fwd/preprocess/convert per q-tile, bwd
   main per kv-tile) whose addresses ride existing kernel arg slots
   (sched_swizzle in the fwd, dk_accum_ptr in the bwd) so kernel
@@ -49,6 +48,19 @@ run-to-run variance (locked clocks, interleaved):
   documented at the preprocess write site). v1 envelope: every
   seqlen % 128 == 0, self-attn lengths, bwd MHA-only (fwd takes
   GQA). All per-CTA table scalars are warp.broadcast-laundered.
+
+- SHORT-SEQ FWD (2026-06-11, resolved): the fwd trailed 1.05–1.22x
+  at short sequences (B=1 S=512 single-wave: +2.5 µs/CTA,
+  PC-sampling-attributed ~8% to 16 serialized UTMASTG.3D issues +
+  UTMACMDFLUSH from the unswizzled 16B-chunk O descriptor, plus the
+  EXIT-drain it caused). Fix: stmatrix-stage O into the dead
+  (swizzled) Q tile and issue ONE SWIZZLE_128B whole-tile TMA store
+  — the bwd dK/dV epilogue's proven pattern. This also made the
+  CANONICAL fwd faster than FA4 (0.991x) and closed the varlen
+  mixed-config gap. Residual: B=32 S=512 (4-trip, 36-wave) is still
+  ~1.05x — known, low value. The lesson generalizes: descriptor
+  chunking shows up as serialized UTMASTG issue cost, ~70 cycles
+  apiece, exposed whenever per-CTA work is small.
 
 `HANDOFF.md` is the full race log: architecture, the perf journey,
 the codegen lessons (uniform-register file capacity, the
@@ -234,9 +246,8 @@ HANDOFF.md and the memory notes):
 
 ## Extending the envelope (if/when)
 
-The natural next features, in rough order of value: the
-short-sequence fwd gap (task #18 — dense B=8 S=2048 is 1.054x),
-arbitrary (non-%128) seqlens via varlen tail masking (lifts the
+The natural next features, in rough order of value: arbitrary
+(non-%128) seqlens via varlen tail masking (lifts the
 varlen v1 envelope: boundary-tile-only kv mask + predicated tail
 stores — the audit's steps 2/5b), varlen GQA (the bwd needs
 `total_k_rounded_padded`/`padded_offset_k` accum windows; the fwd

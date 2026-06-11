@@ -126,13 +126,16 @@ def launch_fwd_fa4[
     var v_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
     ](ctx, v_ptr, rows_kv, nheads_kv)
-    # O store descriptor: unswizzled, so the kernel can stage O in a
-    # plain row-major smem tile (one whole-tile bulk store).
+    # O store descriptor: SWIZZLE_128B like the loads — the kernel
+    # stmatrix-stages O into the dead (swizzled) Q tile and issues
+    # ONE whole-tile TMA store. (The previous unswizzled 16B-chunk
+    # descriptor cost 16 serialized UTMASTG issues per CTA — ~8% of
+    # a short-seq CTA, PC-sampling-verified.)
     var o_imm_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=o_addr
     )
     var o_tma = create_split_tma[
-        q_smem_shape, gmem_shape, swizzle_mode = TensorMapSwizzle.SWIZZLE_NONE
+        q_smem_shape, gmem_shape, swizzle_mode=swizzle
     ](ctx, o_imm_ptr, rows, nheads_int)
 
     comptime kernel_inst = fwd_fa4_kernel[

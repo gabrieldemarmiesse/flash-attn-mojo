@@ -272,6 +272,42 @@ Bench plumbing: `bench_fa4.py --varlen [--varlen-lens ...]`
 varlen cross-checked through the same harness), `master_bench.sh
 --varlen` (PTX refs `reference_ptx/fa4_*_varlen.ptx`).
 
+## The O-store epilogue fix (2026-06-11) — short-seq fwd parity
+
+Symptom: fwd trailed FA4 by a near-constant ~35-55 µs at any
+2048-CTA config — invisible at S=8192 (1.01-1.03x) but 1.05x at
+S=2048 and 1.22x at S=512. Single-wave isolation (B=1 S=512, 64
+CTAs): +2.5 µs per CTA flat.
+
+Attribution (ncu --section SourceCounters PC sampling at the
+single-wave shape): ~8% of all warp-stall samples sat on 16
+serialized UTMASTG.3D issues + UTMACMDFLUSH — the O store. The old
+design staged O row-major in smem and stored through an UNSWIZZLED
+descriptor with desc_shape (BM, 1, 8): TMA decomposes that into 16
+separate 16B-chunk column stores, each a ~70-cycle uniform-datapath
+issue on one thread, plus the EXIT-stall drain while 11 other warps
+wait (13% of samples vs FA4's 6.7%). FA4 stores the tile in 2
+swizzled calls.
+
+Fix: stage O with 8x stmatrix.x4 (non-trans) into the dead Q tile
+in its native SW128 k-major layout (the bwd dK/dV epilogue pattern,
+copied nearly verbatim — same m64n128 c-frag geometry, same
+per-call absolute-address swizzle XOR), switch the O descriptor to
+SWIZZLE_128B, and issue ONE whole-tile async_store_3d.
+
+Results (locked clocks, interleaved): B=1 S=512 1.221x -> 1.027x;
+B=8 S=2048 1.056x -> 1.004-1.006x; CANONICAL B=2 S=8192 1.025x ->
+0.991-0.992x (mojo FASTER — the fix also recovered the long-S
+epilogue cost, which was previously ~half the 1.00-1.03x band);
+causal canonical 0.986x; varlen mixed 1.042x -> 0.997-1.001x
+(0.978-0.981x causal). Residual: B=32 S=512 still ~1.05x (4-trip
+CTAs, 36 waves; remaining per-CTA delta ~0.3 µs — ring-fill ramp /
+upfront empty-arrives are the suspects if ever chased).
+
+Moral: at short per-CTA trip counts, FIXED per-CTA costs dominate
+the ratio, and TMA *issue* count (not bytes) is the unit of cost —
+audit every async_store/copy for descriptor chunking.
+
 ## Not yet tried (fwd)
 
 - ~~L2 cache hints on TMA loads~~ DEBUNKED (third session): FA4's

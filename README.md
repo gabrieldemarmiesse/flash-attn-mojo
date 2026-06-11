@@ -9,24 +9,22 @@ FlashAttention-4-class attention kernels written from scratch in
 D=128, bf16, H100) both the forward and the backward kernels match
 FA4's kernel time within run-to-run variance:
 
-| kernel       | mojo (µs)   | FA4 (µs)    | ratio       |
-|--------------|-------------|-------------|-------------|
-| fwd          | 2237–2276   | 2206–2255   | 1.00–1.03x  |
-| bwd          | 6148–6250   | 5913–6176   | 1.00–1.06x  |
-| fwd (causal) | 1253–1256   | ~1238       | 1.01–1.02x  |
-| bwd (causal) | 3146–3242   | 3129–3204   | 0.99–1.05x  |
-| fwd (GQA 4x) | 2253 / 1221 | 2201 / 1240 | 1.03 / 0.98x (plain/causal) |
-| bwd (GQA 4x) | 6526 / 3615 | 6659 / 3596 | 0.98 / 1.01x (plain/causal) |
-| bwd (varlen) | 1977 / 1254 | 2014 / 1250 | 0.98 / 1.00x (plain/causal) |
+| kernel       | ratio (mojo/FA4)            |
+|--------------|-----------------------------|
+| fwd          | 0.99x (mojo faster)         |
+| bwd          | 1.00–1.06x                  |
+| fwd (causal) | 0.99x (mojo faster)         |
+| bwd (causal) | 0.99–1.05x                  |
+| fwd (GQA 4x) | 1.01 / 0.99x (plain/causal) |
+| bwd (GQA 4x) | 0.98 / 1.01x (plain/causal) |
+| fwd (varlen) | 1.00 / 0.98x (plain/causal) |
+| bwd (varlen) | 0.98 / 1.00x (plain/causal) |
 
 (Locked clocks, interleaved kernel-only CUPTI timing; both kernels
-wobble ~2–4% run to run. The bwd main loop executes 448
-instructions/iteration to FA4's 532 at identical tensor-core work.
-Varlen row: the canonical packed config — 8 sequences, 16384 total
-tokens, lengths 1280–3072. The varlen fwd matches FA4's varlen
-kernel at long sequences and trails ~4% at the mixed config — a
-short-sequence amortization gap shared by the dense kernel, being
-worked.)
+wobble ~2–4% run to run, so everything above straddles parity. The
+bwd main loop executes 448 instructions/iteration to FA4's 532 at
+identical tensor-core work. Varlen rows: the canonical packed
+config — 8 sequences, 16384 total tokens, lengths 1280–3072.)
 
 The kernels are warp-specialized TMA + WGMMA Hopper kernels JIT-built
 via `mojo build` on first use and cached; correctness sits at the
