@@ -170,7 +170,17 @@ run-to-run variance (locked clocks, interleaved):
   bottom-right `triu(Lk-Lq+1)`) — cross-length causal now routes
   through the explicit-mask branch. The exact-LSE/wrong-out failure
   signature identifies reference-vs-kernel mask-alignment splits.
-  DEFERRED from this task: seqused_q/seqused_k.
+  SEQUSED (same day): seqused_q/seqused_k per-sequence used-prefix
+  overrides are PURELY HOST-SIDE — the varlen machinery is
+  table-driven, so effective lengths go into the tables while
+  cu_seqlens keep defining memory bases; the kernels are untouched
+  (zero recompiles). Unused rows get out/lse/grads of EXACT 0
+  (zeros_like allocation; the kernels never touch them — FA4 leaves
+  them undefined, we chose defined). Cross-sequence garbage reads
+  by full tiles stay safe under the existing finite-garbage
+  annihilation (+inf-LSE/0-dpsum padding, store predicates,
+  exactly-zero c-frag cp.reduce no-ops). seqused requires CUDA
+  (the CPU reference path rejects it).
 
 - SOFTCAP (2026-06-11, Gemma-2, fully differentiable, composes
   with causal/window/GQA — the causal+SWA+softcap Gemma-2 layer

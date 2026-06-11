@@ -283,19 +283,23 @@ def _check_varlen_envelope(
 
 class _FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale, causal):
+    def forward(
+        ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale,
+        causal, seqused_q=None, seqused_k=None,
+    ):
         from flash_attn_mojo.fwd_fa4 import fa4_varlen_fwd
 
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         out, lse = fa4_varlen_fwd(
             q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale,
-            causal=causal,
+            causal=causal, seqused_q=seqused_q, seqused_k=seqused_k,
         )
         ctx.save_for_backward(
             q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k
         )
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.seqused = (seqused_q, seqused_k)
         ctx.mark_non_differentiable(lse)
         return out, lse
 
@@ -304,11 +308,13 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         from flash_attn_mojo.bwd_fa4 import bwd_fa4_varlen
 
         q, k, v, out, lse, cu_q, cu_k = ctx.saved_tensors
+        seqused_q, seqused_k = ctx.seqused
         dq, dk, dv = bwd_fa4_varlen(
             q, k, v, out, dout.contiguous(), lse, cu_q, cu_k,
             ctx.softmax_scale, causal=ctx.causal,
+            seqused_q=seqused_q, seqused_k=seqused_k,
         )
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None
 
 
 def flash_attn_varlen_func(
@@ -321,6 +327,8 @@ def flash_attn_varlen_func(
     max_seqlen_k: int | None = None,
     softmax_scale: float | None = None,
     causal: bool = False,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
     *,
     return_lse: bool = False,
 ):
@@ -342,6 +350,10 @@ def flash_attn_varlen_func(
             compatibility (computed internally when omitted).
         softmax_scale: defaults to head_dim**-0.5.
         causal: causal masking (per sequence).
+        seqused_q, seqused_k: optional (nseq,) int32 tensors — use
+            only the first seqused tokens of each sequence (KV-cache
+            style over-allocated buffers; cu_seqlens still define
+            the memory layout). Unused rows get out/lse/grads of 0.
         return_lse: also return the packed (nheads, total_q) fp32
             natural-log row logsumexp.
 
@@ -357,11 +369,33 @@ def flash_attn_varlen_func(
     # so violations raise clear ValueErrors, not deep AssertionErrors.
     cu_q_host = cu_seqlens_q.detach().cpu()
     cu_k_host = cu_seqlens_k.detach().cpu()
-    seqlens_q = cu_q_host[1:] - cu_q_host[:-1]
-    seqlens_k = cu_k_host[1:] - cu_k_host[:-1]
+    mem_lens_q = cu_q_host[1:] - cu_q_host[:-1]
+    mem_lens_k = cu_k_host[1:] - cu_k_host[:-1]
+    for name, su, lens in (
+        ("seqused_q", seqused_q, mem_lens_q),
+        ("seqused_k", seqused_k, mem_lens_k),
+    ):
+        if su is None:
+            continue
+        if su.dtype != torch.int32 or tuple(su.shape) != (len(lens),):
+            raise ValueError(f"{name} must be (nseq,) int32")
+        suh = su.detach().cpu()
+        if bool((suh < 1).any()) or bool((suh > lens).any()):
+            raise ValueError(
+                f"{name} must satisfy 1 <= {name}[i] <= seqlen[i]"
+            )
+    # Effective (used) lengths drive the mask-shape checks below.
+    seqlens_q = (
+        seqused_q.detach().cpu() if seqused_q is not None
+        else mem_lens_q
+    )
+    seqlens_k = (
+        seqused_k.detach().cpu() if seqused_k is not None
+        else mem_lens_k
+    )
     if int(cu_q_host[0]) != 0 or int(cu_k_host[0]) != 0:
         raise ValueError("cu_seqlens must start at 0")
-    if bool((seqlens_q < 0).any()) or bool((seqlens_k < 0).any()):
+    if bool((mem_lens_q < 0).any()) or bool((mem_lens_k < 0).any()):
         raise ValueError("cu_seqlens must be non-decreasing")
     if causal and bool((seqlens_q > seqlens_k).any()):
         raise ValueError(
@@ -380,7 +414,7 @@ def flash_attn_varlen_func(
             f"cu_seqlens_k[-1] ({int(cu_k_host[-1])}) must equal "
             f"k total_tokens ({k.shape[0]})"
         )
-    if bool((seqlens_q == 0).any()) or bool((seqlens_k == 0).any()):
+    if bool((mem_lens_q == 0).any()) or bool((mem_lens_k == 0).any()):
         raise ValueError(
             "empty (zero-length) sequences are not supported — drop "
             "them from cu_seqlens"
@@ -399,6 +433,11 @@ def flash_attn_varlen_func(
         )
 
     if not q.is_cuda:
+        if seqused_q is not None or seqused_k is not None:
+            raise NotImplementedError(
+                "seqused_{q,k} requires CUDA tensors (the CPU "
+                "reference path does not support it)"
+            )
         from flash_attn_mojo.reference import flash_attn_varlen_ref
 
         # flash_attn_varlen_ref handles GQA and the packed
@@ -410,7 +449,8 @@ def flash_attn_varlen_func(
         )
 
     out, lse = _FlashAttnVarlenFunc.apply(
-        q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale, causal
+        q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale, causal,
+        seqused_q, seqused_k,
     )
     if return_lse:
         return out, lse

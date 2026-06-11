@@ -71,7 +71,9 @@ LSE), differentiable end-to-end, with ARBITRARY sequence lengths
 (>= 1 — ragged tails are masked in-kernel and tail tiles stored
 row-predicated), self- OR cross-attention (`cu_seqlens_q !=
 cu_seqlens_k`; causal cross uses the flash-attn bottom-right
-diagonal and requires `seqlen_q <= seqlen_k` per sequence).
+diagonal and requires `seqlen_q <= seqlen_k` per sequence), and
+`seqused_q`/`seqused_k` per-sequence used-prefix overrides
+(KV-cache style; unused rows get out/grads of exactly 0).
 
 ## Install
 

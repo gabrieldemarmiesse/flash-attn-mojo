@@ -401,6 +401,71 @@ def test_window_public_api(hkv):
 
 
 @requires_cuda
+@pytest.mark.parametrize("causal", [False, True])
+def test_varlen_seqused(causal):
+    """seqused_{q,k}: used prefixes match the sliced reference;
+    unused rows give exactly-zero out and grads."""
+    from flash_attn_mojo import flash_attn_varlen_func
+    from flash_attn_mojo.reference import flash_attn_varlen_ref
+
+    torch.manual_seed(7)
+    lens_q, used_q = [200, 300], [130, 257]
+    lens_k, used_k = [400, 300], [250, 300]
+
+    def cu_of(lens):
+        cu = [0]
+        for L in lens:
+            cu.append(cu[-1] + L)
+        return torch.tensor(cu, dtype=torch.int32, device="cuda")
+
+    cu_q, cu_k = cu_of(lens_q), cu_of(lens_k)
+    q = torch.randn(
+        sum(lens_q), 4, 128, dtype=torch.bfloat16, device="cuda",
+        requires_grad=True,
+    )
+    k = torch.randn(
+        sum(lens_k), 4, 128, dtype=torch.bfloat16, device="cuda",
+        requires_grad=True,
+    )
+    v = torch.randn_like(k, requires_grad=True)
+    dout = torch.randn_like(q)
+    out = flash_attn_varlen_func(
+        q, k, v, cu_q, cu_k, causal=causal,
+        seqused_q=torch.tensor(used_q, dtype=torch.int32, device="cuda"),
+        seqused_k=torch.tensor(used_k, dtype=torch.int32, device="cuda"),
+    )
+    out.backward(dout)
+
+    def used(t, lens, useds, base=0):
+        parts, off = [], 0
+        for L, u in zip(lens, useds):
+            parts.append(t[off:off + u])
+            off += L
+        return torch.cat(parts)
+
+    qs = used(q, lens_q, used_q).detach().float().requires_grad_()
+    ks = used(k, lens_k, used_k).detach().float().requires_grad_()
+    vs = used(v, lens_k, used_k).detach().float().requires_grad_()
+    ref = flash_attn_varlen_ref(
+        qs, ks, vs, cu_of(used_q), cu_of(used_k), causal=causal
+    )
+    ref.backward(used(dout, lens_q, used_q).float())
+
+    assert (used(out, lens_q, used_q).float() - ref).abs().max() < 2e-2
+    for got, want, lens, useds in (
+        (q.grad, qs.grad, lens_q, used_q),
+        (k.grad, ks.grad, lens_k, used_k),
+        (v.grad, vs.grad, lens_k, used_k),
+    ):
+        assert (used(got, lens, useds).float() - want).abs().max() < 5e-2
+    # unused rows: exactly zero
+    assert out[used_q[0]:lens_q[0]].abs().max().item() == 0.0
+    assert q.grad[used_q[0]:lens_q[0]].abs().max().item() == 0.0
+    assert k.grad[used_k[0]:lens_k[0]].abs().max().item() == 0.0
+    assert v.grad[used_k[0]:lens_k[0]].abs().max().item() == 0.0
+
+
+@requires_cuda
 def test_softcap_public_api():
     """Gemma-2 layer config (causal + SWA + softcap) through
     flash_attn_func end-to-end (autograd)."""

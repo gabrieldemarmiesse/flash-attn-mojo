@@ -191,6 +191,8 @@ def _build_bwd_tables(
     cu_seqlens_k: torch.Tensor,
     block_m: int,
     causal: bool,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
 ) -> tuple:
     """Host work tables for the varlen bwd (vectorized torch on a
     host copy; one D2H sync).
@@ -208,10 +210,12 @@ def _build_bwd_tables(
     slack guarantees non-overlap); total_qpad = num_mpad*BM with
     num_mpad = ceil((total_q + (nseq+1)*BM)/BM) per FA4's formula.
     """
+    from flash_attn_mojo.fwd_fa4 import _effective_lens
+
     cu_q = cu_seqlens_q.detach().to("cpu", torch.int64)
     cu_k = cu_seqlens_k.detach().to("cpu", torch.int64)
-    seqlens_q = cu_q[1:] - cu_q[:-1]
-    seqlens_k = cu_k[1:] - cu_k[:-1]
+    seqlens_q = _effective_lens(cu_q, seqused_q, "seqused_q")
+    seqlens_k = _effective_lens(cu_k, seqused_k, "seqused_k")
     # Arbitrary lengths >= 1 (ragged kv tails are masked in-kernel
     # and tail tiles stored row-predicated); self- or
     # cross-attention.
@@ -295,13 +299,16 @@ def bwd_fa4_varlen(
     cu_seqlens_k: torch.Tensor,
     softmax_scale: float | None = None,
     causal: bool = False,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Packed varlen backward (dq, dk, dv).
 
     q/k/v/out/dout: (total_tokens, H, D) bf16 contiguous, D=128.
     lse: (H, total_q) fp32 (the packed natural-log LSE from the
     varlen fwd). MHA or GQA (Hq % Hkv == 0); arbitrary sequence
-    lengths >= 1; self-attn lengths.
+    lengths >= 1; self- or cross-attention; seqused_{q,k} override
+    the used prefix per sequence (grads for unused rows are 0).
     """
     from flash_attn_mojo.bwd_fa4._jit import (
         call_bwd_fa4_convert,
@@ -334,13 +341,24 @@ def bwd_fa4_varlen(
     (
         q_table, num_q_tiles, kv_table, num_kv_tiles,
         num_mpad, total_q_, total_k_,
-    ) = _build_bwd_tables(cu_seqlens_q, cu_seqlens_k, block_m, causal)
+    ) = _build_bwd_tables(
+        cu_seqlens_q, cu_seqlens_k, block_m, causal,
+        seqused_q, seqused_k,
+    )
     assert total_q_ == total_q and total_k_ == total_k
     total_qpad = num_mpad * block_m
 
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    # With seqused, rows past each sequence's used prefix are never
+    # touched by the kernels — zero-allocate so their gradients are
+    # a defined 0 (they genuinely receive no gradient).
+    alloc = (
+        torch.zeros_like
+        if (seqused_q is not None or seqused_k is not None)
+        else torch.empty_like
+    )
+    dq = alloc(q)
+    dk = alloc(k)
+    dv = alloc(v)
 
     def _aux_row(p0, p1, extra32=0):
         a = torch.tensor([p0, p1, 0, 0], dtype=torch.int64).view(

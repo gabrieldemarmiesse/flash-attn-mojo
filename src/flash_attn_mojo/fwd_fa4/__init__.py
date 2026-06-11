@@ -125,10 +125,29 @@ def native_fwd_fa4(
 _BLOCK_M = 128  # fwd m-tile (kFa4BlockM)
 
 
+def _effective_lens(
+    cu: torch.Tensor, seqused: torch.Tensor | None, name: str
+) -> torch.Tensor:
+    """Per-sequence lengths: cu_seqlens deltas, overridden by
+    seqused when given (the cu bases still define the memory
+    layout — seqused just shortens each sequence's used prefix)."""
+    lens = cu[1:] - cu[:-1]
+    if seqused is None:
+        return lens
+    su = seqused.detach().to("cpu", torch.int64)
+    assert su.shape == lens.shape, f"{name} must be (nseq,)"
+    assert bool((su >= 1).all() and (su <= lens).all()), (
+        f"{name} must satisfy 1 <= {name}[i] <= seqlen[i]"
+    )
+    return su
+
+
 def _build_fwd_tile_table(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     causal: bool = False,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int, int]:
     """Host work-item table: one int32[8] row per CTA m-tile —
     (m_block, q_row_base, k_row_base, seqlen_q, seqlen_k, 0, 0, 0).
@@ -138,8 +157,8 @@ def _build_fwd_tile_table(
     cu_k = cu_seqlens_k.detach().to("cpu", torch.int64)
     # Table fields are int32 row indices; .to(int32) wraps silently.
     assert int(cu_q[-1]) < 2**31 and int(cu_k[-1]) < 2**31
-    seqlens_q = cu_q[1:] - cu_q[:-1]
-    seqlens_k = cu_k[1:] - cu_k[:-1]
+    seqlens_q = _effective_lens(cu_q, seqused_q, "seqused_q")
+    seqlens_k = _effective_lens(cu_k, seqused_k, "seqused_k")
     # Arbitrary lengths >= 1 (ragged tails are masked in-kernel and
     # tail tiles stored row-predicated); empty sequences are out of
     # the envelope.
@@ -179,6 +198,8 @@ def fa4_varlen_fwd(
     cu_seqlens_k: torch.Tensor,
     softmax_scale: float | None = None,
     causal: bool = False,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Packed varlen forward. Mirrors
     ``flash_attn.cute.flash_attn_varlen_func``'s simplest call.
@@ -210,11 +231,19 @@ def fa4_varlen_fwd(
     assert cu_seqlens_q.shape == cu_seqlens_k.shape
 
     table, num_tiles, max_seqlen_q = _build_fwd_tile_table(
-        cu_seqlens_q, cu_seqlens_k, causal
+        cu_seqlens_q, cu_seqlens_k, causal, seqused_q, seqused_k
     )
 
-    out = torch.empty_like(q)
-    lse = torch.empty(
+    # With seqused the rows past each sequence's used prefix are
+    # never written — zero-fill so out is fully defined (FA4 leaves
+    # them undefined; a memset is cheap and safer).
+    out = (
+        torch.zeros_like(q)
+        if seqused_q is not None
+        else torch.empty_like(q)
+    )
+    lse_alloc = torch.zeros if seqused_q is not None else torch.empty
+    lse = lse_alloc(
         (nheads, total_q), dtype=torch.float32, device=q.device
     )
     nseq = cu_seqlens_q.numel() - 1
