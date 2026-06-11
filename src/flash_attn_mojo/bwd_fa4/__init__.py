@@ -83,9 +83,9 @@ def bwd_fa4(
         dv = torch.empty_like(v)
         dk_main_addr = dk.data_ptr()
         dv_main_addr = dv.data_ptr()
-    # Causal uses FA4's tile_m=64 (divides any supported seqlen: no
-    # padding); non-causal tile_m=80 pads.
-    block_m = 64 if causal else _BLOCK_M
+    # FA4's tile_m: hdim64 = 128 (both); hdim128 = 64 causal / 80
+    # non-causal (the 80 pads).
+    block_m = 128 if head_dim == 64 else (64 if causal else _BLOCK_M)
     seqlen_pad = -(-seqlen // block_m) * block_m
     dpsum = torch.empty(
         (batch, nheads, seqlen_pad), dtype=torch.float32, device=q.device
@@ -298,7 +298,7 @@ def bwd_fa4_varlen(
     for cu in (cu_seqlens_q, cu_seqlens_k):
         assert cu.dtype == torch.int32 and cu.is_cuda and cu.is_contiguous()
 
-    block_m = 64 if causal else _BLOCK_M
+    block_m = 128 if head_dim == 64 else (64 if causal else _BLOCK_M)
     (
         q_table, num_q_tiles, kv_table, num_kv_tiles,
         num_mpad, total_q_, total_k_,

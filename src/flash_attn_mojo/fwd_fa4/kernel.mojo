@@ -80,16 +80,18 @@ from common import (
     kFa4BlockN,
     kFa4NMmaWarpgroups,
     kFa4KVStages,
+    kFa4ProducerRegs,
+    kFa4ConsumerRegs,
 )
 
 comptime WGMMA_M: Int = 64
 comptime WGMMA_K: Int = 16
-comptime NUM_PRODUCER_REGS: Int = 24
-comptime NUM_CONSUMER_REGS: Int = 240
 
 
 @__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(kFa4NThreads))
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+        Int32(kFa4NThreads(head_dim))
+    )
 )
 @__llvm_arg_metadata(q_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(k_tma, `nvvm.grid_constant`)
@@ -120,11 +122,13 @@ def fwd_fa4_kernel[
     sched_num_hb_q: Int,
     sched_residual: Int,
 ):
-    comptime BM: Int = kFa4BlockM
+    comptime BM: Int = kFa4BlockM(head_dim)
     comptime BN: Int = kFa4BlockN
     comptime D: Int = head_dim
-    comptime NWG: Int = kFa4NMmaWarpgroups
+    comptime NWG: Int = kFa4NMmaWarpgroups(head_dim)
     comptime STAGES: Int = kFa4KVStages
+    comptime NUM_PRODUCER_REGS: Int = kFa4ProducerRegs(head_dim)
+    comptime NUM_CONSUMER_REGS: Int = kFa4ConsumerRegs(head_dim)
     comptime accum_type: DType = DType.float32
     comptime swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B
 

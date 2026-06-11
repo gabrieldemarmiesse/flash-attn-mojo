@@ -94,6 +94,7 @@ from _wgmma_f16 import wgmma_rs_f16_m64n128
 
 from common import (
     kBwdBlockM,
+    kBwdTileM,
     kBwdBlockN,
     kBwdCvtThreads,
     kBwdNMmaWarpgroups,
@@ -162,7 +163,7 @@ def bwd_main_kernel[
     # Causal uses FA4's tile_m=64 (_tile_size_bwd_sm90: 64/128 with
     # dQ_swapAB=False; v0 keeps our swapped dQ — valid algebra, the
     # mailbox/convert layouts are BM-parametric).
-    comptime BM: Int = 64 if causal else kBwdBlockM
+    comptime BM: Int = kBwdTileM(head_dim, causal)
     comptime BN: Int = kBwdBlockN
     comptime D: Int = head_dim
     comptime NWG: Int = kBwdNMmaWarpgroups
@@ -1245,7 +1246,7 @@ def bwd_preprocess_kernel[
     var b_idx: Int = Int(block_idx.z)
     var tid: Int = Int(thread_idx.x)
 
-    comptime bm_main: Int = 64 if causal else kBwdBlockM
+    comptime bm_main: Int = kBwdTileM(head_dim, causal)
 
     comptime if varlen:
         # One CTA per main-kernel m-block (bm_main rows). The q-tile
@@ -1466,7 +1467,7 @@ def bwd_convert_kernel[
     32). Phase 2: each thread emits contiguous 16-elem (32B) d-slices
     so every warp store covers full 256B rows (full 32B sectors)."""
     comptime D: Int = head_dim
-    comptime BM: Int = 64 if causal else kBwdBlockM
+    comptime BM: Int = kBwdTileM(head_dim, causal)
     comptime PAD: Int = 4  # pad smem rows to dodge bank conflicts
     comptime NT: Int = kBwdCvtThreads  # 256
 

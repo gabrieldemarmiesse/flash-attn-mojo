@@ -80,7 +80,9 @@ def launch_fwd_fa4[
     # Smem: Q (BM x D) + kFa4KVStages ring slots (BN x D) bf16 +
     # mbarriers. head_dim=128: 32 KiB per tile -> 224 KiB (H100
     # opt-in cap is 227 KiB).
-    comptime q_bytes: Int = kFa4BlockM * head_dim * size_of[dtype]()
+    comptime q_bytes: Int = (
+        kFa4BlockM(head_dim) * head_dim * size_of[dtype]()
+    )
     comptime kv_slot_bytes: Int = kFa4BlockN * head_dim * size_of[dtype]()
     comptime mbar_bytes: Int = 128
     comptime smem_bytes: Int = (
@@ -105,7 +107,9 @@ def launch_fwd_fa4[
 
     # 3D TMA descriptors over the (B*L, H, D) gmem view.
     comptime gmem_shape = IndexList[3](UNKNOWN_VALUE, UNKNOWN_VALUE, head_dim)
-    comptime q_smem_shape = IndexList[3](kFa4BlockM, 1, head_dim)
+    comptime q_smem_shape = IndexList[3](
+        kFa4BlockM(head_dim), 1, head_dim
+    )
     comptime kv_smem_shape = IndexList[3](kFa4BlockN, 1, head_dim)
 
     # Varlen: one flat descriptor over the packed (total_tokens, H, D)
@@ -166,7 +170,7 @@ def launch_fwd_fa4[
     # otherwise). L2 swizzle: how many (head, batch) pairs share one
     # m_block sweep so their K+V tiles stay L2-resident (FA4's
     # SingleTileLPTScheduler with a 50 MiB L2 budget).
-    var num_m: Int = ceildiv(seqlen_int, Int(kFa4BlockM))
+    var num_m: Int = ceildiv(seqlen_int, Int(kFa4BlockM(head_dim)))
     var size_one_kv_head: Int = seqlen_int * 2 * head_dim * size_of[dtype]()
     var l2_ratio: Int = (50 * 1024 * 1024) // size_one_kv_head
     var sched_swizzle: Int = 1
@@ -214,7 +218,7 @@ def launch_fwd_fa4[
             sched_num_hb_q_arg,
             sched_residual,
             grid_dim=grid,
-            block_dim=(kFa4NThreads,),
+            block_dim=(kFa4NThreads(head_dim),),
             shared_mem_bytes=smem_bytes,
         )
     else:
@@ -232,7 +236,7 @@ def launch_fwd_fa4[
             sched_num_hb_q_arg,
             sched_residual,
             grid_dim=grid,
-            block_dim=(kFa4NThreads,),
+            block_dim=(kFa4NThreads(head_dim),),
             shared_mem_bytes=smem_bytes,
         )
         ctx.synchronize()

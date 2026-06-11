@@ -12,6 +12,15 @@ the tail m-tile's P and dS to exact zeros.
 
 comptime kBwdBlockM: Int = 80  # Q rows per inner tile (FA4 tile_m)
 comptime kBwdBlockN: Int = 128  # KV rows per block
+
+
+fn kBwdTileM(head_dim: Int, causal: Bool) -> Int:
+    """FA4's bwd tile_m: hdim64 = 128 (both causal and non-causal,
+    BwdConfig in interface.py:177-184); hdim128 = 64 causal / 80
+    non-causal."""
+    if head_dim == 64:
+        return 128
+    return 64 if causal else kBwdBlockM
 comptime kBwdNMmaWarpgroups: Int = 2
 comptime kBwdNThreads: Int = (kBwdNMmaWarpgroups + 1) * 128
 

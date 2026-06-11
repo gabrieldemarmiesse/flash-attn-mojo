@@ -28,6 +28,7 @@ from layout.tma_async import create_split_tma
 from kernel import bwd_main_kernel, bwd_preprocess_kernel, bwd_convert_kernel
 from common import (
     kBwdBlockM,
+    kBwdTileM,
     kBwdBlockN,
     kBwdCvtThreads,
     kBwdNMmaWarpgroups,
@@ -132,7 +133,7 @@ def launch_bwd_preprocess[
     # Grid covers Spad rows (side buffers padded to the main-kernel
     # m-block size; pad rows get lse=+inf / dpsum=0). Varlen: one CTA
     # per main-kernel m-block (q-tile table row).
-    comptime bm_main: Int = 64 if causal else kBwdBlockM
+    comptime bm_main: Int = kBwdTileM(head_dim, causal)
     var spad: Int = (
         ceildiv(seqlen_int, Int(bm_main)) * Int(bm_main)
     )
@@ -221,7 +222,7 @@ def launch_bwd_main[
     # Smem (BM=80): K + V (2 x 32768) + 4-slot Q/dO ring (4 x 20480)
     # + 2 sdS stages (2 x 20480) + lse/dps (1280) + dQ mailbox
     # (2 x 20480) = 230912 B <= 232448 cap.
-    comptime bm: Int = 64 if causal else kBwdBlockM
+    comptime bm: Int = kBwdTileM(head_dim, causal)
     comptime kv_bytes: Int = kBwdBlockN * head_dim * size_of[dtype]()
     comptime q_slot_bytes: Int = bm * head_dim * size_of[dtype]()
     comptime sds_bytes: Int = bm * kBwdBlockN * size_of[dtype]()
@@ -435,7 +436,7 @@ def launch_bwd_convert[
         nheads_arg = vl_num_mpad
 
     # (BM q) x (128+4 d) f32 decode tile.
-    comptime bm_cvt: Int = 64 if causal else kBwdBlockM
+    comptime bm_cvt: Int = kBwdTileM(head_dim, causal)
     comptime cvt_smem_bytes: Int = bm_cvt * (head_dim + 4) * 4
 
     comptime kernel_inst = bwd_convert_kernel[
