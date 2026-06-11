@@ -1,6 +1,11 @@
-"""FA4-kernel correctness: fwd out/lse and end-to-end autograd grads
-vs the fp32 SDPA reference, across tail (S % 80 != 0) and exact-fit
-seqlens. bf16 noise-floor tolerances."""
+"""Public-API correctness: `flash_attn_func` / `flash_attn_varlen_func`
+end-to-end (autograd) against the pure-PyTorch references in
+`flash_attn_mojo.reference`, across tail (S % 80 != 0) and exact-fit
+seqlens, plus cross-checks vs Tri Dao's flash_attn.cute when
+importable. bf16 noise-floor tolerances.
+
+(Kernel-wrapper-level checks — what the bench delegates to — live in
+test_kernels.py.)"""
 
 from __future__ import annotations
 
@@ -8,6 +13,7 @@ import pytest
 import torch
 
 from flash_attn_mojo import flash_attn_func
+from flash_attn_mojo.reference import flash_attn_ref, flash_attn_varlen_ref
 
 from conftest import requires_cuda
 
@@ -30,16 +36,11 @@ def _make(seqlen, requires_grad=False):
     return q, k, v
 
 
-def _sdpa_fp32(q, k, v):
-    import torch.nn.functional as F
-
-    return (
-        F.scaled_dot_product_attention(
-            q.transpose(1, 2).float(),
-            k.transpose(1, 2).float(),
-            v.transpose(1, 2).float(),
-        )
-        .transpose(1, 2)
+def _ref(q, k, v, causal=False, return_lse=False, softmax_scale=None):
+    """fp32 reference (handles GQA and LSE internally)."""
+    return flash_attn_ref(
+        q.float(), k.float(), v.float(),
+        softmax_scale=softmax_scale, causal=causal, return_lse=return_lse,
     )
 
 
@@ -48,14 +49,8 @@ def _sdpa_fp32(q, k, v):
 def test_fwd_out_and_lse(seqlen):
     q, k, v = _make(seqlen)
     out, lse = flash_attn_func(q, k, v, return_lse=True)
-    ref = _sdpa_fp32(q, k, v)
+    ref, ref_lse = _ref(q, k, v, return_lse=True)
     assert (out.float() - ref).abs().max().item() < FWD_TOL
-
-    scale = q.shape[-1] ** -0.5
-    ref_lse = torch.logsumexp(
-        torch.einsum("bshd,bthd->bhst", q.float(), k.float()) * scale,
-        dim=-1,
-    )
     assert (lse - ref_lse).abs().max().item() < LSE_TOL
 
 
@@ -71,7 +66,7 @@ def test_backward_grads(seqlen):
     qf = q.detach().float().requires_grad_()
     kf = k.detach().float().requires_grad_()
     vf = v.detach().float().requires_grad_()
-    ref = _sdpa_fp32(qf, kf, vf)
+    ref = flash_attn_ref(qf, kf, vf)
     ref.backward(dout.float())
 
     for name, got, want in (
@@ -88,17 +83,7 @@ def test_custom_softmax_scale():
     q, k, v = _make(256)
     scale = 0.05
     out = flash_attn_func(q, k, v, softmax_scale=scale)
-    import torch.nn.functional as F
-
-    ref = (
-        F.scaled_dot_product_attention(
-            q.transpose(1, 2).float(),
-            k.transpose(1, 2).float(),
-            v.transpose(1, 2).float(),
-            scale=scale,
-        )
-        .transpose(1, 2)
-    )
+    ref = _ref(q, k, v, softmax_scale=scale)
     assert (out.float() - ref).abs().max().item() < FWD_TOL
 
 
@@ -123,27 +108,8 @@ def test_causal_fwd(seqlen):
     q, k, v = _make(seqlen)
     with torch.no_grad():
         out, lse = flash_attn_func(q, k, v, causal=True, return_lse=True)
-    import torch.nn.functional as F
-
-    ref = (
-        F.scaled_dot_product_attention(
-            q.transpose(1, 2).float(),
-            k.transpose(1, 2).float(),
-            v.transpose(1, 2).float(),
-            is_causal=True,
-        )
-        .transpose(1, 2)
-    )
+    ref, ref_lse = _ref(q, k, v, causal=True, return_lse=True)
     assert (out.float() - ref).abs().max().item() < 2e-2
-
-    scale = q.shape[-1] ** -0.5
-    scores = (
-        torch.einsum("bshd,bthd->bhst", q.float(), k.float()) * scale
-    )
-    tri = torch.ones(
-        seqlen, seqlen, dtype=torch.bool, device="cuda"
-    ).triu(1)
-    ref_lse = torch.logsumexp(scores.masked_fill(tri, float("-inf")), dim=-1)
     assert (lse - ref_lse).abs().max().item() < LSE_TOL
 
 
@@ -159,15 +125,7 @@ def test_causal_backward_grads(seqlen):
     qf = q.detach().float().requires_grad_()
     kf = k.detach().float().requires_grad_()
     vf = v.detach().float().requires_grad_()
-    import torch.nn.functional as F
-
-    ref = (
-        F.scaled_dot_product_attention(
-            qf.transpose(1, 2), kf.transpose(1, 2), vf.transpose(1, 2),
-            is_causal=True,
-        )
-        .transpose(1, 2)
-    )
+    ref = flash_attn_ref(qf, kf, vf, causal=True)
     ref.backward(dout.float())
 
     # Causal grads are noisier than non-causal (short rows average
@@ -210,27 +168,12 @@ def _make_gqa(seqlen, hq=4, hkv=2, requires_grad=False):
     return q, k, v
 
 
-def _sdpa_gqa_fp32(q, k, v, causal=False):
-    import torch.nn.functional as F
-
-    g = q.shape[2] // k.shape[2]
-    return (
-        F.scaled_dot_product_attention(
-            q.transpose(1, 2).float(),
-            k.repeat_interleave(g, dim=2).transpose(1, 2).float(),
-            v.repeat_interleave(g, dim=2).transpose(1, 2).float(),
-            is_causal=causal,
-        )
-        .transpose(1, 2)
-    )
-
-
 @requires_cuda
 @pytest.mark.parametrize("causal", [False, True])
 def test_gqa_fwd(causal):
     q, k, v = _make_gqa(1024)
     out = flash_attn_func(q, k, v, causal=causal)
-    ref = _sdpa_gqa_fp32(q, k, v, causal=causal)
+    ref = _ref(q, k, v, causal=causal)
     assert (out.float() - ref).abs().max().item() < 2e-2
 
 
@@ -245,7 +188,7 @@ def test_gqa_backward_grads(causal):
     qf = q.detach().float().requires_grad_()
     kf = k.detach().float().requires_grad_()
     vf = v.detach().float().requires_grad_()
-    ref = _sdpa_gqa_fp32(qf, kf, vf, causal=causal)
+    ref = flash_attn_ref(qf, kf, vf, causal=causal)
     ref.backward(dout.float())
     for name, got, want in (
         ("dq", q.grad, qf.grad),
@@ -286,24 +229,7 @@ def _make_varlen(lens, requires_grad=False):
     )
     k = torch.randn_like(q, requires_grad=requires_grad)
     v = torch.randn_like(q, requires_grad=requires_grad)
-    return q, k, v, cu, cu_list
-
-
-def _sdpa_varlen_fp32(q, k, v, cu_list, causal=False):
-    import torch.nn.functional as F
-
-    outs = []
-    for i in range(len(cu_list) - 1):
-        s, e = cu_list[i], cu_list[i + 1]
-        outs.append(
-            F.scaled_dot_product_attention(
-                q[s:e].transpose(0, 1).float(),
-                k[s:e].transpose(0, 1).float(),
-                v[s:e].transpose(0, 1).float(),
-                is_causal=causal,
-            ).transpose(0, 1)
-        )
-    return torch.cat(outs, dim=0)
+    return q, k, v, cu
 
 
 @requires_cuda
@@ -312,28 +238,17 @@ def _sdpa_varlen_fp32(q, k, v, cu_list, causal=False):
 def test_varlen_fwd_out_and_lse(lens, causal):
     from flash_attn_mojo import flash_attn_varlen_func
 
-    q, k, v, cu, cu_list = _make_varlen(lens)
+    q, k, v, cu = _make_varlen(lens)
     with torch.no_grad():
         out, lse = flash_attn_varlen_func(
             q, k, v, cu, cu, causal=causal, return_lse=True
         )
-    ref = _sdpa_varlen_fp32(q, k, v, cu_list, causal)
+    ref, ref_lse = flash_attn_varlen_ref(
+        q.float(), k.float(), v.float(), cu, cu,
+        causal=causal, return_lse=True,
+    )
     assert (out.float() - ref).abs().max().item() < 2e-2
-
-    scale = q.shape[-1] ** -0.5
-    for i, L in enumerate(lens):
-        s, e = cu_list[i], cu_list[i + 1]
-        scores = (
-            torch.einsum("shd,thd->hst", q[s:e].float(), k[s:e].float())
-            * scale
-        )
-        if causal:
-            tri = torch.ones(
-                L, L, dtype=torch.bool, device="cuda"
-            ).triu(1)
-            scores = scores.masked_fill(tri, float("-inf"))
-        ref_lse = torch.logsumexp(scores, dim=-1)
-        assert (lse[:, s:e] - ref_lse).abs().max().item() < LSE_TOL
+    assert (lse - ref_lse).abs().max().item() < LSE_TOL
 
 
 @requires_cuda
@@ -342,7 +257,7 @@ def test_varlen_fwd_out_and_lse(lens, causal):
 def test_varlen_backward_grads(lens, causal):
     from flash_attn_mojo import flash_attn_varlen_func
 
-    q, k, v, cu, cu_list = _make_varlen(lens, requires_grad=True)
+    q, k, v, cu = _make_varlen(lens, requires_grad=True)
     dout = torch.randn_like(q)
     out = flash_attn_varlen_func(q, k, v, cu, cu, causal=causal)
     out.backward(dout)
@@ -350,7 +265,7 @@ def test_varlen_backward_grads(lens, causal):
     qf = q.detach().float().requires_grad_()
     kf = k.detach().float().requires_grad_()
     vf = v.detach().float().requires_grad_()
-    ref = _sdpa_varlen_fp32(qf, kf, vf, cu_list, causal)
+    ref = flash_attn_varlen_ref(qf, kf, vf, cu, cu, causal=causal)
     ref.backward(dout.float())
     for name, got, want in (
         ("dq", q.grad, qf.grad),
@@ -371,7 +286,7 @@ def test_varlen_vs_fa4_when_available(causal):
         pytest.skip("flash_attn.cute not importable")
     from flash_attn_mojo import flash_attn_varlen_func
 
-    q, k, v, cu, _ = _make_varlen([1024, 256, 128])
+    q, k, v, cu = _make_varlen([1024, 256, 128])
     with torch.no_grad():
         out, lse = flash_attn_varlen_func(
             q, k, v, cu, cu, causal=causal, return_lse=True
@@ -407,11 +322,7 @@ def test_varlen_gqa_fwd_only():
 
     with torch.no_grad():
         out = flash_attn_varlen_func(q, k, v, cu, cu)
-    g = 2
-    ref = _sdpa_varlen_fp32(
-        q.detach(),
-        k.detach().repeat_interleave(g, dim=1),
-        v.detach().repeat_interleave(g, dim=1),
-        [0, 256],
-    )
+        ref = flash_attn_varlen_ref(
+            q.float(), k.float(), v.float(), cu, cu
+        )
     assert (out.float() - ref).abs().max().item() < 2e-2

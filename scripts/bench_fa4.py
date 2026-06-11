@@ -94,245 +94,33 @@ def _get_step(impl: str, kind: str, q, k, v, dout, causal: bool = False):
     return step, lambda: grads["g"]
 
 
-def _rep_kv(t, nheads_q):
-    """repeat_interleave KV heads up to nheads_q (GQA reference)."""
-    g = nheads_q // t.shape[2]
-    return t.repeat_interleave(g, dim=2) if g > 1 else t
+def _run_check_suite(args) -> None:
+    """Correctness checks live in tests/test_kernels.py; delegate to
+    pytest with a -k expression selecting this variant (the test and
+    parameter names encode the kind/dense-varlen/mask/heads axes).
+    FLASH_ATTN_MOJO_TEST_IMPL carries the impl under test."""
+    import os
+    import subprocess
+    from pathlib import Path
 
-
-def _sdpa_fp32(q, k, v, causal: bool = False):
-    import torch.nn.functional as F
-
-    return (
-        F.scaled_dot_product_attention(
-            q.transpose(1, 2).float(),
-            _rep_kv(k, q.shape[2]).transpose(1, 2).float(),
-            _rep_kv(v, q.shape[2]).transpose(1, 2).float(),
-            is_causal=causal,
-        )
-        .transpose(1, 2)
+    parts = [
+        args.kind,
+        "varlen" if args.varlen else "dense",
+        "causal" if args.causal else "plain",
+    ]
+    if not args.varlen:
+        parts.append("gqa" if args.hkv else "mha")
+    kexpr = " and ".join(parts)
+    tests = Path(__file__).resolve().parent.parent / "tests" / "test_kernels.py"
+    print(f"CHECK pytest -k '{kexpr}' (impl={args.impl})")
+    r = subprocess.run(
+        [sys.executable, "-m", "pytest", str(tests), "-q", "-k", kexpr],
+        env={**os.environ, "FLASH_ATTN_MOJO_TEST_IMPL": args.impl},
     )
+    if r.returncode != 0:
+        print("CHECK FAILED (see pytest output above)", file=sys.stderr)
+        sys.exit(r.returncode)
 
-
-def _check_small(
-    impl: str,
-    kind: str,
-    D: int,
-    seqlen: int = 512,
-    causal: bool = False,
-    hkv: int = 0,
-) -> None:
-    torch.manual_seed(1)
-    hq = 4
-    qs = torch.randn(2, seqlen, hq, D, dtype=torch.bfloat16, device="cuda")
-    h_kv = hkv if hkv else hq
-    # small-shape GQA uses ratio Hq/Hkv = 4/2 when --hkv is set
-    if hkv:
-        h_kv = 2
-    ks = torch.randn(2, seqlen, h_kv, D, dtype=torch.bfloat16, device="cuda")
-    vs = torch.randn_like(ks)
-    if kind == "fwd":
-        step, outputs = _get_step(impl, "fwd", qs, ks, vs, None, causal)
-        step()
-        out, lse = outputs()
-        d = (out.float() - _sdpa_fp32(qs, ks, vs, causal)).abs().max().item()
-        scale = qs.shape[-1] ** -0.5
-        scores = (
-            torch.einsum(
-                "bshd,bthd->bhst",
-                qs.float(),
-                _rep_kv(ks, qs.shape[2]).float(),
-            )
-            * scale
-        )
-        if causal:
-            s_q = scores.shape[-2]
-            mask = torch.ones(
-                s_q, s_q, dtype=torch.bool, device=scores.device
-            ).triu(1)
-            scores = scores.masked_fill(mask, float("-inf"))
-        ref_lse = torch.logsumexp(
-            scores,
-            dim=-1,
-        )
-        dl = (lse.float() - ref_lse).abs().max().item()
-        print(
-            f"CHECK impl={impl} kind=fwd S={seqlen} causal={int(causal)} "
-            f"small_vs_fp32_sdpa_maxdiff={d:.3e} lse_maxdiff={dl:.3e}"
-        )
-        return
-    dos = torch.randn_like(qs)
-    step, outputs = _get_step(impl, "bwd", qs, ks, vs, dos, causal)
-    step()
-    qf = qs.detach().float().requires_grad_()
-    kf = ks.detach().float().requires_grad_()
-    vf = vs.detach().float().requires_grad_()
-    import torch.nn.functional as F
-
-    of = F.scaled_dot_product_attention(
-        qf.transpose(1, 2),
-        _rep_kv(kf, qf.shape[2]).transpose(1, 2),
-        _rep_kv(vf, qf.shape[2]).transpose(1, 2),
-        is_causal=causal,
-    ).transpose(1, 2)
-    of.backward(dos.float())
-    names = ("dq", "dk", "dv")
-    refs = (qf.grad, kf.grad, vf.grad)
-    worst = 0.0
-    for name, got, ref in zip(names, outputs(), refs):
-        d = (got.float() - ref).abs().max().item()
-        worst = max(worst, d)
-        print(
-            f"CHECK impl={impl} kind=bwd causal={int(causal)} "
-            f"{name}_vs_fp32_maxdiff={d:.3e}"
-        )
-    if worst > 5e-2:
-        print("CHECK FAILED: bwd grads diverge from fp32 reference", file=sys.stderr)
-        sys.exit(1)
-
-
-def _check_varlen(
-    impl: str,
-    kind: str,
-    D: int,
-    lens: list[int],
-    causal: bool = False,
-) -> None:
-    """Packed-varlen correctness vs per-sequence fp32 references:
-    fwd checks out + LSE (FA4's packed (H, total_q) layout); bwd
-    checks dq/dk/dv vs fp32 SDPA autograd."""
-    torch.manual_seed(3)
-    H = 4
-    cu_list = [0]
-    for L in lens:
-        cu_list.append(cu_list[-1] + L)
-    cu = torch.tensor(cu_list, dtype=torch.int32, device="cuda")
-    total = cu_list[-1]
-    q = torch.randn(total, H, D, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-
-    if kind == "bwd":
-        # out/lse always from FA4's varlen fwd (identical inputs for
-        # both impls); only the bwd path differs.
-        from flash_attn.cute import flash_attn_varlen_func
-
-        out, lse = flash_attn_varlen_func(
-            q, k, v, cu_seqlens_q=cu, cu_seqlens_k=cu,
-            max_seqlen_q=max(lens), max_seqlen_k=max(lens),
-            causal=causal, return_lse=True,
-        )
-        dout = torch.randn_like(q)
-        if impl == "mojo":
-            from flash_attn_mojo.bwd_fa4 import bwd_fa4_varlen
-
-            dq, dk, dv = bwd_fa4_varlen(
-                q, k, v, out, dout, lse, cu, cu, causal=causal
-            )
-        else:
-            from flash_attn.cute.interface import _flash_attn_bwd
-
-            dq, dk, dv = _flash_attn_bwd(
-                q, k, v, out, dout, lse,
-                cu_seqlens_q=cu, cu_seqlens_k=cu,
-                max_seqlen_q=max(lens), max_seqlen_k=max(lens),
-                causal=causal,
-            )
-        worst = {"dq": 0.0, "dk": 0.0, "dv": 0.0}
-        for i, L in enumerate(lens):
-            s, e = cu_list[i], cu_list[i + 1]
-            qf = q[s:e].detach().float().requires_grad_()
-            kf = k[s:e].detach().float().requires_grad_()
-            vf = v[s:e].detach().float().requires_grad_()
-            import torch.nn.functional as F
-
-            of = F.scaled_dot_product_attention(
-                qf.transpose(0, 1),
-                kf.transpose(0, 1),
-                vf.transpose(0, 1),
-                is_causal=causal,
-            ).transpose(0, 1)
-            of.backward(dout[s:e].float())
-            for name, got, ref in (
-                ("dq", dq[s:e], qf.grad),
-                ("dk", dk[s:e], kf.grad),
-                ("dv", dv[s:e], vf.grad),
-            ):
-                worst[name] = max(
-                    worst[name],
-                    (got.float() - ref).abs().max().item(),
-                )
-        print(
-            f"CHECK impl={impl} kind=bwd "
-            f"varlen={','.join(map(str, lens))} causal={int(causal)} "
-            f"dq_maxdiff={worst['dq']:.3e} dk_maxdiff={worst['dk']:.3e} "
-            f"dv_maxdiff={worst['dv']:.3e}"
-        )
-        if max(worst.values()) > 5e-2:
-            print(
-                "CHECK FAILED: varlen bwd grads diverge from fp32 "
-                "reference",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        return
-
-    if impl == "mojo":
-        from flash_attn_mojo.fwd_fa4 import fa4_varlen_fwd
-
-        out, lse = fa4_varlen_fwd(q, k, v, cu, cu, causal=causal)
-    else:
-        from flash_attn.cute import flash_attn_varlen_func
-
-        out, lse = flash_attn_varlen_func(
-            q, k, v, cu_seqlens_q=cu, cu_seqlens_k=cu,
-            max_seqlen_q=max(lens), max_seqlen_k=max(lens),
-            causal=causal, return_lse=True,
-        )
-
-    scale = D**-0.5
-    worst = worst_lse = 0.0
-    for i, L in enumerate(lens):
-        s, e = cu_list[i], cu_list[i + 1]
-        ref = _sdpa_fp32(
-            q[s:e].unsqueeze(0), k[s:e].unsqueeze(0), v[s:e].unsqueeze(0),
-            causal,
-        )[0]
-        d = (out[s:e].float() - ref).abs().max().item()
-        worst = max(worst, d)
-        scores = (
-            torch.einsum("shd,thd->hst", q[s:e].float(), k[s:e].float())
-            * scale
-        )
-        if causal:
-            mask = torch.ones(
-                L, L, dtype=torch.bool, device=scores.device
-            ).triu(1)
-            scores = scores.masked_fill(mask, float("-inf"))
-        ref_lse = torch.logsumexp(scores, dim=-1)  # (H, L)
-        dl = (lse[:, s:e].float() - ref_lse).abs().max().item()
-        worst_lse = max(worst_lse, dl)
-    print(
-        f"CHECK impl={impl} kind=fwd varlen={','.join(map(str, lens))} "
-        f"causal={int(causal)} vs_fp32_sdpa_maxdiff={worst:.3e} "
-        f"lse_maxdiff={worst_lse:.3e}"
-    )
-    if worst > 5e-2 or worst_lse > 1e-3:
-        print(
-            "CHECK FAILED: varlen fwd diverges from fp32 reference",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-
-# Tile-aligned varlen check sets (every length % 128 == 0); ragged
-# lengths join when the seqlen tail masking lands (port step 2).
-_VARLEN_CHECK_SETS = (
-    [128],
-    [128, 256, 640],
-    [1024, 128],
-    [256] * 16,
-)
 
 
 def main() -> None:
@@ -350,13 +138,14 @@ def main() -> None:
     p.add_argument(
         "--check",
         action="store_true",
-        help="correctness: small-shape vs fp32 + bench-shape vs fa4",
+        help="run this variant's pytest checks (tests/test_kernels.py)"
+        " before benching",
     )
     p.add_argument(
         "--check-only",
         action="store_true",
-        help="run the small-shape fp32 checks at a few seqlens and "
-        "exit (fast edit-compile-check loop; no bench)",
+        help="run this variant's pytest checks and exit (fast "
+        "edit-compile-check loop; no bench)",
     )
     p.add_argument(
         "--profile",
@@ -367,8 +156,7 @@ def main() -> None:
     p.add_argument(
         "--varlen",
         action="store_true",
-        help="packed varlen (cu_seqlens) mode; with --check-only runs "
-        "the varlen check sets",
+        help="packed varlen (cu_seqlens) mode",
     )
     p.add_argument(
         "--varlen-lens",
@@ -388,22 +176,11 @@ def main() -> None:
     B, S, H, D = args.shape
     torch.manual_seed(args.seed)
 
-    if args.check_only and args.varlen:
-        for lens in _VARLEN_CHECK_SETS:
-            _check_varlen(
-                args.impl, args.kind, D, lens, causal=args.causal
-            )
-        return
-
     if args.check_only:
-        # 640 = 8 * 80 exercises the bwd tile_m=80 exact-fit path;
-        # the others all leave a partial tail m-tile (S % 80 != 0).
-        for s_len in (128, 256, 640, 1024):
-            _check_small(
-                args.impl, args.kind, D, seqlen=s_len,
-                causal=args.causal, hkv=args.hkv,
-            )
+        _run_check_suite(args)
         return
+    if args.check:
+        _run_check_suite(args)
 
     if args.varlen:
         # Packed varlen bench: one (total, H, D) packed batch.
@@ -481,74 +258,6 @@ def main() -> None:
     # JIT compile + allocator warmup.
     step()
     torch.cuda.synchronize()
-
-    if args.check and args.varlen:
-        for check_lens in _VARLEN_CHECK_SETS:
-            _check_varlen(
-                args.impl, args.kind, D, check_lens, causal=args.causal
-            )
-        if args.impl == "mojo":
-            if args.kind == "bwd":
-                from flash_attn.cute.interface import _flash_attn_bwd
-
-                refs = _flash_attn_bwd(
-                    q, k, v, out, dout, lse,
-                    cu_seqlens_q=cu, cu_seqlens_k=cu,
-                    max_seqlen_q=max(lens), max_seqlen_k=max(lens),
-                    causal=args.causal,
-                )
-                torch.cuda.synchronize()
-                worst = max(
-                    (got - ref).abs().max().item()
-                    for got, ref in zip(outputs(), refs)
-                )
-            else:
-                from flash_attn.cute import flash_attn_varlen_func
-
-                ref_out, ref_lse = flash_attn_varlen_func(
-                    q, k, v, cu_seqlens_q=cu, cu_seqlens_k=cu,
-                    max_seqlen_q=max(lens), max_seqlen_k=max(lens),
-                    causal=args.causal, return_lse=True,
-                )
-                torch.cuda.synchronize()
-                o_got, lse_got = outputs()
-                worst = max(
-                    (o_got - ref_out).abs().max().item(),
-                    (lse_got - ref_lse).abs().max().item(),
-                )
-            print(
-                f"CHECK impl=mojo kind={args.kind} varlen=1 "
-                f"bench_shape_vs_fa4_maxdiff={worst:.3e}"
-            )
-            if worst > 5e-2:
-                print(
-                    "CHECK FAILED: mojo varlen output diverges from fa4",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-    elif args.check:
-        _check_small(
-            args.impl, args.kind, D, causal=args.causal, hkv=args.hkv
-        )
-        if args.impl == "mojo":
-            ref_step, ref_outputs = _get_step(
-                "fa4", args.kind, q, k, v, dout, args.causal
-            )
-            ref_step()
-            torch.cuda.synchronize()
-            worst = 0.0
-            for got, ref in zip(outputs(), ref_outputs()):
-                worst = max(worst, (got - ref).abs().max().item())
-            print(
-                f"CHECK impl=mojo kind={args.kind} "
-                f"bench_shape_vs_fa4_maxdiff={worst:.3e}"
-            )
-            if worst > 5e-2:
-                print(
-                    "CHECK FAILED: mojo output diverges from fa4",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
 
     for _ in range(args.warmup):
         step()

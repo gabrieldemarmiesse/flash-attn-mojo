@@ -90,12 +90,19 @@ attempting any perf change**.
   and (unless `--no-ncu`) side-by-side ncu stats.
 - **Fast correctness loop**:
   `uv run python scripts/bench_fa4.py --impl mojo --kind {fwd,bwd}
-  --check-only` — fp32-reference checks at S ∈ {128, 256, 640, 1024}
-  (640 = 8×80 exercises the bwd tile_m=80 exact-fit path; the others
-  leave partial tail m-tiles). fwd also checks LSE. Add `--varlen`
-  for the packed cu_seqlens check sets (per-seq fp32 references);
-  `--varlen-lens` sets the bench lengths (default: the canonical
-  mixed 16384-token config).
+  --check-only [--causal] [--hkv N] [--varlen]` — delegates to
+  pytest `tests/test_kernels.py -k "<kind> and <dense|varlen> and
+  <plain|causal> and <mha|gqa>"` (the test/param names encode those
+  axes, so you can also call pytest directly). The checks are
+  fp32-reference comparisons via `flash_attn_mojo.reference`
+  (`flash_attn_ref` / `flash_attn_varlen_ref`, both with
+  `return_lse`): S ∈ {128, 256, 640, 1024} dense (640 = 8×80
+  exercises the bwd tile_m=80 exact-fit path), tile-aligned varlen
+  sets, plus canonical-bench-shape cross-checks vs `flash_attn.cute`.
+  `FLASH_ATTN_MOJO_TEST_IMPL=fa4` runs the same reference checks
+  against Tri Dao's kernels (harness validation). `--varlen-lens`
+  sets the BENCH lengths (default: the canonical mixed 16384-token
+  config).
 - **`scripts/ptxas_ur_probe.py`** — generates toy wgmma-loop PTX in
   varying dataflow shapes, compiles with ptxas, reports
   UR-allocation / R2UR / spills. Use it to test any codegen
@@ -135,9 +142,13 @@ attempting any perf change**.
     wrappers). Envelope-checked; non-CUDA tensors fall through to
     the reference.
   - `reference.py`: pure-PyTorch `flash_attn_ref` (SDPA-based).
-- `tests/`: `uv run pytest tests/` — API/envelope tests (CPU) +
-  CUDA correctness vs fp32 reference + cross-check vs
-  `flash_attn.cute` when importable.
+- `tests/`: `uv run pytest tests/` — `test_api.py` API/envelope
+  errors + CPU reference path; `test_fa4.py` public-API (autograd)
+  correctness vs the fp32 references; `test_kernels.py`
+  kernel-wrapper checks per variant (what the bench delegates to,
+  incl. canonical-shape cross-checks vs `flash_attn.cute`). All
+  reference math lives in `reference.py` — never re-implement it
+  inline.
 - `compat/`: drop-in `import flash_attn` shim package
   (`flash-attn-mojo-compatibility`).
 - `flash-attention/`: gitignored clone of Tri Dao's repo (the

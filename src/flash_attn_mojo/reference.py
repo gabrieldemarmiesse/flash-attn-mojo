@@ -25,14 +25,19 @@ def flash_attn_ref(
     window_size: tuple[int, int] = (-1, -1),
     softcap: float = 0.0,
     alibi_slopes: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Reference SDPA in the flash-attn 2.x API conventions.
 
     Inputs are (batch, seqlen, nheads, headdim) — flash-attn's
     convention. PyTorch's SDPA wants (batch, nheads, seqlen, headdim),
     so we transpose at the boundary.
 
-    Args mirror `flash_attn_func` exactly.
+    Args mirror `flash_attn_func` exactly. With ``return_lse`` the
+    result is ``(out, lse)`` where lse is the (batch, nheads, seqlen)
+    fp32 natural-log row logsumexp (computed in fp32 from the same
+    masked scores regardless of the input dtype — the test suite's
+    ground truth).
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -112,7 +117,45 @@ def flash_attn_ref(
         )
 
     # (B, H, L, D) → (B, L, H, D)
-    return out_h.transpose(1, 2).contiguous()
+    out = out_h.transpose(1, 2).contiguous()
+    if not return_lse:
+        return out
+
+    if dropout_p > 0:
+        raise ValueError("return_lse is ill-defined with dropout")
+    # fp32 LSE from the same transformed/masked scores.
+    scores = torch.matmul(
+        q_h.float() * softmax_scale, k_h.float().transpose(-1, -2)
+    )
+    if softcap > 0:
+        scores = softcap * torch.tanh(scores / softcap)
+    if alibi_slopes is not None:
+        B, H, Lq, Lk = scores.shape
+        i = torch.arange(Lq, device=scores.device).view(1, 1, -1, 1)
+        j = torch.arange(Lk, device=scores.device).view(1, 1, 1, -1)
+        slopes = alibi_slopes.float()
+        if slopes.dim() == 1:
+            slopes = slopes.view(1, -1, 1, 1)
+        else:
+            slopes = slopes.view(B, -1, 1, 1)
+        scores = scores + -slopes * (i - j).abs().float()
+    if window_size != (-1, -1):
+        left, right = window_size
+        Lq, Lk = scores.shape[-2:]
+        i = torch.arange(Lq, device=scores.device).view(-1, 1)
+        j = torch.arange(Lk, device=scores.device).view(1, -1)
+        in_window = (
+            ((j >= i - left) | (left < 0))
+            & ((j <= i + right) | (right < 0))
+        )
+        scores = scores.masked_fill(~in_window, float("-inf"))
+    if causal:
+        Lq, Lk = scores.shape[-2:]
+        mask = torch.ones(
+            Lq, Lk, dtype=torch.bool, device=scores.device
+        ).triu(Lk - Lq + 1)
+        scores = scores.masked_fill(mask, float("-inf"))
+    return out, torch.logsumexp(scores, dim=-1)
 
 
 def flash_attn_varlen_ref(
@@ -123,21 +166,31 @@ def flash_attn_varlen_ref(
     cu_seqlens_k: torch.Tensor,
     softmax_scale: float | None = None,
     causal: bool = False,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Packed-varlen reference: per-sequence `flash_attn_ref` over
     (total_tokens, H, D) inputs sliced by cu_seqlens. Differentiable
-    (plain torch ops)."""
+    (plain torch ops). With ``return_lse`` also returns the packed
+    (nheads, total_q) fp32 LSE (FA4's varlen layout)."""
     cu_q = cu_seqlens_q.detach().cpu().tolist()
     cu_k = cu_seqlens_k.detach().cpu().tolist()
     outs = []
+    lses = []
     for i in range(len(cu_q) - 1):
-        outs.append(
-            flash_attn_ref(
-                q[cu_q[i] : cu_q[i + 1]].unsqueeze(0),
-                k[cu_k[i] : cu_k[i + 1]].unsqueeze(0),
-                v[cu_k[i] : cu_k[i + 1]].unsqueeze(0),
-                softmax_scale=softmax_scale,
-                causal=causal,
-            )[0]
+        r = flash_attn_ref(
+            q[cu_q[i] : cu_q[i + 1]].unsqueeze(0),
+            k[cu_k[i] : cu_k[i + 1]].unsqueeze(0),
+            v[cu_k[i] : cu_k[i + 1]].unsqueeze(0),
+            softmax_scale=softmax_scale,
+            causal=causal,
+            return_lse=return_lse,
         )
-    return torch.cat(outs, dim=0)
+        if return_lse:
+            outs.append(r[0][0])
+            lses.append(r[1][0])
+        else:
+            outs.append(r[0])
+    out = torch.cat(outs, dim=0)
+    if return_lse:
+        return out, torch.cat(lses, dim=1)
+    return out

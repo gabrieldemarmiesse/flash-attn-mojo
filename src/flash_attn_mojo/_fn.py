@@ -129,27 +129,12 @@ def flash_attn_func(
         softmax_scale = q.shape[-1] ** -0.5
 
     if not q.is_cuda:
-        g = q.shape[2] // k.shape[2]
-        k_r = k.repeat_interleave(g, dim=2) if g > 1 else k
-        v_r = v.repeat_interleave(g, dim=2) if g > 1 else v
-        out = flash_attn_ref(
-            q, k_r, v_r, softmax_scale=softmax_scale, causal=causal
+        # flash_attn_ref handles GQA (repeat-interleave) and the
+        # fp32 LSE internally.
+        return flash_attn_ref(
+            q, k, v, softmax_scale=softmax_scale, causal=causal,
+            return_lse=return_lse,
         )
-        if return_lse:
-            scores = (
-                torch.einsum(
-                    "bshd,bthd->bhst", q.float(), k_r.float()
-                )
-                * softmax_scale
-            )
-            if causal:
-                s_q = scores.shape[-2]
-                tri = torch.ones(
-                    s_q, s_q, dtype=torch.bool, device=scores.device
-                ).triu(1)
-                scores = scores.masked_fill(tri, float("-inf"))
-            return out, torch.logsumexp(scores, dim=-1)
-        return out
 
     out, lse = _FlashAttnFunc.apply(q, k, v, softmax_scale, causal)
     if return_lse:
@@ -315,36 +300,13 @@ def flash_attn_varlen_func(
     if not q.is_cuda:
         from flash_attn_mojo.reference import flash_attn_varlen_ref
 
-        g = q.shape[1] // k.shape[1]
-        k_r = k.repeat_interleave(g, dim=1) if g > 1 else k
-        v_r = v.repeat_interleave(g, dim=1) if g > 1 else v
-        out = flash_attn_varlen_ref(
-            q, k_r, v_r, cu_seqlens_q, cu_seqlens_k,
+        # flash_attn_varlen_ref handles GQA and the packed
+        # (nheads, total_q) fp32 LSE internally.
+        return flash_attn_varlen_ref(
+            q, k, v, cu_seqlens_q, cu_seqlens_k,
             softmax_scale=softmax_scale, causal=causal,
+            return_lse=return_lse,
         )
-        if return_lse:
-            cu = cu_seqlens_q.detach().cpu().tolist()
-            lse = torch.empty(
-                (q.shape[1], q.shape[0]),
-                dtype=torch.float32, device=q.device,
-            )
-            for i in range(len(cu) - 1):
-                s, e = cu[i], cu[i + 1]
-                scores = (
-                    torch.einsum(
-                        "shd,thd->hst", q[s:e].float(), k_r[s:e].float()
-                    )
-                    * softmax_scale
-                )
-                if causal:
-                    tri = torch.ones(
-                        e - s, e - s, dtype=torch.bool,
-                        device=scores.device,
-                    ).triu(1)
-                    scores = scores.masked_fill(tri, float("-inf"))
-                lse[:, s:e] = torch.logsumexp(scores, dim=-1)
-            return out, lse
-        return out
 
     # The varlen backward is MHA-only for now: refuse GQA up front
     # when gradients are live instead of failing inside backward().
