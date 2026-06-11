@@ -64,10 +64,14 @@ from std.gpu.compute.mma import st_matrix
 from layout import Layout, LayoutTensor
 from layout.tensor_core_async import (
     TensorCoreAsync,
+    _wgmma_descriptor,
     tile_layout_k_major,
     tile_layout_mn_major,
+    tile_to_descriptor,
     warpgroup_fence,
 )
+
+from _wgmma_f16 import wgmma_rs_f16_m64n128
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
 from common import (
@@ -430,6 +434,40 @@ def fwd_fa4_kernel[
     ]:
         return {kv_smem_base + slot * kv_slot_size}
 
+    # fp16 RS fork: the stdlib's register-A wgmma overload is
+    # bf16-only (hardcoded .bf16.bf16 asm); the vendored
+    # m64n128k16 f32.f16.f16 emitter (_wgmma_f16.mojo) replicates
+    # the TensorCoreAsync RS k-loop here. bf16 keeps the stdlib
+    # path — byte-identical codegen.
+    comptime v_canonical = tile_to_descriptor[
+        dtype, v_smem_layout, False
+    ]()
+    comptime v_k_stride: Int = (
+        v_canonical[1].stride[1].value() * 2 * size_of[dtype]()
+    )
+
+    @parameter
+    @always_inline
+    def pv_gemm(slot_arg: Int):
+        comptime if dtype == DType.float16:
+            var b_desc = _wgmma_descriptor[v_canonical, False, swizzle](
+                kv_smem_base + slot_arg * kv_slot_size
+            )
+            var o_simd = o_reg.ptr.load[width=c_frag_size_pv]()
+            comptime for k_mma in range(num_k_mmas_pv):
+                o_simd = rebind[SIMD[accum_type, c_frag_size_pv]](
+                    wgmma_rs_f16_m64n128(
+                        rebind[SIMD[DType.float16, 8]](
+                            (p_reg.ptr + 8 * k_mma).load[width=8]()
+                        ),
+                        (b_desc + k_mma * v_k_stride).desc,
+                        rebind[SIMD[DType.float32, 64]](o_simd),
+                    )
+                )
+            o_reg.ptr.store[width=c_frag_size_pv](o_simd)
+        else:
+            wgmma_pv.wgmma(p_reg, v_tile(slot_arg), o_reg)
+
     # c-frag (row, col) roots for the diagonal mask (within-tile
     # coordinates; global q = m*BM + row, kv = n*BN + col, and on the
     # diagonal tile n == m_block the mask is simply col > row).
@@ -548,7 +586,7 @@ def fwd_fa4_kernel[
         full[v_slot].wait(v_phase)
         warpgroup_fence(o_reg)
         wgmma_pv.arrive()
-        wgmma_pv.wgmma(p_reg, v_tile(v_slot), o_reg)
+        pv_gemm(v_slot)
         wgmma_pv.commit_group()
         named_barrier_arrive[Int32(NWG * 128)](Int32(2 - wg))
 
@@ -586,7 +624,7 @@ def fwd_fa4_kernel[
     full[v_slot].wait(v_phase)
     warpgroup_fence(o_reg)
     wgmma_pv.arrive()
-    wgmma_pv.wgmma(p_reg, v_tile(v_slot), o_reg)
+    pv_gemm(v_slot)
     wgmma_pv.commit_group()
     wgmma_pv.wait_group[0]()
     warpgroup_fence(o_reg)
@@ -665,8 +703,14 @@ def fwd_fa4_kernel[
                 )
             var raw_i: Int = o_raw + (i % 4) * 32 + (i // 4) * (BM * 128)
             var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
+            # .bitcast[BFloat16]: the stdlib st_matrix comptime-
+            # asserts bf16/f32, but stmatrix.b16 is dtype-agnostic
+            # (raw 16-bit stores; the payload is already bit-packed)
+            # — the cast unblocks fp16 and is a no-op for bf16.
             st_matrix[simd_width=4](
-                smem_base + ((sw_i >> 1) - (Int(smem_base) >> 1)),
+                (
+                    smem_base + ((sw_i >> 1) - (Int(smem_base) >> 1))
+                ).bitcast[BFloat16](),
                 packed,
             )
 

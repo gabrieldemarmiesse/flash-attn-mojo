@@ -37,8 +37,8 @@ def test_causal_cpu_reference():
 
 
 def test_envelope_errors():
-    q, k, v = _qkv(dtype=torch.float16)
-    with pytest.raises(ValueError, match="bf16"):
+    q, k, v = _qkv(dtype=torch.float32)
+    with pytest.raises(ValueError, match="bf16 and fp16"):
         flash_attn_func(q, k, v)
     q, k, v = _qkv(head_dim=64)
     with pytest.raises(ValueError, match="head_dim"):

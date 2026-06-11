@@ -90,6 +90,8 @@ from layout.tensor_core_async import (
 )
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
+from _wgmma_f16 import wgmma_rs_f16_m64n128
+
 from common import (
     kBwdBlockM,
     kBwdBlockN,
@@ -538,6 +540,17 @@ def bwd_main_kernel[
     comptime a_frag: Int = WGMMA_M * WGMMA_K // 128  # 8
     comptime num_k_mmas_rs: Int = BM // WGMMA_K  # 4
 
+    # fp16 RS fork support: the stdlib register-A wgmma is bf16-only;
+    # the vendored m64n128k16 f32.f16.f16 emitter (_wgmma_f16.mojo)
+    # replicates the TensorCoreAsync RS k-loop at the dV/dK sites.
+    # bf16 keeps the stdlib path — byte-identical codegen.
+    comptime qt_canonical = tile_to_descriptor[
+        dtype, qt_view_layout, False
+    ]()
+    comptime qt_k_stride: Int = (
+        qt_canonical[1].stride[1].value() * 2 * size_of[dtype]()
+    )
+
     var s_reg = LayoutTensor[
         accum_type,
         Layout.row_major(1, c_frag_sdp),
@@ -808,8 +821,11 @@ def bwd_main_kernel[
                             ds_reg.ptr[8 * i + 2 * jm + 1],
                         )
                     )
+                # .bitcast[BFloat16]: stdlib st_matrix over-asserts
+                # bf16/f32; stmatrix.b16 is dtype-agnostic (no-op
+                # for bf16, unblocks fp16).
                 st_matrix[simd_width=4, transpose=True](
-                    sds_ptr + i * 1024, packed
+                    (sds_ptr + i * 1024).bitcast[BFloat16](), packed
                 )
 
         # dV += P^T · dO — committed after the dS store (FA4's
@@ -817,7 +833,24 @@ def bwd_main_kernel[
         # runs under the PdS barrier wait below.
         warpgroup_fence(dv_acc)
         wgmma_dkv.arrive()
-        wgmma_dkv.wgmma(p_reg, dot_view, dv_acc)
+        comptime if dtype == DType.float16:
+            var dvb_desc = _wgmma_descriptor[
+                qt_canonical, False, swizzle
+            ](ring_base + (slot + 1) * q_slot_size)
+            var dv_simd = dv_acc.ptr.load[width=c_frag_dkv]()
+            comptime for k_mma in range(num_k_mmas_rs):
+                dv_simd = rebind[SIMD[accum_type, c_frag_dkv]](
+                    wgmma_rs_f16_m64n128(
+                        rebind[SIMD[DType.float16, 8]](
+                            (p_reg.ptr + 8 * k_mma).load[width=8]()
+                        ),
+                        (dvb_desc + k_mma * qt_k_stride).desc,
+                        rebind[SIMD[DType.float32, 64]](dv_simd),
+                    )
+                )
+            dv_acc.ptr.store[width=c_frag_dkv](dv_simd)
+        else:
+            wgmma_dkv.wgmma(p_reg, dot_view, dv_acc)
         wgmma_dkv.commit_group()
 
         comptime if not PROBE_NO_DQ:
@@ -885,7 +918,24 @@ def bwd_main_kernel[
         # dQ drain below overlaps the dK GEMM on the tensor core.
         warpgroup_fence(dk_acc)
         wgmma_dkv.arrive()
-        wgmma_dkv.wgmma(ds_reg, qt_view, dk_acc)
+        comptime if dtype == DType.float16:
+            var dkb_desc = _wgmma_descriptor[
+                qt_canonical, False, swizzle
+            ](ring_base + slot * q_slot_size)
+            var dk_simd = dk_acc.ptr.load[width=c_frag_dkv]()
+            comptime for k_mma in range(num_k_mmas_rs):
+                dk_simd = rebind[SIMD[accum_type, c_frag_dkv]](
+                    wgmma_rs_f16_m64n128(
+                        rebind[SIMD[DType.float16, 8]](
+                            (ds_reg.ptr + 8 * k_mma).load[width=8]()
+                        ),
+                        (dkb_desc + k_mma * qt_k_stride).desc,
+                        rebind[SIMD[DType.float32, 64]](dk_simd),
+                    )
+                )
+            dk_acc.ptr.store[width=c_frag_dkv](dk_simd)
+        else:
+            wgmma_dkv.wgmma(ds_reg, qt_view, dk_acc)
         wgmma_dkv.commit_group()
 
         # Queue [dQ, dK]: wait ≤1 retires dQ; dK still runs while we
@@ -1103,7 +1153,9 @@ def bwd_main_kernel[
         var raw_i: Int = dv_raw + (i % 4) * 32 + (i // 4) * (BN * 128)
         var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
         st_matrix[simd_width=4](
-            v_base + ((sw_i >> 1) - (Int(v_base) >> 1)),
+            (v_base + ((sw_i >> 1) - (Int(v_base) >> 1))).bitcast[
+                BFloat16
+            ](),
             packed,
         )
     fence_async_view_proxy()
@@ -1135,7 +1187,9 @@ def bwd_main_kernel[
         var raw_i: Int = dk_raw + (i % 4) * 32 + (i // 4) * (BN * 128)
         var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
         st_matrix[simd_width=4](
-            k_base + ((sw_i >> 1) - (Int(k_base) >> 1)),
+            (k_base + ((sw_i >> 1) - (Int(k_base) >> 1))).bitcast[
+                BFloat16
+            ](),
             packed,
         )
     fence_async_view_proxy()

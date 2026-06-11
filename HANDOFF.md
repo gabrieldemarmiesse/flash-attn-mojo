@@ -381,6 +381,29 @@ rematerialization lesson again, host-data edition). The
 cp_async_bulk_wait_group stdlib default is already .read — no win
 available there.
 
+## fp16 (2026-06-11, seventh session)
+
+Validated end-to-end (dense/causal/GQA/varlen, fwd+bwd) at parity:
+fwd 1.012-1.032x, bwd 1.016x vs FA4 fp16 (both impls run ~3-5%
+slower than their bf16 selves at identical flops — an FA4-side
+effect too, not ours). 0 spills; bf16 PTX byte-identical.
+
+Two stdlib over-restrictions vendored around (same class as the
+SM100-gated cp.reduce):
+- `st_matrix` comptime-asserts bf16/f32 although stmatrix.b16 is
+  dtype-agnostic (raw 16-bit stores; the payload is already
+  bit-packed f32 regs) -> `.bitcast[BFloat16]()` on the smem ptr at
+  the 4 call sites; no-op for bf16.
+- The register-A (RS) `wgmma_async` overload hardcodes `.bf16.bf16`
+  asm strings and bf16 rebinds (mma.mojo:952). The SS overloads use
+  the NVVM intrinsic with `_dtype_to_nvvm_wgmma_type` — generic.
+  `src/flash_attn_mojo/_wgmma_f16.mojo` vendors the n==128 arm 1:1
+  with the `.f32.f16.f16` suffix; the 3 RS sites (fwd PV, bwd
+  dV/dK) fork under `comptime dtype == float16` and replicate
+  TensorCoreAsync's RS k-loop (a-frags k-major at 8-elem strides,
+  B descriptor + k*stride11*2*sizeof steps, trans_b=1 for the
+  mn-major views).
+
 ## Not yet tried (fwd)
 
 - ~~L2 cache hints on TMA loads~~ DEBUNKED (third session): FA4's

@@ -6,8 +6,9 @@ kernels written from scratch in Mojo.
 ## State (2026-06-11): parity with FlashAttention-4 on H100
 
 The package races Tri Dao's **FlashAttention-4** (`flash_attn.cute`,
-CuTe DSL) at one minimalist config — bf16, head_dim=128, non-causal,
-contiguous, seqlen % 128 == 0, Hq == Hk. Canonical benchmark shape:
+CuTe DSL). Original minimalist config — bf16, head_dim=128,
+non-causal, contiguous, seqlen % 128 == 0, Hq == Hk; the envelope
+has since grown (causal, GQA, varlen+ragged, fp16 — see below). Canonical benchmark shape:
 **B=2, S=8192, H=16, D=128**. Both kernels are AT PARITY within
 run-to-run variance (locked clocks, interleaved):
 
@@ -89,6 +90,18 @@ run-to-run variance (locked clocks, interleaved):
   ~1.05x — known, low value. The lesson generalizes: descriptor
   chunking shows up as serialized UTMASTG issue cost, ~70 cycles
   apiece, exposed whenever per-CTA work is small.
+
+- FP16 (2026-06-11): the kernels were dtype-parameterized all
+  along; two stdlib over-restrictions had to be vendored around —
+  `st_matrix` comptime-asserts bf16/f32 (stmatrix.b16 is
+  dtype-agnostic: pointer-bitcast at the call sites) and the
+  register-A (RS) `wgmma_async` overload is hardcoded `.bf16.bf16`
+  inline asm (`_wgmma_f16.mojo` vendors the m64n128k16 f32.f16.f16
+  arm; the three RS sites — fwd PV, bwd dV/dK — fork under
+  `comptime dtype == float16`, replicating the TensorCoreAsync RS
+  k-loop; SS sites go through the dtype-generic NVVM intrinsic).
+  bf16 codegen byte-identical; fp16 parity fwd 1.01-1.03x / bwd
+  1.016x (in-band); 0 spills.
 
 `HANDOFF.md` is the full race log: architecture, the perf journey,
 the codegen lessons (uniform-register file capacity, the

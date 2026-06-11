@@ -36,7 +36,7 @@ fp32 precision.
 `flash_attn_func(q, k, v, softmax_scale=None, causal=False, *,
 return_lse=False)` with:
 
-- bf16, contiguous `(batch, seqlen, nheads, head_dim)`
+- bf16 or fp16, contiguous `(batch, seqlen, nheads, head_dim)`
 - `head_dim == 128`, `seqlen % 128 == 0`, MHA or GQA
   (`Hq % Hkv == 0`)
 - causal or non-causal (both differentiable, both at parity); no

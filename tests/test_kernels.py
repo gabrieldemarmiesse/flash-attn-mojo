@@ -116,13 +116,16 @@ def _varlen_bwd(q, k, v, out, dout, lse, cu, causal):
     return bwd_fa4_varlen(q, k, v, out, dout, lse, cu, cu, causal=causal)
 
 
-def _make(seqlen, hq=4, hkv=4, batch=2, requires_grad=False):
+DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
+
+
+def _make(seqlen, hq=4, hkv=4, batch=2, requires_grad=False, dt=torch.bfloat16):
     q = torch.randn(
-        batch, seqlen, hq, 128, dtype=torch.bfloat16, device="cuda",
+        batch, seqlen, hq, 128, dtype=dt, device="cuda",
         requires_grad=requires_grad,
     )
     k = torch.randn(
-        batch, seqlen, hkv, 128, dtype=torch.bfloat16, device="cuda",
+        batch, seqlen, hkv, 128, dtype=dt, device="cuda",
         requires_grad=requires_grad,
     )
     v = torch.randn_like(k, requires_grad=requires_grad)
@@ -145,14 +148,17 @@ def _make_varlen(lens, hq=4, hkv=4):
 
 # ---------------------------------------------------------- dense
 @requires_cuda
+@pytest.mark.parametrize("dtype", ["bf16", "fp16"])
 @pytest.mark.parametrize("seqlen", SEQLENS)
 @pytest.mark.parametrize("heads", ["mha", "gqa"])
 @pytest.mark.parametrize("mask", ["plain", "causal"])
-def test_fwd_dense(seqlen, mask, heads):
+def test_fwd_dense(seqlen, mask, heads, dtype):
     _skip_if_impl_unavailable()
     torch.manual_seed(1)
     causal = mask == "causal"
-    q, k, v = _make(seqlen, hkv=4 if heads == "mha" else 2)
+    q, k, v = _make(
+        seqlen, hkv=4 if heads == "mha" else 2, dt=DTYPES[dtype]
+    )
     out, lse = _fwd(q, k, v, causal)
     ref, ref_lse = flash_attn_ref(
         q.float(), k.float(), v.float(), causal=causal, return_lse=True
@@ -165,14 +171,17 @@ def test_fwd_dense(seqlen, mask, heads):
 
 
 @requires_cuda
+@pytest.mark.parametrize("dtype", ["bf16", "fp16"])
 @pytest.mark.parametrize("seqlen", SEQLENS)
 @pytest.mark.parametrize("heads", ["mha", "gqa"])
 @pytest.mark.parametrize("mask", ["plain", "causal"])
-def test_bwd_dense(seqlen, mask, heads):
+def test_bwd_dense(seqlen, mask, heads, dtype):
     _skip_if_impl_unavailable()
     torch.manual_seed(1)
     causal = mask == "causal"
-    q, k, v = _make(seqlen, hkv=4 if heads == "mha" else 2)
+    q, k, v = _make(
+        seqlen, hkv=4 if heads == "mha" else 2, dt=DTYPES[dtype]
+    )
     dout = torch.randn_like(q)
     out, lse = _fwd(q, k, v, causal)
     dq, dk, dv = _bwd(q, k, v, out, dout, lse, causal)
@@ -347,3 +356,39 @@ def test_bwd_varlen_canonical(mask, heads):
     for name, got, ref in zip(("dq", "dk", "dv"), grads, refs):
         d = (got - ref).abs().max().item()
         assert d < BWD_TOL_MASKED, f"{name} maxdiff {d:.3e}"
+
+
+@requires_cuda
+def test_varlen_fp16_smoke():
+    """fp16 through the varlen path (ragged set, fwd out/lse + grads
+    via the kernel wrappers)."""
+    _skip_if_impl_unavailable()
+    torch.manual_seed(5)
+    lens = [63, 129, 257]
+    cu_list = [0]
+    for L in lens:
+        cu_list.append(cu_list[-1] + L)
+    cu = torch.tensor(cu_list, dtype=torch.int32, device="cuda")
+    q = torch.randn(
+        cu_list[-1], 4, 128, dtype=torch.float16, device="cuda"
+    )
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    dout = torch.randn_like(q)
+    out, lse = _varlen_fwd(q, k, v, cu, False)
+    ref, ref_lse = flash_attn_varlen_ref(
+        q.float(), k.float(), v.float(), cu, cu, return_lse=True
+    )
+    assert (out.float() - ref).abs().max().item() < FWD_TOL
+    assert (lse - ref_lse).abs().max().item() < LSE_TOL
+    dq, dk, dv = _varlen_bwd(q, k, v, out, dout, lse, cu, False)
+    qf = q.detach().float().requires_grad_()
+    kf = k.detach().float().requires_grad_()
+    vf = v.detach().float().requires_grad_()
+    r = flash_attn_varlen_ref(qf, kf, vf, cu, cu)
+    r.backward(dout.float())
+    for name, got, want in (
+        ("dq", dq, qf.grad), ("dk", dk, kf.grad), ("dv", dv, vf.grad)
+    ):
+        d = (got.float() - want).abs().max().item()
+        assert d < BWD_TOL, f"{name} maxdiff {d:.3e}"

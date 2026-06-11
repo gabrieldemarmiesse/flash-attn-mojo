@@ -110,6 +110,9 @@ def _run_check_suite(args) -> None:
     ]
     if not args.varlen:
         parts.append("gqa" if args.hkv else "mha")
+    # dtype axis: bf16 selects bf16-id'd + un-id'd (canonical) tests;
+    # fp16 selects only the fp16-id'd ones.
+    parts.append("not fp16" if args.dtype == "bf16" else "fp16")
     kexpr = " and ".join(parts)
     tests = Path(__file__).resolve().parent.parent / "tests" / "test_kernels.py"
     print(f"CHECK pytest -k '{kexpr}' (impl={args.impl})")
@@ -154,6 +157,10 @@ def main() -> None:
     )
     p.add_argument("--causal", action="store_true")
     p.add_argument(
+        "--dtype", choices=["bf16", "fp16"], default="bf16",
+        help="tensor dtype for the bench shapes",
+    )
+    p.add_argument(
         "--varlen",
         action="store_true",
         help="packed varlen (cu_seqlens) mode",
@@ -175,6 +182,7 @@ def main() -> None:
 
     B, S, H, D = args.shape
     torch.manual_seed(args.seed)
+    DT = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
 
     if args.check_only:
         _run_check_suite(args)
@@ -190,9 +198,9 @@ def main() -> None:
             cu_list.append(cu_list[-1] + L)
         total = cu_list[-1]
         cu = torch.tensor(cu_list, dtype=torch.int32, device="cuda")
-        q = torch.randn(total, H, D, dtype=torch.bfloat16, device="cuda")
+        q = torch.randn(total, H, D, dtype=DT, device="cuda")
         h_kv = args.hkv if args.hkv else H
-        k = torch.randn(total, h_kv, D, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(total, h_kv, D, dtype=DT, device="cuda")
         v = torch.randn_like(k)
         holder = {}
         if args.kind == "bwd":
@@ -246,9 +254,9 @@ def main() -> None:
 
         outputs = lambda: holder["o"]  # noqa: E731
     else:
-        q = torch.randn(B, S, H, D, dtype=torch.bfloat16, device="cuda")
+        q = torch.randn(B, S, H, D, dtype=DT, device="cuda")
         h_kv = args.hkv if args.hkv else H
-        k = torch.randn(B, S, h_kv, D, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(B, S, h_kv, D, dtype=DT, device="cuda")
         v = torch.randn_like(k)
         dout = torch.randn_like(q) if args.kind == "bwd" else None
 
@@ -303,7 +311,7 @@ def main() -> None:
     print(
         f"RESULT impl={args.impl} kind={args.kind} "
         f"shape={shape_str} causal={int(args.causal)} "
-        f"hkv={hkv_str} "
+        f"hkv={hkv_str} dtype={args.dtype} "
         f"us={us:.1f} tflops={tflops:.1f}"
     )
     for e in sorted(

@@ -57,7 +57,9 @@ def native_fwd_fa4(
 
     batch, seqlen, nheads, head_dim = q.shape
     nheads_kv = k.shape[2]
-    assert q.dtype == torch.bfloat16, "fwd_fa4 is bf16-only"
+    assert q.dtype in (torch.bfloat16, torch.float16), (
+        "fwd_fa4 is bf16/fp16-only"
+    )
     assert head_dim == 128, "fwd_fa4 is head_dim=128-only"
     assert seqlen % _BLOCK_N == 0, "fwd_fa4 needs seqlen % 128 == 0"
     assert k.shape == (batch, seqlen, nheads_kv, head_dim)
@@ -161,7 +163,9 @@ def fa4_varlen_fwd(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    assert q.dtype == torch.bfloat16, "fwd_fa4 is bf16-only"
+    assert q.dtype in (torch.bfloat16, torch.float16), (
+        "fwd_fa4 is bf16/fp16-only"
+    )
     assert head_dim == 128, "fwd_fa4 is head_dim=128-only"
     assert k.shape == (total_k, nheads_kv, head_dim)
     assert v.shape == k.shape

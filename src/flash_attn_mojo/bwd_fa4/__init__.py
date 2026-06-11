@@ -50,7 +50,9 @@ def bwd_fa4(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    assert q.dtype == torch.bfloat16, "bwd_fa4 is bf16-only"
+    assert q.dtype in (torch.bfloat16, torch.float16), (
+        "bwd_fa4 is bf16/fp16-only"
+    )
     assert head_dim == 128, "bwd_fa4 is head_dim=128-only"
     assert seqlen % _BLOCK == 0, "bwd_fa4 needs seqlen % 128 == 0"
     assert k.shape == (batch, seqlen, nheads_kv, head_dim)
@@ -283,7 +285,9 @@ def bwd_fa4_varlen(
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
     gqa_ratio = nheads // nheads_kv
-    assert q.dtype == torch.bfloat16, "bwd_fa4 is bf16-only"
+    assert q.dtype in (torch.bfloat16, torch.float16), (
+        "bwd_fa4 is bf16/fp16-only"
+    )
     assert head_dim == 128, "bwd_fa4 is head_dim=128-only"
     assert nheads % nheads_kv == 0, "Hq must be a multiple of Hkv"
     assert k.shape == (total_k, nheads_kv, head_dim)

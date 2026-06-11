@@ -4,7 +4,7 @@ FlashAttention-4-class Hopper kernels (`fwd_fa4` / `bwd_fa4`),
 JIT-compiled on first use. Supported envelope (asserted with clear
 errors):
 
-    * bf16 q/k/v, contiguous (B, S, H, D)
+    * bf16 or fp16 q/k/v, contiguous (B, S, H, D)
     * head_dim == 128
     * seqlen % 128 == 0
     * causal or non-causal (both at FA4 kernel-time parity, fwd
@@ -43,8 +43,10 @@ def _check_envelope(
             f"{tuple(q.shape)}"
         )
     _batch, seqlen, _nheads, head_dim = q.shape  # noqa: F841
-    if q.dtype != torch.bfloat16:
-        raise ValueError(f"only bf16 is supported, got {q.dtype}")
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"only bf16 and fp16 are supported, got {q.dtype}"
+        )
     if head_dim != _SUPPORTED_HEAD_DIM:
         raise ValueError(
             f"only head_dim={_SUPPORTED_HEAD_DIM} is supported, got "
@@ -112,7 +114,7 @@ def flash_attn_func(
     """Scaled-dot-product attention via the FA4-class Mojo kernels.
 
     Args:
-        q, k, v: bf16 CUDA tensors, q (batch, seqlen, nheads,
+        q, k, v: bf16/fp16 CUDA tensors, q (batch, seqlen, nheads,
             head_dim), k/v (batch, seqlen, nheads_kv, head_dim) with
             Hq % Hkv == 0 (head_dim=128, seqlen % 128 == 0).
             Non-CUDA tensors run the pure-PyTorch reference instead.
@@ -155,8 +157,10 @@ def _check_varlen_envelope(
             f"got {tuple(q.shape)}"
         )
     _total, nheads, head_dim = q.shape
-    if q.dtype != torch.bfloat16:
-        raise ValueError(f"only bf16 is supported, got {q.dtype}")
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"only bf16 and fp16 are supported, got {q.dtype}"
+        )
     if head_dim != _SUPPORTED_HEAD_DIM:
         raise ValueError(
             f"only head_dim={_SUPPORTED_HEAD_DIM} is supported, got "
