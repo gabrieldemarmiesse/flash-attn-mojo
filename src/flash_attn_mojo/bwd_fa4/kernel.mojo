@@ -145,6 +145,7 @@ def bwd_main_kernel[
     causal: Bool = False,
     gqa_ratio: Int = 1,
     varlen: Bool = False,
+    window: Bool = False,
 ](
     q_tma: TMATensorTile[dtype, 3, q_tile_shape, q_desc_shape],
     do_tma: TMATensorTile[dtype, 3, q_tile_shape, q_desc_shape],
@@ -299,6 +300,18 @@ def bwd_main_kernel[
             empty[s].init(Int32(NWG * 128))
     barrier()
 
+    # Sliding window (causal local, v1: dense, left % 128 == 0).
+    # win_left rides the HIGH 32 bits of seq_len — the established
+    # seq_len slot-riding pattern (varlen already repurposes it as
+    # num_mpad) — so the kernel signature stays byte-identical to
+    # dense AND the feature survives GQA, where both accum-ptr
+    # slots are taken. Non-window variants read seq_len verbatim.
+    var win_left: Int = 0
+    var slen: Int = seq_len
+    comptime if window:
+        win_left = seq_len >> 32
+        slen = seq_len & 0xFFFFFFFF
+
     var n_block: Int
     var h_idx: Int
     var b_idx: Int
@@ -337,11 +350,20 @@ def bwd_main_kernel[
         n_block = Int(block_idx.x)
         h_idx = Int(block_idx.y)
         b_idx = Int(block_idx.z)
-        num_m_blocks = (seq_len + BM - 1) // BM
+        num_m_blocks = (slen + BM - 1) // BM
         comptime if causal:
             m_start = (n_block * BN) // BM
-        kv_row = b_idx * seq_len + n_block * BN
+        kv_row = b_idx * slen + n_block * BN
     var m_trips: Int = num_m_blocks - m_start
+    comptime if window:
+        # Upper trip bound: kv tile n receives gradient only from q
+        # tiles with m*BM <= n*BN + BN - 1 + win_left (q rows past
+        # the window edge attend none of this tile).
+        var m_end: Int = min(
+            num_m_blocks,
+            (n_block * BN + BN + win_left + BM - 1) // BM,
+        )
+        m_trips = m_end - m_start
 
     # The warpgroup index is shfl-broadcast from lane 0: ptxas's
     # tid-uniformity pattern only matches 32-bit shr.u32 on %tid.x,
@@ -380,12 +402,12 @@ def bwd_main_kernel[
                 # mpad_base*BM (seq_len carries num_mpad).
                 q_row = vl_q_base + m_start * BM
                 bh_stat = (
-                    (h_idx * seq_len + vl_mpad_base + m_start) * BM
+                    (h_idx * slen + vl_mpad_base + m_start) * BM
                 ) * 4
             else:
                 # lse_log2/dpsum are (B, H, Spad) — padded to a
                 # multiple of BM (pad rows +inf / 0; causal: spad == S).
-                q_row = b_idx * seq_len + m_start * BM
+                q_row = b_idx * slen + m_start * BM
                 bh_stat = (
                     (b_idx * Int(grid_dim.y) + h_idx)
                     * (num_m_blocks * BM)
@@ -477,7 +499,7 @@ def bwd_main_kernel[
             var dq_byte_base: Int
             comptime if varlen:
                 dq_byte_base = Int(dq_accum_ptr) + (
-                    h_idx * seq_len + vl_mpad_base + m_start
+                    h_idx * slen + vl_mpad_base + m_start
                 ) * (2 * DQ_MAIL_F32 * 4)
             else:
                 dq_byte_base = Int(dq_accum_ptr) + (
@@ -729,6 +751,30 @@ def bwd_main_kernel[
                     comptime crow_off: Int = 8 if (c % 4) >= 2 else 0
                     if mrow_lo + crow_off > (
                         ccol_base + 2 * lane_pair + mask_d
+                    ):
+                        s_reg.ptr[c] = Scalar[accum_type](-1.0e30)
+
+        comptime if window:
+            # Trailing window-edge trips: q cols past kv row +
+            # win_left fall outside the window. left % 128 == 0
+            # keeps the boundary m-tile-aligned, so exactly BN//BM
+            # trailing trips mask (fewer when the sequence end
+            # clamps m_end first); with left >= BN they never
+            # overlap the diagonal trips above. Masked entries
+            # exp2 to 0 in P^T, zeroing their dV/dK/dS/dQ
+            # contributions.
+            var mask_w: Int = (
+                n_block * BN + win_left - (m_start + it) * BM
+            )
+            if mask_w < BM:
+                var wrow_lo: Int = (
+                    wg * WGMMA_M + warp_in_wg * 16 + lane_group
+                )
+                comptime for c in range(c_frag_sdp):
+                    comptime wcol_base: Int = (c // 4) * 8 + (c & 1)
+                    comptime wrow_off: Int = 8 if (c % 4) >= 2 else 0
+                    if wcol_base + 2 * lane_pair > (
+                        wrow_lo + wrow_off + mask_w
                     ):
                         s_reg.ptr[c] = Scalar[accum_type](-1.0e30)
 
@@ -1081,7 +1127,7 @@ def bwd_main_kernel[
                     b_idx * (Int(grid_dim.y) // gqa_ratio)
                     + h_idx // gqa_ratio
                 )
-                * seq_len
+                * slen
                 + n_block * BN
             ) * D * 4
         comptime for t in range(2):  # 0 = dV, 1 = dK

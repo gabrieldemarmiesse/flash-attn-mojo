@@ -53,6 +53,23 @@ def test_envelope_errors():
         flash_attn_func(q, k[:, :, :2], v)
 
 
+def test_window_envelope_errors():
+    q, k, v = _qkv()
+    with pytest.raises(ValueError, match="causal=True"):
+        flash_attn_func(q, k, v, window_size=(256, 256))
+    with pytest.raises(ValueError, match="left % 128"):
+        flash_attn_func(q, k, v, causal=True, window_size=(100, 0))
+    with pytest.raises(ValueError, match="left must be >= 0"):
+        flash_attn_func(q, k, v, causal=True, window_size=(-2, 0))
+
+
+def test_window_cpu_reference_path():
+    q, k, v = _qkv(seqlen=256)
+    out = flash_attn_func(q, k, v, causal=True, window_size=(128, 0))
+    ref = flash_attn_ref(q, k, v, causal=True, window_size=(128, 0))
+    assert torch.equal(out, ref)
+
+
 def test_cpu_reference_path():
     q, k, v = _qkv()
     out = flash_attn_func(q, k, v)

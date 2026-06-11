@@ -190,6 +190,7 @@ def launch_bwd_main[
     causal: Bool = False,
     gqa_ratio: Int = 1,
     varlen: Bool = False,
+    window: Bool = False,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -211,6 +212,7 @@ def launch_bwd_main[
     vl_total_q: Int = 0,
     vl_total_k: Int = 0,
     vl_num_mpad: Int = 0,
+    window_left: Int = 0,
 ) raises:
     var ctx = _ctx_and_stream(ctx_handle_addr)
     var stream_opaque = OpaquePointer[MutAnyOrigin](
@@ -289,6 +291,11 @@ def launch_bwd_main[
         rows_kv = vl_total_k
         dk_accum_addr_eff = vl_table_addr
         seq_len_arg = vl_num_mpad
+    comptime if window:
+        # win_left rides the high 32 bits of the seq_len kernel arg
+        # (signature stays byte-identical to dense; see the kernel's
+        # decode comment).
+        seq_len_arg = seqlen_int | (window_left << 32)
     var nheads_kv: Int = nheads_int // gqa_ratio
     # Under GQA the dk/dv addresses carry the fp32 per-kv-head
     # accumulators (the epilogue bulk-reduce-adds into them; a torch
@@ -331,6 +338,7 @@ def launch_bwd_main[
         causal,
         gqa_ratio,
         varlen,
+        window,
     ]
 
     var compiled = ctx.compile_function[

@@ -50,25 +50,27 @@ def make_config(
     causal: bool = False,
     gqa_ratio: int = 1,
     varlen: bool = False,
+    window: bool = False,
 ):
     dump_ptx = os.environ.get("MOJO_DUMP_PTX", "")
     return (
         dtype_code, head_dim, bool(use_external_stream), bool(causal),
-        int(gqa_ratio), bool(varlen), dump_ptx,
+        int(gqa_ratio), bool(varlen), bool(window), dump_ptx,
     )
 
 
 def _mod_name(config: tuple) -> str:
-    (dt, hd, ues, causal, ratio, varlen, dump_ptx) = config
+    (dt, hd, ues, causal, ratio, varlen, window, dump_ptx) = config
     suffix = "_causal" if causal else ""
     suffix += f"_gqa{ratio}" if ratio > 1 else ""
     suffix += "_varlen" if varlen else ""
+    suffix += "_win" if window else ""
     suffix += "_dumpptx" if dump_ptx else ""
     return f"{_DTYPE_NAME[dt]}_hd{hd}_extstr{int(ues)}{suffix}"
 
 
 def _defines(config: tuple) -> dict[str, str]:
-    (dt, hd, ues, causal, ratio, varlen, dump_ptx) = config
+    (dt, hd, ues, causal, ratio, varlen, window, dump_ptx) = config
     defines = {
         "DTYPE": _DTYPE_DEFINE[dt],
         "HEAD_DIM": str(hd),
@@ -76,6 +78,7 @@ def _defines(config: tuple) -> dict[str, str]:
         "CAUSAL": "true" if causal else "false",
         "GQA_RATIO": str(ratio),
         "VARLEN": "true" if varlen else "false",
+        "WINDOW": "true" if window else "false",
     }
     if dump_ptx:
         defines["MOJO_DUMP_PTX"] = dump_ptx

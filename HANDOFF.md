@@ -440,6 +440,47 @@ NWG=2) fallback config — FA4-blessed — to dodge in-pack 192-tails)
 and hdim64 fp16 (m64n64 arm for _wgmma_f16.mojo, mirror the
 stdlib's n==64 arm).
 
+## Sliding window (2026-06-11, eighth session)
+
+Mistral-style SWA (causal + left window), fully differentiable,
+MHA + GQA. Canonical window=(1024,0): fwd 1.007-1.009x, bwd
+0.983-0.985x (mojo FASTER) — both inside wobble vs FA4's 382/1181
+us targets (reference PTX committed for both).
+
+Window masking is the causal diagonal's mirror image, and the
+whole feature reuses that machinery:
+
+- fwd: per q-tile, skip kv tiles below `first_kv = (m*BM -
+  left) // BN` (trip-count change only) and mask the single
+  leading-edge boundary tile with the same column-mask shape as the
+  diagonal arm, keyed on the prologue's existing mask_tail flag.
+  The steady loop stays mask-free (the varlen lesson). The LPT
+  scheduler is REPLACED by a plain grid under window — windowed
+  work per q-tile is uniform, LPT's imbalance premise is gone —
+  which freed the sched_swizzle kernel slot for window_left.
+- bwd: per kv tile, the m-walk gains an upper bound `m_end =
+  ceil((n*BN + BN + left)/BM)` and the trailing trips mask S^T with
+  `col > row + mask_w` (`mask_w = n*BN + left - m_abs*BM`, guard
+  `mask_w < BM`) — the exact transpose-mirror of the causal arm.
+  left % 128 == 0 keeps both boundaries m-tile-aligned: BN/BM
+  leading diagonal trips + BN/BM trailing window trips, disjoint
+  whenever left >= BN. preprocess/convert need NO window knowledge
+  (every q row attends itself; untouched dq_accum regions stay at
+  preprocess's zeros).
+- Slot-riding novelty: the bwd's win_left rides the HIGH 32 BITS
+  of the seq_len kernel arg (host packs `S | (left << 32)`, the
+  kernel decodes under `comptime if window`). Chosen over an
+  accum-ptr slot because GQA occupies BOTH dk/dv accum slots —
+  high-bits packing is the only dense slot that survives every
+  head config. Byte-gated across all 6 dense/varlen bwd variants.
+
+Gate note (stale-baseline trap again): two byte-gates "failed"
+against /tmp/ptx_hd128_baseline — gqa by 3 shr-immediates (the
+baseline was dumped at a different comptime gqa_ratio) and
+causal_varlen by 3k lines (baseline predated a committed change).
+Fresh stash-based baselines from HEAD: both byte-identical. ALWAYS
+re-baseline via stash before believing a gate failure.
+
 ## Not yet tried (fwd)
 
 - ~~L2 cache hints on TMA loads~~ DEBUNKED (third session): FA4's

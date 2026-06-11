@@ -30,12 +30,15 @@ def bwd_fa4(
     lse: torch.Tensor,
     softmax_scale: float | None = None,
     causal: bool = False,
+    window_left: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute (dq, dk, dv). Mirrors
     ``flash_attn.cute.interface._flash_attn_bwd``'s simplest call.
 
     q/k/v/out/dout: (B, S, H, D) bf16 contiguous, D=128, S % 128 == 0.
     lse: (B, H, S) fp32 contiguous (natural-log LSE from the fwd).
+    window_left > 0: causal sliding window (Mistral SWA) — same v1
+    envelope as the fwd (causal, head_dim=128, left % 128 == 0).
     """
     from flash_attn_mojo.bwd_fa4._jit import (
         call_bwd_fa4_convert,
@@ -58,6 +61,10 @@ def bwd_fa4(
         "hdim64 fp16 needs the n=64 RS wgmma arm"
     )
     assert seqlen % _BLOCK == 0, "bwd_fa4 needs seqlen % 128 == 0"
+    if window_left:
+        assert causal and head_dim == 128 and window_left % 128 == 0, (
+            "window v1: causal + head_dim=128 + left % 128 == 0"
+        )
     assert k.shape == (batch, seqlen, nheads_kv, head_dim)
     assert v.shape == k.shape
     assert nheads % nheads_kv == 0, "Hq must be a multiple of Hkv"
@@ -105,7 +112,8 @@ def bwd_fa4(
     )
 
     config = make_config(
-        _DTYPE_CODE[q.dtype], head_dim, True, causal, gqa_ratio
+        _DTYPE_CODE[q.dtype], head_dim, True, causal, gqa_ratio,
+        window=bool(window_left),
     )
     stream = torch.cuda.current_stream().cuda_stream
 
@@ -144,6 +152,7 @@ def bwd_fa4(
             dq_accum.data_ptr(),
             stream,
             0, 0, 0, 0, 0,  # varlen extras
+            window_left,
         ),
         config,
     )
@@ -405,6 +414,7 @@ def bwd_fa4_varlen(
             total_q,
             total_k,
             num_mpad,
+            0,  # window_left (varlen window not in v1)
         ),
         config,
     )

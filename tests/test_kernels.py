@@ -214,8 +214,14 @@ def test_bwd_dense(seqlen, mask, heads, dtype, hdim):
 # (seqlen, window_left) — v1 envelope: causal, hdim128,
 # window_left % 128 == 0. W=128 at S=1024 leaves most kv tiles
 # skipped (deep first_kv); W >= S degenerates to plain causal.
-WINDOW_CASES = [(256, 128), (640, 256), (1024, 512), (1024, 128)]
-WINDOW_IDS = ["S256-W128", "S640-W256", "S1024-W512", "S1024-W128"]
+WINDOW_CASES = [
+    (256, 128), (640, 256), (1024, 512), (1024, 128),
+    (1024, 1024),  # W >= S degenerates to plain causal
+]
+WINDOW_IDS = [
+    "S256-W128", "S640-W256", "S1024-W512", "S1024-W128",
+    "S1024-W1024",
+]
 
 
 def _fwd_window(q, k, v, window_left):
@@ -232,12 +238,13 @@ def _fwd_window(q, k, v, window_left):
 
 
 @requires_cuda
+@pytest.mark.parametrize("heads", ["mha", "gqa"])
 @pytest.mark.parametrize("case", WINDOW_CASES, ids=WINDOW_IDS)
-def test_fwd_window(case):
+def test_fwd_window(case, heads):
     _skip_if_impl_unavailable()
     seqlen, window_left = case
     torch.manual_seed(1)
-    q, k, v = _make(seqlen)
+    q, k, v = _make(seqlen, hkv=4 if heads == "mha" else 2)
     out, lse = _fwd_window(q, k, v, window_left)
     ref, ref_lse = flash_attn_ref(
         q.float(), k.float(), v.float(), causal=True,
@@ -247,6 +254,48 @@ def test_fwd_window(case):
     assert d < FWD_TOL_MASKED, f"out maxdiff {d:.3e}"
     dl = (lse - ref_lse).abs().max().item()
     assert dl < LSE_TOL, f"lse maxdiff {dl:.3e}"
+
+
+def _bwd_window(q, k, v, out, dout, lse, window_left):
+    if IMPL == "fa4":
+        from flash_attn.cute.interface import _flash_attn_bwd
+
+        return _flash_attn_bwd(
+            q, k, v, out, dout, lse, causal=True,
+            window_size_left=window_left,
+        )
+    from flash_attn_mojo.bwd_fa4 import bwd_fa4
+
+    return bwd_fa4(
+        q, k, v, out, dout, lse, causal=True,
+        window_left=window_left,
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("heads", ["mha", "gqa"])
+@pytest.mark.parametrize("case", WINDOW_CASES, ids=WINDOW_IDS)
+def test_bwd_window(case, heads):
+    _skip_if_impl_unavailable()
+    seqlen, window_left = case
+    torch.manual_seed(1)
+    q, k, v = _make(seqlen, hkv=4 if heads == "mha" else 2)
+    dout = torch.randn_like(q)
+    out, lse = _fwd_window(q, k, v, window_left)
+    dq, dk, dv = _bwd_window(q, k, v, out, dout, lse, window_left)
+
+    qf = q.detach().float().requires_grad_()
+    kf = k.detach().float().requires_grad_()
+    vf = v.detach().float().requires_grad_()
+    ref = flash_attn_ref(
+        qf, kf, vf, causal=True, window_size=(window_left, 0)
+    )
+    ref.backward(dout.float())
+    for name, got, want in (
+        ("dq", dq, qf.grad), ("dk", dk, kf.grad), ("dv", dv, vf.grad)
+    ):
+        d = (got.float() - want).abs().max().item()
+        assert d < BWD_TOL_MASKED, f"{name} maxdiff {d:.3e}"
 
 
 # --------------------------------------------------------- varlen
@@ -341,6 +390,31 @@ def test_fwd_window_canonical():
     )
     assert (out - ref_out).abs().max().item() < FWD_TOL_MASKED
     assert (lse - ref_lse).abs().max().item() < LSE_TOL
+
+
+@requires_cuda
+def test_bwd_window_canonical():
+    _skip_unless_cross_check()
+    from flash_attn.cute import flash_attn_func as fa4_func
+    from flash_attn.cute.interface import _flash_attn_bwd
+    from flash_attn_mojo.bwd_fa4 import bwd_fa4
+
+    torch.manual_seed(0)
+    B, S, H, D = CANONICAL
+    q, k, v = _make(S, hq=H, hkv=H, batch=B)
+    dout = torch.randn_like(q)
+    out, lse = fa4_func(
+        q, k, v, causal=True, window_size=(1024, 0), return_lse=True
+    )
+    grads = bwd_fa4(
+        q, k, v, out, dout, lse, causal=True, window_left=1024
+    )
+    refs = _flash_attn_bwd(
+        q, k, v, out, dout, lse, causal=True, window_size_left=1024
+    )
+    for name, got, ref in zip(("dq", "dk", "dv"), grads, refs):
+        d = (got - ref).abs().max().item()
+        assert d < BWD_TOL_MASKED, f"{name} maxdiff {d:.3e}"
 
 
 @requires_cuda

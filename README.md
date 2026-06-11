@@ -21,12 +21,15 @@ FA4's kernel time within run-to-run variance:
 | bwd (varlen) | 0.98 / 1.00x (plain/causal) |
 | fwd (hdim64) | 0.96 / 0.95x (plain/causal, mojo faster) |
 | bwd (hdim64) | 0.97 / 0.97x (plain/causal) |
+| fwd (sliding window) | 1.01x |
+| bwd (sliding window) | 0.98x (mojo faster) |
 
 (Locked clocks, interleaved kernel-only CUPTI timing; both kernels
 wobble ~2–4% run to run, so everything above straddles parity. The
 bwd main loop executes 448 instructions/iteration to FA4's 532 at
 identical tensor-core work. Varlen rows: the canonical packed
-config — 8 sequences, 16384 total tokens, lengths 1280–3072.)
+config — 8 sequences, 16384 total tokens, lengths 1280–3072.
+Window rows: causal, window=(1024, 0) at the canonical shape.)
 
 The kernels are warp-specialized TMA + WGMMA Hopper kernels JIT-built
 via `mojo build` on first use and cached; correctness sits at the
@@ -35,16 +38,18 @@ fp32 precision.
 
 ## Supported envelope
 
-`flash_attn_func(q, k, v, softmax_scale=None, causal=False, *,
-return_lse=False)` with:
+`flash_attn_func(q, k, v, softmax_scale=None, causal=False,
+window_size=(-1, -1), *, return_lse=False)` with:
 
 - bf16 or fp16, contiguous `(batch, seqlen, nheads, head_dim)`
 - `head_dim` 64 or 128; ANY seqlen at head_dim=128 (non-multiples
   of 128 route through the varlen kernels internally), seqlen %
   128 == 0 at head_dim=64; MHA or GQA
   (`Hq % Hkv == 0`)
-- causal or non-causal (both differentiable, both at parity); no
-  dropout / windows / ALiBi
+- causal or non-causal (both differentiable, both at parity)
+- sliding window (Mistral SWA): `causal=True, window_size=(left,
+  0)` with `left % 128 == 0`, head_dim=128, seqlen % 128 == 0 —
+  fully differentiable; no dropout / ALiBi
 - CUDA sm90 (Hopper); non-CUDA tensors run a pure-PyTorch reference
 
 Everything outside the envelope raises a clear error. The op is

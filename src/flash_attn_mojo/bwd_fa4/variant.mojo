@@ -20,6 +20,7 @@ comptime USE_EXTERNAL_STREAM: Bool = get_defined_bool["USE_EXTERNAL_STREAM"]()
 comptime CAUSAL: Bool = get_defined_bool["CAUSAL", False]()
 comptime GQA_RATIO: Int = get_defined_int["GQA_RATIO", 1]()
 comptime VARLEN: Bool = get_defined_bool["VARLEN", False]()
+comptime WINDOW: Bool = get_defined_bool["WINDOW", False]()
 
 
 def flash_attn_bwd_fa4_acquire_ctx(
@@ -63,7 +64,13 @@ def flash_attn_bwd_fa4_main(
     mut args: PythonObject,
 ) raises -> PythonObject:
     launch_bwd_main[
-        DTYPE, HEAD_DIM, USE_EXTERNAL_STREAM, CAUSAL, GQA_RATIO, VARLEN
+        DTYPE,
+        HEAD_DIM,
+        USE_EXTERNAL_STREAM,
+        CAUSAL,
+        GQA_RATIO,
+        VARLEN,
+        WINDOW,
     ](
         Int(py=args[0]),  # batch
         Int(py=args[1]),  # seqlen
@@ -79,12 +86,13 @@ def flash_attn_bwd_fa4_main(
         Int(py=args[11]),  # dpsum_addr
         Int(py=args[12]),  # dq_accum_addr
         Int(py=args[13]),  # stream
-        Int(py=args[19]),  # ctx handle
+        Int(py=args[20]),  # ctx handle (appended by the dispatcher)
         Int(py=args[14]),  # vl_num_kv_tiles (0 when dense)
         Int(py=args[15]),  # vl_table_addr
         Int(py=args[16]),  # vl_total_q
         Int(py=args[17]),  # vl_total_k
         Int(py=args[18]),  # vl_num_mpad
+        Int(py=args[19]),  # window_left (0 when not windowed)
     )
     return PythonObject(None)
 

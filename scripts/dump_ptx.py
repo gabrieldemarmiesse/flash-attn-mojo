@@ -65,7 +65,7 @@ def main() -> None:
 
             bwd_fa4(
                 q, k, v, out, torch.randn_like(q), lse,
-                causal=args.causal,
+                causal=args.causal, window_left=args.window,
             )
     torch.cuda.synchronize()
     print("dumped", args)

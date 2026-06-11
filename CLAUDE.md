@@ -126,6 +126,30 @@ run-to-run variance (locked clocks, interleaved):
   NWG=2) fallback config per the spec, FA4-blessed) and hdim64 fp16
   (needs an m64n64 arm in _wgmma_f16.mojo).
 
+- SLIDING WINDOW (2026-06-11, Mistral SWA, fully differentiable,
+  MHA + GQA): fwd 1.007-1.009x / bwd 0.983-0.985x (mojo FASTER) at
+  the canonical shape with window=(1024,0), locked-clock 3-run
+  spreads vs FA4 (`window_size_left`). v1 envelope: causal +
+  hdim128 + dense + window_left % 128 == 0 (+ seqlen % 128). API:
+  `flash_attn_func(..., causal=True, window_size=(left, 0))`. fwd:
+  window_left rides the sched_swizzle slot; LPT replaced by a plain
+  grid (windowed work per q-tile is uniform); `first_kv = (m*BM -
+  left) // BN` lower trip bound; ONE leading-edge mask col +
+  win_mask_d < row via the prologue's existing mask_tail flag —
+  steady loop mask-free. bwd: win_left rides the HIGH 32 BITS of
+  the seq_len kernel arg (seq_len slot-riding precedent; survives
+  GQA where both accum-ptr slots are taken — kernel signature stays
+  byte-identical, gated across all 6 dense/varlen variants); upper
+  m-trip bound m_end = min(num_m, ceil((n*BN + BN + left)/BM));
+  trailing-trip S^T mask col > row + mask_w (mask_w = n*BN + left -
+  m_abs*BM, guard mask_w < BM) mirroring the causal diagonal arm —
+  left % 128 == 0 keeps both boundaries m-tile-aligned, so masked
+  trips are exactly BN/BM leading + BN/BM trailing. preprocess/
+  convert are window-blind (every q row still attends itself; outer
+  dq_accum stays zeroed). Degenerate W >= S == plain causal
+  (tested). General (non-%128) window_left needs only the fwd
+  trip-0 mask + the bwd guard relaxation — formulas already exact.
+
 `HANDOFF.md` is the full race log: architecture, the perf journey,
 the codegen lessons (uniform-register file capacity, the
 tid-widening trap, descriptor rematerialization), the measurement
@@ -325,10 +349,12 @@ HANDOFF.md and the memory notes):
 through the varlen kernels inside flash_attn_func — one sequence
 per batch row; the %128 fast path is untouched.)
 
-The natural next features, in rough order of value: sliding window,
-softcap, varlen cross-attention, hdim64 varlen + fp16 (see the
+(Sliding window landed 2026-06-11 — see the State entry.)
+
+The natural next features, in rough order of value: softcap,
+varlen cross-attention, hdim64 varlen + fp16 (see the
 hdim64 State note), hdim 96/256, the varlen-GQA bwd gap
-(pack-GQA-style head packing). The FA4-class algorithm core
+(pack-GQA-style head packing), general non-%128 window_left. The FA4-class algorithm core
 (warp specialization, tile_m=80 bwd, the mailbox dQ drain) carries
 over. Keep every change inside the measurement protocol above — and
 add new seqlen/shape cases to `bench_fa4.py --check-only` and

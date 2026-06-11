@@ -86,14 +86,18 @@ def _check_envelope(
 
 class _FlashAttnFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, softmax_scale, causal):
+    def forward(ctx, q, k, v, softmax_scale, causal, window_left=0):
         from flash_attn_mojo.fwd_fa4 import fa4_fwd
 
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        out, lse = fa4_fwd(q, k, v, softmax_scale, causal=causal)
+        out, lse = fa4_fwd(
+            q, k, v, softmax_scale, causal=causal,
+            window_left=window_left,
+        )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.window_left = window_left
         ctx.mark_non_differentiable(lse)
         return out, lse
 
@@ -104,9 +108,9 @@ class _FlashAttnFunc(torch.autograd.Function):
         q, k, v, out, lse = ctx.saved_tensors
         dq, dk, dv = bwd_fa4(
             q, k, v, out, dout.contiguous(), lse, ctx.softmax_scale,
-            causal=ctx.causal,
+            causal=ctx.causal, window_left=ctx.window_left,
         )
-        return dq, dk, dv, None, None
+        return dq, dk, dv, None, None, None
 
 
 def flash_attn_func(
@@ -130,6 +134,9 @@ def flash_attn_func(
             Non-CUDA tensors run the pure-PyTorch reference instead.
         softmax_scale: defaults to head_dim**-0.5.
         causal: causal masking (fully differentiable).
+        window_size: (left, 0) with causal=True enables Mistral-style
+            sliding-window attention (fully differentiable). v1
+            envelope: left % 128 == 0, head_dim=128, seqlen % 128 == 0.
         return_lse: also return the (batch, nheads, seqlen) fp32
             natural-log row logsumexp.
 
@@ -154,13 +161,6 @@ def flash_attn_func(
             raise ValueError(
                 "window v1 envelope: left % 128 == 0, head_dim=128, "
                 "seqlen % 128 == 0"
-            )
-        if torch.is_grad_enabled() and (
-            q.requires_grad or k.requires_grad or v.requires_grad
-        ):
-            raise ValueError(
-                "the windowed backward is not implemented yet — run "
-                "under torch.no_grad() (forward/inference only)"
             )
         window_left = int(left)
 
@@ -202,18 +202,9 @@ def flash_attn_func(
             )
         return out
 
-    if window_left:
-        from flash_attn_mojo.fwd_fa4 import fa4_fwd
-
-        out, lse = fa4_fwd(
-            q.contiguous(), k.contiguous(), v.contiguous(),
-            softmax_scale, causal=True, window_left=window_left,
-        )
-        if return_lse:
-            return out, lse
-        return out
-
-    out, lse = _FlashAttnFunc.apply(q, k, v, softmax_scale, causal)
+    out, lse = _FlashAttnFunc.apply(
+        q, k, v, softmax_scale, causal, window_left
+    )
     if return_lse:
         return out, lse
     return out
