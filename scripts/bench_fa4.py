@@ -191,8 +191,9 @@ def main() -> None:
         total = cu_list[-1]
         cu = torch.tensor(cu_list, dtype=torch.int32, device="cuda")
         q = torch.randn(total, H, D, dtype=torch.bfloat16, device="cuda")
-        k = torch.randn_like(q)
-        v = torch.randn_like(q)
+        h_kv = args.hkv if args.hkv else H
+        k = torch.randn(total, h_kv, D, dtype=torch.bfloat16, device="cuda")
+        v = torch.randn_like(k)
         holder = {}
         if args.kind == "bwd":
             # out/lse from FA4's varlen fwd, outside the timed region.
@@ -295,7 +296,7 @@ def main() -> None:
     tflops = flops / (us * 1e-6) / 1e12
     if args.varlen:
         shape_str = f"varlen:{total}tok,{H},{D}"
-        hkv_str = str(H)
+        hkv_str = str(h_kv)
     else:
         shape_str = f"{B},{S},{H},{D}"
         hkv_str = str(h_kv)

@@ -129,15 +129,18 @@ def _make(seqlen, hq=4, hkv=4, batch=2, requires_grad=False):
     return q, k, v
 
 
-def _make_varlen(lens, h=4):
+def _make_varlen(lens, hq=4, hkv=4):
     cu_list = [0]
     for L in lens:
         cu_list.append(cu_list[-1] + L)
     cu = torch.tensor(cu_list, dtype=torch.int32, device="cuda")
     q = torch.randn(
-        cu_list[-1], h, 128, dtype=torch.bfloat16, device="cuda"
+        cu_list[-1], hq, 128, dtype=torch.bfloat16, device="cuda"
     )
-    return q, torch.randn_like(q), torch.randn_like(q), cu
+    k = torch.randn(
+        cu_list[-1], hkv, 128, dtype=torch.bfloat16, device="cuda"
+    )
+    return q, k, torch.randn_like(k), cu
 
 
 # ---------------------------------------------------------- dense
@@ -190,18 +193,19 @@ def test_bwd_dense(seqlen, mask, heads):
 # --------------------------------------------------------- varlen
 @requires_cuda
 @pytest.mark.parametrize("lens", VARLEN_SETS, ids=VARLEN_IDS)
+@pytest.mark.parametrize("heads", ["mha", "gqa"])
 @pytest.mark.parametrize("mask", ["plain", "causal"])
-def test_fwd_varlen(lens, mask):
+def test_fwd_varlen(lens, mask, heads):
     _skip_if_impl_unavailable()
     torch.manual_seed(3)
     causal = mask == "causal"
-    q, k, v, cu = _make_varlen(lens)
+    q, k, v, cu = _make_varlen(lens, hkv=4 if heads == "mha" else 2)
     out, lse = _varlen_fwd(q, k, v, cu, causal)
     ref, ref_lse = flash_attn_varlen_ref(
         q.float(), k.float(), v.float(), cu, cu,
         causal=causal, return_lse=True,
     )
-    tol = FWD_TOL if mask == "plain" else FWD_TOL_MASKED
+    tol = FWD_TOL if (mask, heads) == ("plain", "mha") else FWD_TOL_MASKED
     d = (out.float() - ref).abs().max().item()
     assert d < tol, f"out maxdiff {d:.3e}"
     dl = (lse - ref_lse).abs().max().item()
@@ -210,12 +214,13 @@ def test_fwd_varlen(lens, mask):
 
 @requires_cuda
 @pytest.mark.parametrize("lens", VARLEN_SETS, ids=VARLEN_IDS)
+@pytest.mark.parametrize("heads", ["mha", "gqa"])
 @pytest.mark.parametrize("mask", ["plain", "causal"])
-def test_bwd_varlen(lens, mask):
+def test_bwd_varlen(lens, mask, heads):
     _skip_if_impl_unavailable()
     torch.manual_seed(3)
     causal = mask == "causal"
-    q, k, v, cu = _make_varlen(lens)
+    q, k, v, cu = _make_varlen(lens, hkv=4 if heads == "mha" else 2)
     dout = torch.randn_like(q)
     out, lse = _varlen_fwd(q, k, v, cu, causal)
     dq, dk, dv = _varlen_bwd(q, k, v, out, dout, lse, cu, causal)
@@ -225,7 +230,7 @@ def test_bwd_varlen(lens, mask):
     vf = v.detach().float().requires_grad_()
     ref = flash_attn_varlen_ref(qf, kf, vf, cu, cu, causal=causal)
     ref.backward(dout.float())
-    tol = BWD_TOL if mask == "plain" else BWD_TOL_MASKED
+    tol = BWD_TOL if (mask, heads) == ("plain", "mha") else BWD_TOL_MASKED
     for name, got, want in (
         ("dq", dq, qf.grad), ("dk", dk, kf.grad), ("dv", dv, vf.grad)
     ):
@@ -286,15 +291,19 @@ def test_bwd_dense_canonical(mask, heads):
 
 
 @requires_cuda
+@pytest.mark.parametrize("heads", ["mha", "gqa"])
 @pytest.mark.parametrize("mask", ["plain", "causal"])
-def test_fwd_varlen_canonical(mask):
+def test_fwd_varlen_canonical(mask, heads):
     _skip_unless_cross_check()
     from flash_attn.cute import flash_attn_varlen_func as fa4_varlen
     from flash_attn_mojo.fwd_fa4 import fa4_varlen_fwd
 
     torch.manual_seed(0)
     causal = mask == "causal"
-    q, k, v, cu = _make_varlen(CANONICAL_LENS, h=16)
+    q, k, v, cu = _make_varlen(
+        CANONICAL_LENS, hq=16,
+        hkv=16 if heads == "mha" else CANONICAL_HKV,
+    )
     out, lse = fa4_varlen_fwd(q, k, v, cu, cu, causal=causal)
     max_len = max(CANONICAL_LENS)
     ref_out, ref_lse = fa4_varlen(
@@ -307,8 +316,9 @@ def test_fwd_varlen_canonical(mask):
 
 
 @requires_cuda
+@pytest.mark.parametrize("heads", ["mha", "gqa"])
 @pytest.mark.parametrize("mask", ["plain", "causal"])
-def test_bwd_varlen_canonical(mask):
+def test_bwd_varlen_canonical(mask, heads):
     _skip_unless_cross_check()
     from flash_attn.cute import flash_attn_varlen_func as fa4_varlen
     from flash_attn.cute.interface import _flash_attn_bwd
@@ -316,7 +326,10 @@ def test_bwd_varlen_canonical(mask):
 
     torch.manual_seed(0)
     causal = mask == "causal"
-    q, k, v, cu = _make_varlen(CANONICAL_LENS, h=16)
+    q, k, v, cu = _make_varlen(
+        CANONICAL_LENS, hq=16,
+        hkv=16 if heads == "mha" else CANONICAL_HKV,
+    )
     dout = torch.randn_like(q)
     max_len = max(CANONICAL_LENS)
     out, lse = fa4_varlen(

@@ -347,6 +347,40 @@ findings):
 Kernel signatures still byte-identical to dense (gate: 0 diff
 lines), 0 spills / 168 regs on all varlen variants.
 
+## Varlen GQA (2026-06-11, sixth session)
+
+fwd: free (0.988-0.989x, mojo faster — pack-GQA addressing was
+already in). bwd: the dense fp32-accum design carried over with a
+SIMPLIFICATION over FA4: no per-seq padded accumulator windows.
+The ragged S^T mask makes garbage kv rows' dV/dK c-frags EXACTLY
+zero (exp2 underflow -> P=0 -> wgmma accumulates zero rows), so a
+boundary CTA's full-tile cp.reduce.add into the next sequence's
+rows is a numeric no-op, and concurrent atomic adds commute — only
+the buffer END pads to a full tile (total_k_alloc). Accumulator
+ptrs + total_k_alloc ride aux rows appended to BOTH work tables
+(read at index grid_dim.x); preprocess zeroes the accumulators.
+
+bwd result: 1.036-1.044x plain / 1.072x causal — the only config
+above wobble. Per-kernel decomposition of the ~+90 us: main +50
+(GQA epilogue fixed cost ~3 us/CTA x short varlen m-sweeps — the
+same short-work amortization story as the fwd O-store fix, but the
+cost here is the 2x serialized 64 KiB stage+reduce, already
+read-overlapped), preprocess +48 (accumulator zeroing at 1.4 TB/s),
+torch permute-cast +43, convert -53 (we win). FA4 dodges the
+per-CTA epilogue at varlen-GQA by restructuring (pack_gqa/CLC).
+Levers if parity is required: pack-GQA M-dim head packing (a tile
+geometry change), a fused dkv-convert kernel (~-35 us), faster
+zeroing (~-12 us).
+
+Negative results: (a) cast-then-permute conversion split (slice
+cast ran 0.9 TB/s, net SLOWER than the fused permute-cast);
+(b) keeping epilogue addresses (aux ptrs, kv_row) live across the
+main loop — 8-16 B spills; fixed by REBUILDING them from the table
++ special regs inside the thread-128 issue branch (the
+rematerialization lesson again, host-data edition). The
+cp_async_bulk_wait_group stdlib default is already .read — no win
+available there.
+
 ## Not yet tried (fwd)
 
 - ~~L2 cache hints on TMA loads~~ DEBUNKED (third session): FA4's

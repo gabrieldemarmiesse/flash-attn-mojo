@@ -57,9 +57,25 @@ run-to-run variance (locked clocks, interleaved):
   CTAs (causality does NOT subsume there). Partial tail tiles store
   c-frags straight to gmem row-predicated (raw ptrs: O rides
   sched_num_hb_q; dk/dv ride an aux work-table row at index
-  grid_dim.x). Envelope: any lengths >= 1, self-attn lengths, bwd
-  MHA-only (fwd takes GQA). All per-CTA table scalars are
-  warp.broadcast-laundered.
+  grid_dim.x). Envelope: any lengths >= 1, self-attn lengths, MHA or
+  GQA, fully differentiable. All per-CTA table scalars are
+  warp.broadcast-laundered. VARLEN GQA (2026-06-11): fwd at parity
+  (0.988-0.989x, mojo faster); bwd trails 1.04x plain / 1.07x causal
+  — the ONLY config above wobble. Root cause (per-kernel CUPTI
+  decomposition): the per-CTA GQA epilogue fixed cost (64 KiB smem
+  staging + 2 serialized cp.reduce, ~3 us/CTA) amortizes poorly over
+  varlen's short per-CTA m-sweeps, + accumulator zeroing (+48 us in
+  preprocess) + the torch permute-cast (+43 us); FA4 restructures
+  varlen-GQA (pack_gqa / CLC re-enabled — the audit noted it). Known
+  levers if parity is later required: pack-GQA-style M-dim head
+  packing, or a fused dkv-convert kernel. Design note: varlen GQA
+  needs NO per-seq padded accumulator windows (deliberate divergence
+  from FA4's padded_offset_k) — masked S^T garbage rows give
+  EXACTLY-ZERO c-frags, so full-tile cp.reduce adds into neighbour
+  rows are numeric no-ops; only the buffer END pads to a full tile.
+  Accum ptrs + total_k_alloc ride the aux table rows; the epilogue
+  REBUILDS its addresses from the table/special regs at issue time
+  (keeping them live across the main loop spilled 8-16 B).
 
 - SHORT-SEQ FWD (2026-06-11, resolved): the fwd trailed 1.05–1.22x
   at short sequences (B=1 S=512 single-wave: +2.5 µs/CTA,
@@ -269,10 +285,10 @@ HANDOFF.md and the memory notes):
 
 ## Extending the envelope (if/when)
 
-The natural next features, in rough order of value: varlen GQA
-(the bwd needs `total_k_rounded_padded`/`padded_offset_k` accum
-windows; the fwd already takes GQA), other head dims, dense
-arbitrary seqlen routing through the varlen path. The FA4-class algorithm core
+The natural next features, in rough order of value: other head
+dims, the varlen-GQA bwd gap (pack-GQA-style head packing — see the
+State note), dense arbitrary seqlen routing through the varlen
+path. The FA4-class algorithm core
 (warp specialization, tile_m=80 bwd, the mailbox dQ drain) carries
 over. Keep every change inside the measurement protocol above — and
 add new seqlen/shape cases to `bench_fa4.py --check-only` and

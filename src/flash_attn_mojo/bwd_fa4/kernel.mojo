@@ -308,7 +308,6 @@ def bwd_main_kernel[
     var vl_mpad_base: Int = 0
     var vl_kv_tail: Int = 0
     comptime if varlen:
-        comptime assert gqa_ratio == 1, "varlen bwd v1 is MHA-only"
         # Host kv-tile work table, one int32[8] row per CTA:
         # (n_block, q_row_base, k_row_base, seqlen_q, seqlen_k,
         # num_m_blocks, m_start, mpad_base). Its address rides the
@@ -927,13 +926,16 @@ def bwd_main_kernel[
             phase ^= 1
 
     # ---- Epilogue.
-    comptime if varlen:
+    comptime if varlen and gqa_ratio == 1:
         # Ragged kv tail tile: a full-tile TMA store would overwrite
         # the NEXT sequence's dK/dV rows — store the c-frags straight
         # to gmem, row-predicated (no smem staging, no barrier; both
         # warpgroups take this branch together). The raw dk/dv base
         # addresses live in the work table's aux row (row index
-        # grid_dim.x), packed as two int64s.
+        # grid_dim.x), packed as two int64s. (GQA needs no such path:
+        # its cp.reduce accumulation tolerates full tiles — the
+        # masked garbage rows' c-frags are exactly zero, and adding
+        # zero is a no-op; only the allocator pads the buffer end.)
         if vl_kv_tail < BN:
             var taux = dk_accum_ptr.bitcast[Int64]() + 4 * Int(
                 grid_dim.x
@@ -993,11 +995,16 @@ def bwd_main_kernel[
         comptime for c in range(c_frag_dkv):
             dk_acc.ptr[c] *= scale_acc
         var acc32 = k_base.bitcast[Float32]()
-        var kv_acc_base: Int = (
-            (b_idx * (Int(grid_dim.y) // gqa_ratio) + h_idx // gqa_ratio)
-            * seq_len
-            + n_block * BN
-        ) * D * 4
+        var kv_acc_base: Int = 0
+        comptime if not varlen:
+            kv_acc_base = (
+                (
+                    b_idx * (Int(grid_dim.y) // gqa_ratio)
+                    + h_idx // gqa_ratio
+                )
+                * seq_len
+                + n_block * BN
+            ) * D * 4
         comptime for t in range(2):  # 0 = dV, 1 = dK
             comptime for c2 in range(c_frag_dkv // 2):
                 comptime g_chunk: Int = c2 // 2
@@ -1022,18 +1029,49 @@ def bwd_main_kernel[
             fence_async_view_proxy()
             named_barrier[Int32(NWG * 128)](Int32(4))
             if thread_idx.x == 128:
+                # The reduce destination is computed HERE (one
+                # thread, at issue time) so its addresses are never
+                # live across the staging loops (a 16-B spill
+                # otherwise). Varlen: packed (Hkv, total_k_alloc, D)
+                # f32 accumulators; the raw pointers + total_k_alloc
+                # live in the kv table's aux row (dk_accum_ptr
+                # carries the table). kv_row is already the global
+                # packed row; boundary tiles reduce-add EXACT ZEROS
+                # past seqlen_k (masked S^T rows), and the allocator
+                # pads the buffer end to a full tile.
+                var red_dst: Int
+                comptime if varlen:
+                    # Everything here is REBUILT from kernel params /
+                    # special regs (table reload, block_idx) so no
+                    # per-CTA scalar stays live across the main loop
+                    # for the epilogue's sake — the combined vl +
+                    # GQA liveness otherwise spills ~8 B.
+                    var tblr = dk_accum_ptr.bitcast[Int32]() + 8 * Int(
+                        block_idx.x
+                    )
+                    var kv_row_e: Int = Int(tblr[2]) + Int(tblr[0]) * BN
+                    var taux64 = dk_accum_ptr.bitcast[Int64]() + 4 * Int(
+                        grid_dim.x
+                    )
+                    var taux32 = dk_accum_ptr.bitcast[Int32]() + 8 * Int(
+                        grid_dim.x
+                    )
+                    red_dst = Int(taux64[0 if t == 1 else 1]) + (
+                        (Int(block_idx.y) // gqa_ratio) * Int(taux32[4])
+                        + kv_row_e
+                    ) * D * 4
+                else:
+                    red_dst = (
+                        Int(dv_accum_ptr if t == 0 else dk_accum_ptr)
+                        + kv_acc_base
+                    )
                 inlined_assembly[
                     "cp.reduce.async.bulk.global.shared::cta"
                     + ".bulk_group.add.f32 [$0], [$1], $2;",
                     NoneType,
                     constraints="l,r,r",
                 ](
-                    Int64(
-                        Int(
-                            dv_accum_ptr if t == 0 else dk_accum_ptr
-                        )
-                        + kv_acc_base
-                    ),
+                    Int64(red_dst),
                     Int32(Int(acc32)),
                     Int32(BN * D * 4),
                 )
@@ -1162,7 +1200,6 @@ def bwd_preprocess_kernel[
         # dk_accum_ptr slot; seq_len carries total_q (packed (H,
         # total_q) LSE reads) and nheads carries total_qpad. stats
         # windows are per-seq at mpad_base*bm_main in (H, total_qpad).
-        comptime assert gqa_ratio == 1, "varlen bwd v1 is MHA-only"
         var tbl = dk_accum_ptr.bitcast[Int32]() + 8 * Int(block_idx.x)
         var m_local: Int = Int(tbl[0])
         var q_base: Int = Int(tbl[1])
@@ -1225,6 +1262,42 @@ def bwd_preprocess_kernel[
                 SIMD[DType.float32, ZVEC](0)
             )
             zoff += kBwdPreThreads * ZVEC
+
+        # GQA: zero this kv-head's slice of the packed (Hkv,
+        # total_k_alloc, D) f32 dK/dV accumulators (the main kernel
+        # bulk-reduce-ADDS into them). Done by the h % ratio == 0
+        # grid columns, the flat range split across grid.x. The raw
+        # pointers + total_k_alloc live in the q-tile table's aux
+        # row (index grid_dim.x).
+        comptime if gqa_ratio > 1:
+            if h_idx % gqa_ratio == 0:
+                var paux64 = dk_accum_ptr.bitcast[Int64]() + 4 * Int(
+                    grid_dim.x
+                )
+                var paux32 = dk_accum_ptr.bitcast[Int32]() + 8 * Int(
+                    grid_dim.x
+                )
+                var dk_red = UnsafePointer[Float32, MutAnyOrigin](
+                    unsafe_from_address=Int(paux64[0])
+                )
+                var dv_red = UnsafePointer[Float32, MutAnyOrigin](
+                    unsafe_from_address=Int(paux64[1])
+                )
+                var kvtot: Int = Int(paux32[4]) * D
+                var kvbase: Int = (h_idx // gqa_ratio) * kvtot
+                var knb: Int = Int(grid_dim.x)
+                comptime ZCH: Int = kBwdPreThreads * ZVEC
+                var kpasses: Int = (kvtot + knb * ZCH - 1) // (knb * ZCH)
+                var koff: Int = Int(block_idx.x) * kpasses * ZCH + tid * ZVEC
+                for _ in range(kpasses):
+                    if koff < kvtot:
+                        (dk_red + kvbase + koff).store[width=ZVEC](
+                            SIMD[DType.float32, ZVEC](0)
+                        )
+                        (dv_red + kvbase + koff).store[width=ZVEC](
+                            SIMD[DType.float32, ZVEC](0)
+                        )
+                    koff += ZCH
         return
     var num_main_blocks: Int = (
         seq_len + bm_main - 1

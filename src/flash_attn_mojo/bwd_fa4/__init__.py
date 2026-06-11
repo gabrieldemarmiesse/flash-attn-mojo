@@ -205,7 +205,9 @@ def _build_bwd_tables(
     mpad_base = (cu_q[:-1] + torch.arange(nseq) * block_m) // block_m
     num_mpad = -(-(total_q + (nseq + 1) * block_m) // block_m)
     # Table fields are int32; .to(int32) wraps silently on overflow.
-    assert num_mpad * block_m < 2**31 and int(cu_k[-1]) < 2**31
+    # (<= 2**31 - 128 so total_k_alloc = ceil(total_k/128)*128 also
+    # fits in int32 — it rides the aux row as an int32.)
+    assert num_mpad * block_m < 2**31 and int(cu_k[-1]) <= 2**31 - 128
     # Window-fit (the slack formula guarantees this; assert anyway —
     # an overlap silently corrupts the next sequence's stats).
     ends = mpad_base + m_counts
@@ -264,8 +266,8 @@ def bwd_fa4_varlen(
 
     q/k/v/out/dout: (total_tokens, H, D) bf16 contiguous, D=128.
     lse: (H, total_q) fp32 (the packed natural-log LSE from the
-    varlen fwd). MHA only; arbitrary sequence lengths >= 1;
-    self-attn lengths.
+    varlen fwd). MHA or GQA (Hq % Hkv == 0); arbitrary sequence
+    lengths >= 1; self-attn lengths.
     """
     from flash_attn_mojo.bwd_fa4._jit import (
         call_bwd_fa4_convert,
@@ -280,9 +282,10 @@ def bwd_fa4_varlen(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
+    gqa_ratio = nheads // nheads_kv
     assert q.dtype == torch.bfloat16, "bwd_fa4 is bf16-only"
     assert head_dim == 128, "bwd_fa4 is head_dim=128-only"
-    assert nheads_kv == nheads, "bwd_fa4_varlen v1 is MHA-only"
+    assert nheads % nheads_kv == 0, "Hq must be a multiple of Hkv"
     assert k.shape == (total_k, nheads_kv, head_dim)
     assert v.shape == k.shape
     assert lse.shape == (nheads, total_q) and lse.dtype == torch.float32
@@ -302,18 +305,41 @@ def bwd_fa4_varlen(
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
-    # Aux work-table row (index = grid_dim.x): the raw dk/dv base
-    # addresses as two int64s, for the kernel's row-predicated
-    # ragged-tail stores.
-    aux = (
-        torch.tensor(
-            [dk.data_ptr(), dv.data_ptr(), 0, 0], dtype=torch.int64
+
+    def _aux_row(p0, p1, extra32=0):
+        a = torch.tensor([p0, p1, 0, 0], dtype=torch.int64).view(
+            torch.int32
         )
-        .view(torch.int32)
-        .reshape(1, 8)
-        .to(q.device)
-    )
+        a[4] = extra32
+        return a.reshape(1, 8).to(q.device)
+
+    if gqa_ratio > 1:
+        # Packed (Hkv, total_k_alloc, D) f32 accumulators: every
+        # q-head CTA of a group bulk-reduce-adds its dK/dV tile.
+        # total_k_alloc pads the BUFFER END to a full kv tile —
+        # boundary tiles reduce-add exact zeros (masked S^T rows)
+        # into neighbouring rows, which is a numerical no-op, so no
+        # per-sequence padded windows are needed (deliberate
+        # divergence from FA4's padded_offset_k design).
+        total_k_alloc = -(-total_k // _BLOCK) * _BLOCK
+        dk_accum = torch.empty(
+            (nheads_kv, total_k_alloc, head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        dv_accum = torch.empty_like(dk_accum)
+        # Aux rows (table index = grid_dim.x): the accumulator
+        # pointers + total_k_alloc, for the main kernel's cp.reduce
+        # epilogue (kv table) and the preprocess zeroing (q table).
+        aux = _aux_row(
+            dk_accum.data_ptr(), dv_accum.data_ptr(), total_k_alloc
+        )
+    else:
+        # Aux row: raw bf16 dk/dv pointers for the kernel's
+        # row-predicated ragged-tail stores.
+        aux = _aux_row(dk.data_ptr(), dv.data_ptr())
     kv_table = torch.cat([kv_table, aux], dim=0).contiguous()
+    q_table = torch.cat([q_table, aux], dim=0).contiguous()
     dpsum = torch.empty(
         (nheads, total_qpad), dtype=torch.float32, device=q.device
     )
@@ -325,7 +351,7 @@ def bwd_fa4_varlen(
     )
 
     config = make_config(
-        _DTYPE_CODE[q.dtype], head_dim, True, causal, 1, True
+        _DTYPE_CODE[q.dtype], head_dim, True, causal, gqa_ratio, True
     )
     stream = torch.cuda.current_stream().cuda_stream
     nseq = cu_seqlens_q.numel() - 1
@@ -390,4 +416,11 @@ def bwd_fa4_varlen(
         ),
         config,
     )
+    if gqa_ratio > 1:
+        # (Hkv, total_k_alloc, D) f32 -> (total_k, Hkv, D) bf16, one
+        # fused permute-cast each (a cast-then-permute split was
+        # measured SLOWER: the extra kernel + slice-cast ran at
+        # 0.9 TB/s).
+        dk.copy_(dk_accum[:, :total_k].permute(1, 0, 2))
+        dv.copy_(dv_accum[:, :total_k].permute(1, 0, 2))
     return dq, dk, dv

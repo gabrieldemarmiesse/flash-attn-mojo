@@ -304,28 +304,41 @@ def test_varlen_vs_fa4_when_available(causal):
 
 
 @requires_cuda
-def test_varlen_gqa_fwd_only():
-    """Varlen GQA: forward works under no_grad; with live grads the
-    API refuses up front (the varlen backward is MHA-only)."""
+@pytest.mark.parametrize("causal", [False, True])
+def test_varlen_gqa_grads(causal):
+    """Varlen GQA end-to-end autograd (ragged lengths included)."""
     from flash_attn_mojo import flash_attn_varlen_func
 
-    cu = torch.tensor([0, 256], dtype=torch.int32, device="cuda")
+    lens = [256, 100, 384]
+    cu_list = [0]
+    for L in lens:
+        cu_list.append(cu_list[-1] + L)
+    cu = torch.tensor(cu_list, dtype=torch.int32, device="cuda")
+    total = cu_list[-1]
     q = torch.randn(
-        256, 4, 128, dtype=torch.bfloat16, device="cuda",
+        total, 4, 128, dtype=torch.bfloat16, device="cuda",
         requires_grad=True,
     )
     k = torch.randn(
-        256, 2, 128, dtype=torch.bfloat16, device="cuda",
+        total, 2, 128, dtype=torch.bfloat16, device="cuda",
         requires_grad=True,
     )
     v = torch.randn_like(k, requires_grad=True)
+    dout = torch.randn_like(q)
 
-    with pytest.raises(ValueError, match="GQA"):
-        flash_attn_varlen_func(q, k, v, cu, cu)
+    out = flash_attn_varlen_func(q, k, v, cu, cu, causal=causal)
+    out.backward(dout)
 
-    with torch.no_grad():
-        out = flash_attn_varlen_func(q, k, v, cu, cu)
-        ref = flash_attn_varlen_ref(
-            q.float(), k.float(), v.float(), cu, cu
-        )
+    qf = q.detach().float().requires_grad_()
+    kf = k.detach().float().requires_grad_()
+    vf = v.detach().float().requires_grad_()
+    ref = flash_attn_varlen_ref(qf, kf, vf, cu, cu, causal=causal)
+    ref.backward(dout.float())
     assert (out.float() - ref).abs().max().item() < 2e-2
+    for name, got, want in (
+        ("dq", q.grad, qf.grad),
+        ("dk", k.grad, kf.grad),
+        ("dv", v.grad, vf.grad),
+    ):
+        d = (got.float() - want).abs().max().item()
+        assert d < 5e-2, f"{name} maxdiff {d:.3e} causal={causal}"

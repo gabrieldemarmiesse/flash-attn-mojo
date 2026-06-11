@@ -241,7 +241,7 @@ def flash_attn_varlen_func(
             head_dim) / (total_tokens, nheads_kv, head_dim);
             head_dim=128. Current envelope: arbitrary sequence
             lengths >= 1, self-attention lengths (cu_seqlens_q ==
-            cu_seqlens_k); the backward additionally requires MHA.
+            cu_seqlens_k), MHA or GQA (fully differentiable).
             Non-CUDA tensors run the pure-PyTorch reference instead.
         cu_seqlens_q, cu_seqlens_k: (nseq+1,) int32 cumulative
             sequence lengths, starting at 0.
@@ -305,19 +305,6 @@ def flash_attn_varlen_func(
             q, k, v, cu_seqlens_q, cu_seqlens_k,
             softmax_scale=softmax_scale, causal=causal,
             return_lse=return_lse,
-        )
-
-    # The varlen backward is MHA-only for now: refuse GQA up front
-    # when gradients are live instead of failing inside backward().
-    if (
-        q.shape[1] != k.shape[1]
-        and torch.is_grad_enabled()
-        and (q.requires_grad or k.requires_grad or v.requires_grad)
-    ):
-        raise ValueError(
-            "the varlen backward does not support GQA yet — run GQA "
-            "varlen inference under torch.no_grad(), or use MHA for "
-            "training"
         )
 
     out, lse = _FlashAttnVarlenFunc.apply(
