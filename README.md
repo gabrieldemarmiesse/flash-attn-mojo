@@ -17,10 +17,16 @@ FA4's kernel time within run-to-run variance:
 | bwd (causal) | 3146–3242   | 3129–3204   | 0.99–1.05x  |
 | fwd (GQA 4x) | 2253 / 1221 | 2201 / 1240 | 1.03 / 0.98x (plain/causal) |
 | bwd (GQA 4x) | 6526 / 3615 | 6659 / 3596 | 0.98 / 1.01x (plain/causal) |
+| bwd (varlen) | 1977 / 1254 | 2014 / 1250 | 0.98 / 1.00x (plain/causal) |
 
 (Locked clocks, interleaved kernel-only CUPTI timing; both kernels
 wobble ~2–4% run to run. The bwd main loop executes 448
-instructions/iteration to FA4's 532 at identical tensor-core work.)
+instructions/iteration to FA4's 532 at identical tensor-core work.
+Varlen row: the canonical packed config — 8 sequences, 16384 total
+tokens, lengths 1280–3072. The varlen fwd matches FA4's varlen
+kernel at long sequences and trails ~4% at the mixed config — a
+short-sequence amortization gap shared by the dense kernel, being
+worked.)
 
 The kernels are warp-specialized TMA + WGMMA Hopper kernels JIT-built
 via `mojo build` on first use and cached; correctness sits at the
@@ -42,6 +48,14 @@ return_lse=False)` with:
 Everything outside the envelope raises a clear error. The op is
 differentiable (`out.backward(...)` runs the FA4-class backward:
 preprocess → main → dq-convert, mirroring FA4's pipeline).
+
+`flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, ...)`
+runs packed variable-length attention over `(total_tokens, nheads,
+head_dim)` tensors (FA4's varlen layout, packed `(nheads, total_q)`
+LSE), differentiable end-to-end. Current varlen envelope: every
+sequence length a multiple of 128, self-attention lengths
+(`cu_seqlens_q == cu_seqlens_k`); the backward additionally requires
+MHA.
 
 ## Install
 

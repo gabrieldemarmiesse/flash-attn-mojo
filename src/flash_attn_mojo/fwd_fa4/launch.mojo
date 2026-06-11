@@ -62,6 +62,10 @@ def launch_fwd_fa4[
     o_h_stride: Int,
     stream_handle_addr: Int,
     ctx_handle_addr: Int,
+    varlen_total_q: Int = 0,
+    varlen_total_k: Int = 0,
+    varlen_table_addr: Int = 0,
+    varlen_num_tiles: Int = 0,
 ) raises:
     var raw_ctx_ptr = UnsafePointer[_DeviceContextCpp, MutExternalOrigin](
         unsafe_from_address=ctx_handle_addr
@@ -104,17 +108,24 @@ def launch_fwd_fa4[
     comptime q_smem_shape = IndexList[3](kFa4BlockM, 1, head_dim)
     comptime kv_smem_shape = IndexList[3](kFa4BlockN, 1, head_dim)
 
+    # Varlen: one flat descriptor over the packed (total_tokens, H, D)
+    # arrays; the kernel supplies per-sequence row offsets at copy
+    # time (FA4's scheme — no per-seq descriptor rebuilds).
     var rows: Int = batch_int * seqlen_int
+    var rows_kv: Int = rows
+    comptime if varlen:
+        rows = varlen_total_q
+        rows_kv = varlen_total_k
     var q_tma = create_split_tma[
         q_smem_shape, gmem_shape, swizzle_mode=swizzle
     ](ctx, q_ptr, rows, nheads_int)
     var nheads_kv: Int = nheads_int // gqa_ratio
     var k_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
-    ](ctx, k_ptr, rows, nheads_kv)
+    ](ctx, k_ptr, rows_kv, nheads_kv)
     var v_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
-    ](ctx, v_ptr, rows, nheads_kv)
+    ](ctx, v_ptr, rows_kv, nheads_kv)
     # O store descriptor: unswizzled, so the kernel can stage O in a
     # plain row-major smem tile (one whole-tile bulk store).
     var o_imm_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
@@ -135,6 +146,7 @@ def launch_fwd_fa4[
         type_of(o_tma).desc_shape,
         causal,
         gqa_ratio,
+        varlen,
     ]
 
     var compiled = ctx.compile_function[
@@ -162,10 +174,22 @@ def launch_fwd_fa4[
     var sched_residual: Int = max(num_hb % sched_swizzle, 1)
 
     var grid: Tuple[Int, Int, Int]
-    comptime if causal:
-        grid = (num_m * num_hb, 1, 1)
+    comptime if varlen:
+        grid = (varlen_num_tiles, nheads_int, 1)
     else:
-        grid = (num_m, nheads_int, batch_int)
+        comptime if causal:
+            grid = (num_m * num_hb, 1, 1)
+        else:
+            grid = (num_m, nheads_int, batch_int)
+
+    # Varlen reuses two kernel arg slots (signature unchanged vs
+    # dense): seq_len carries total_q (packed LSE layout) and
+    # sched_swizzle carries the work-table address.
+    var seq_len_arg: Int = seqlen_int
+    var sched_swizzle_arg: Int = sched_swizzle
+    comptime if varlen:
+        seq_len_arg = varlen_total_q
+        sched_swizzle_arg = varlen_table_addr
 
     comptime if use_external_stream:
         var stream = ctx.create_external_stream(stream_opaque)
@@ -176,10 +200,10 @@ def launch_fwd_fa4[
             v_tma,
             o_tma,
             lse_ptr,
-            seqlen_int,
+            seq_len_arg,
             softmax_scale,
             nheads_int,
-            sched_swizzle,
+            sched_swizzle_arg,
             sched_num_hb_q,
             sched_residual,
             grid_dim=grid,
@@ -194,10 +218,10 @@ def launch_fwd_fa4[
             v_tma,
             o_tma,
             lse_ptr,
-            seqlen_int,
+            seq_len_arg,
             softmax_scale,
             nheads_int,
-            sched_swizzle,
+            sched_swizzle_arg,
             sched_num_hb_q,
             sched_residual,
             grid_dim=grid,

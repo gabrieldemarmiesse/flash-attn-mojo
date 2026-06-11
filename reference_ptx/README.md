@@ -54,6 +54,22 @@ canonical shape (locked clocks): fwd 2200 µs / causal 1241; bwd
 6659 / causal 3596 — essentially identical to MHA (GQA is free at
 training shapes).
 
+## Varlen counterparts (2026-06-11)
+
+`fa4_{fwd,bwd}_sm90_bf16_hdim128_{causal,noncausal}_varlen.ptx` —
+same tile geometry and wgmma inventories as dense; the deltas are
+ragged addressing (flat descriptors + runtime per-seq row coords,
+ptr-shift store descriptors with BIG_INT=2^30), the in-kernel
+prefix-scan scheduler (~186 PTX lines, prologue-only), and packed
+`(H, total_q)` LSE. The steady compute loop is setp-identical to
+dense — all varlen cost lives outside the hot loop. FA4 varlen
+targets at the canonical packed config (8 seqs, lengths
+[3072,2816,2560,2048,1792,1536,1280,1280] = 16384 tokens, H=16,
+D=128, locked clocks): fwd 674 µs / causal 423; bwd 2002 / causal
+1252. Degenerate-uniform cu_seqlens=[0,8192,16384] matches the
+dense canonical shape's work (FA4: ~2271 µs fwd) and isolates pure
+varlen overhead.
+
 ## Canonical config ("the simplest call")
 
 ```python

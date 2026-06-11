@@ -19,6 +19,7 @@ def test_exports():
         "flash_attn_func",
         "flash_attn_kvpacked_func",
         "flash_attn_qkvpacked_func",
+        "flash_attn_varlen_func",
         "flash_attn_ref",
     }
 
@@ -67,3 +68,37 @@ def test_packed_wrappers_cpu():
     assert torch.equal(flash_attn_qkvpacked_func(qkv), ref)
     kv = torch.stack([k, v], dim=2)
     assert torch.equal(flash_attn_kvpacked_func(q, kv), ref)
+
+
+def test_varlen_envelope_errors():
+    from flash_attn_mojo import flash_attn_varlen_func
+
+    q = torch.randn(256, 4, 128, dtype=torch.bfloat16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    cu = torch.tensor([0, 128, 256], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="packed"):
+        flash_attn_varlen_func(q.unsqueeze(0), k, v, cu, cu)
+    with pytest.raises(ValueError, match="int32"):
+        flash_attn_varlen_func(q, k, v, cu.long(), cu.long())
+    with pytest.raises(ValueError, match="bf16"):
+        flash_attn_varlen_func(q.float(), k.float(), v.float(), cu, cu)
+    with pytest.raises(ValueError, match="head_dim"):
+        flash_attn_varlen_func(
+            q[..., :64], k[..., :64], v[..., :64], cu, cu
+        )
+
+
+def test_varlen_cpu_reference_path():
+    from flash_attn_mojo import flash_attn_varlen_func
+    from flash_attn_mojo.reference import flash_attn_ref
+
+    torch.manual_seed(0)
+    q = torch.randn(384, 4, 128, dtype=torch.bfloat16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    cu = torch.tensor([0, 128, 384], dtype=torch.int32)
+    out = flash_attn_varlen_func(q, k, v, cu, cu)
+    ref0 = flash_attn_ref(
+        q[:128].unsqueeze(0), k[:128].unsqueeze(0), v[:128].unsqueeze(0)
+    )[0]
+    assert (out[:128] - ref0).abs().max().item() < 1e-6

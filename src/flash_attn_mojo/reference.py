@@ -113,3 +113,31 @@ def flash_attn_ref(
 
     # (B, H, L, D) → (B, L, H, D)
     return out_h.transpose(1, 2).contiguous()
+
+
+def flash_attn_varlen_ref(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+) -> torch.Tensor:
+    """Packed-varlen reference: per-sequence `flash_attn_ref` over
+    (total_tokens, H, D) inputs sliced by cu_seqlens. Differentiable
+    (plain torch ops)."""
+    cu_q = cu_seqlens_q.detach().cpu().tolist()
+    cu_k = cu_seqlens_k.detach().cpu().tolist()
+    outs = []
+    for i in range(len(cu_q) - 1):
+        outs.append(
+            flash_attn_ref(
+                q[cu_q[i] : cu_q[i + 1]].unsqueeze(0),
+                k[cu_k[i] : cu_k[i + 1]].unsqueeze(0),
+                v[cu_k[i] : cu_k[i + 1]].unsqueeze(0),
+                softmax_scale=softmax_scale,
+                causal=causal,
+            )[0]
+        )
+    return torch.cat(outs, dim=0)

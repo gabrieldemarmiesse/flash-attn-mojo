@@ -141,6 +141,7 @@ def bwd_main_kernel[
     st_desc_shape: IndexList[3],
     causal: Bool = False,
     gqa_ratio: Int = 1,
+    varlen: Bool = False,
 ](
     q_tma: TMATensorTile[dtype, 3, q_tile_shape, q_desc_shape],
     do_tma: TMATensorTile[dtype, 3, q_tile_shape, q_desc_shape],
@@ -293,17 +294,46 @@ def bwd_main_kernel[
             empty[s].init(Int32(NWG * 128))
     barrier()
 
-    var n_block: Int = Int(block_idx.x)
-    var h_idx: Int = Int(block_idx.y)
-    var b_idx: Int = Int(block_idx.z)
-    var num_m_blocks: Int = (seq_len + BM - 1) // BM
+    var n_block: Int
+    var h_idx: Int
+    var b_idx: Int
+    var num_m_blocks: Int
     # Causal: KV tile n only receives gradient from q rows >= n*BN,
     # i.e. m-blocks m >= m_start. All warp roles share the offset.
     var m_start: Int = 0
-    comptime if causal:
-        m_start = (n_block * BN) // BM
+    var kv_row: Int
+    # Varlen per-CTA scalars (0/unused when dense).
+    var vl_q_base: Int = 0
+    var vl_mpad_base: Int = 0
+    comptime if varlen:
+        comptime assert gqa_ratio == 1, "varlen bwd v1 is MHA-only"
+        # Host kv-tile work table, one int32[8] row per CTA:
+        # (n_block, q_row_base, k_row_base, seqlen_q, seqlen_k,
+        # num_m_blocks, m_start, mpad_base). Its address rides the
+        # dk_accum_ptr slot (GQA varlen is a follow-up) and seq_len
+        # carries num_mpad = total_qpad / BM — the kernel signature
+        # stays identical to dense. Every per-CTA scalar is
+        # warp.broadcast-laundered (tid-widening hazard class, see
+        # HANDOFF.md).
+        var tbl = dk_accum_ptr.bitcast[Int32]() + 8 * Int(block_idx.x)
+        n_block = Int(warp.broadcast(tbl[0]))
+        vl_q_base = Int(warp.broadcast(tbl[1]))
+        var vl_k_base: Int = Int(warp.broadcast(tbl[2]))
+        num_m_blocks = Int(warp.broadcast(tbl[5]))
+        m_start = Int(warp.broadcast(tbl[6]))
+        vl_mpad_base = Int(warp.broadcast(tbl[7]))
+        h_idx = Int(block_idx.y)
+        b_idx = 0
+        kv_row = vl_k_base + n_block * BN
+    else:
+        n_block = Int(block_idx.x)
+        h_idx = Int(block_idx.y)
+        b_idx = Int(block_idx.z)
+        num_m_blocks = (seq_len + BM - 1) // BM
+        comptime if causal:
+            m_start = (n_block * BN) // BM
+        kv_row = b_idx * seq_len + n_block * BN
     var m_trips: Int = num_m_blocks - m_start
-    var kv_row: Int = b_idx * seq_len + n_block * BN
 
     # The warpgroup index is shfl-broadcast from lane 0: ptxas's
     # tid-uniformity pattern only matches 32-bit shr.u32 on %tid.x,
@@ -335,14 +365,24 @@ def bwd_main_kernel[
             var slot: Int = 0
             var phase: UInt32 = 0
             var wrap: Int = 0
-            var q_row: Int = b_idx * seq_len + m_start * BM
-            # lse_log2/dpsum are (B, H, Spad) — padded to a
-            # multiple of BM (pad rows +inf / 0; causal: spad == S).
-            var bh_stat: Int = (
-                (b_idx * Int(grid_dim.y) + h_idx)
-                * (num_m_blocks * BM)
-                + m_start * BM
-            ) * 4
+            var q_row: Int
+            var bh_stat: Int
+            comptime if varlen:
+                # Stats are (H, total_qpad), per-seq window at
+                # mpad_base*BM (seq_len carries num_mpad).
+                q_row = vl_q_base + m_start * BM
+                bh_stat = (
+                    (h_idx * seq_len + vl_mpad_base + m_start) * BM
+                ) * 4
+            else:
+                # lse_log2/dpsum are (B, H, Spad) — padded to a
+                # multiple of BM (pad rows +inf / 0; causal: spad == S).
+                q_row = b_idx * seq_len + m_start * BM
+                bh_stat = (
+                    (b_idx * Int(grid_dim.y) + h_idx)
+                    * (num_m_blocks * BM)
+                    + m_start * BM
+                ) * 4
             var lse_byte: Int = Int(lse_log2_ptr) + bh_stat
             var dps_byte: Int = Int(dpsum_ptr) + bh_stat
             for _ in range(m_trips):
@@ -426,10 +466,16 @@ def bwd_main_kernel[
             # KiB fragment dump into dq_accum. Two outstanding bulk
             # groups (one per wg) at steady state.
             var lane_d: Int = Int(lane_id())
-            var dq_byte_base: Int = Int(dq_accum_ptr) + (
-                (b_idx * Int(grid_dim.y) + h_idx) * num_m_blocks
-                + m_start
-            ) * (2 * DQ_MAIL_F32 * 4)
+            var dq_byte_base: Int
+            comptime if varlen:
+                dq_byte_base = Int(dq_accum_ptr) + (
+                    h_idx * seq_len + vl_mpad_base + m_start
+                ) * (2 * DQ_MAIL_F32 * 4)
+            else:
+                dq_byte_base = Int(dq_accum_ptr) + (
+                    (b_idx * Int(grid_dim.y) + h_idx) * num_m_blocks
+                    + m_start
+                ) * (2 * DQ_MAIL_F32 * 4)
             for _ in range(m_trips):
                 cp_async_bulk_wait_group[1]()
                 named_barrier_arrive[Int32(DRAIN_BAR)](Int32(9))
@@ -1022,6 +1068,7 @@ def bwd_preprocess_kernel[
     head_dim: Int,
     causal: Bool = False,
     gqa_ratio: Int = 1,
+    varlen: Bool = False,
 ](
     o_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     do_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -1043,6 +1090,78 @@ def bwd_preprocess_kernel[
     var tid: Int = Int(thread_idx.x)
 
     comptime bm_main: Int = 64 if causal else kBwdBlockM
+
+    comptime if varlen:
+        # One CTA per main-kernel m-block (bm_main rows). The q-tile
+        # work table — one int32[8] row per CTA: (m_local,
+        # q_row_base, seqlen_q, mpad_base, ...) — rides the
+        # dk_accum_ptr slot; seq_len carries total_q (packed (H,
+        # total_q) LSE reads) and nheads carries total_qpad. stats
+        # windows are per-seq at mpad_base*bm_main in (H, total_qpad).
+        comptime assert gqa_ratio == 1, "varlen bwd v1 is MHA-only"
+        var tbl = dk_accum_ptr.bitcast[Int32]() + 8 * Int(block_idx.x)
+        var m_local: Int = Int(tbl[0])
+        var q_base: Int = Int(tbl[1])
+        var slq: Int = Int(tbl[2])
+        var mpad_base: Int = Int(tbl[3])
+        var nh: Int = Int(grid_dim.y)
+        var total_q: Int = seq_len
+        var total_qpad: Int = nheads
+
+        comptime LANES_PER_ROW: Int = 8
+        comptime RVEC: Int = D // LANES_PER_ROW  # 16
+        comptime ROWS_PER_PASS: Int = kBwdPreThreads // LANES_PER_ROW
+        var sub: Int = tid % LANES_PER_ROW
+        var row_in_pass: Int = tid // LANES_PER_ROW
+        comptime for p in range(bm_main // ROWS_PER_PASS):
+            var s_loc: Int = (
+                m_local * bm_main + p * ROWS_PER_PASS + row_in_pass
+            )
+            var stat_row: Int = (
+                h_idx * total_qpad + mpad_base * bm_main + s_loc
+            )
+            if s_loc < slq:
+                var off: Int = (
+                    (q_base + s_loc) * nh + h_idx
+                ) * D + sub * RVEC
+                var o_v = (o_ptr + off).load[width=RVEC]().cast[
+                    DType.float32
+                ]()
+                var do_v = (do_ptr + off).load[width=RVEC]().cast[
+                    DType.float32
+                ]()
+                var part: Float32 = (o_v * do_v).reduce_add()
+                var dps = warp.lane_group_sum[num_lanes=LANES_PER_ROW](
+                    part
+                )
+                if sub == 0:
+                    (dpsum_ptr + stat_row)[0] = dps
+                    (lse_log2_ptr + stat_row)[0] = (
+                        lse_ptr + h_idx * total_q + q_base + s_loc
+                    )[0] * Float32(log2e)
+            else:
+                # Per-seq window pad rows: +inf/0 annihilate the main
+                # kernel's tail m-rows (same convention as dense —
+                # do NOT switch to FA4's lse_log2=0 without also
+                # adding the in-loop seqlen_q mask).
+                if sub == 0:
+                    (dpsum_ptr + stat_row)[0] = Float32(0)
+                    (lse_log2_ptr + stat_row)[0] = inf[DType.float32]()
+
+        # Zero this m-block's dq_accum fragment region (bm_main*D
+        # f32, exactly divisible by the per-pass footprint).
+        comptime ZVEC: Int = 4
+        comptime zpasses: Int = (bm_main * D) // (kBwdPreThreads * ZVEC)
+        var zbase: Int = (
+            h_idx * total_qpad + (mpad_base + m_local) * bm_main
+        ) * D
+        var zoff: Int = tid * ZVEC
+        for _ in range(zpasses):
+            (dq_accum_ptr + zbase + zoff).store[width=ZVEC](
+                SIMD[DType.float32, ZVEC](0)
+            )
+            zoff += kBwdPreThreads * ZVEC
+        return
     var num_main_blocks: Int = (
         seq_len + bm_main - 1
     ) // bm_main
@@ -1139,6 +1258,7 @@ def bwd_convert_kernel[
     dtype: DType,
     head_dim: Int,
     causal: Bool = False,
+    varlen: Bool = False,
 ](
     dq_accum_ptr: UnsafePointer[Float32, ImmutAnyOrigin],
     dq_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
@@ -1164,7 +1284,29 @@ def bwd_convert_kernel[
     var b_idx: Int = Int(block_idx.z)
     var tid: Int = Int(thread_idx.x)
 
-    var num_m_blocks: Int = (seq_len + BM - 1) // BM
+    # Varlen: one CTA per q-tile-table row (m_local, q_row_base,
+    # seqlen_q, mpad_base, ...); the table address rides the seq_len
+    # slot and nheads carries num_mpad = total_qpad/BM. H comes from
+    # grid_dim.y.
+    var vl_q_base: Int = 0
+    var vl_slq: Int = 0
+    var vl_mpad_base: Int = 0
+    comptime if varlen:
+        var tbl = (
+            UnsafePointer[Int32, ImmutAnyOrigin](
+                unsafe_from_address=seq_len
+            )
+            + 8 * Int(block_idx.x)
+        )
+        m_block = Int(tbl[0])
+        vl_q_base = Int(tbl[1])
+        vl_slq = Int(tbl[2])
+        vl_mpad_base = Int(tbl[3])
+        b_idx = 0
+
+    var num_m_blocks: Int = 0
+    comptime if not varlen:
+        num_m_blocks = (seq_len + BM - 1) // BM
 
     var tile = external_memory[
         Float32,
@@ -1181,9 +1323,15 @@ def bwd_convert_kernel[
     comptime NCOMBO: Int = 2 * NCH  # wg x ch
     var sub: Int = tid // 128
     var ft: Int = tid % 128
-    var frag_base: Int = (
-        (b_idx * nheads + h_idx) * num_m_blocks + m_block
-    ) * (2 * WG_F32)
+    var frag_base: Int
+    comptime if varlen:
+        frag_base = (
+            h_idx * nheads + vl_mpad_base + m_block
+        ) * (2 * WG_F32)
+    else:
+        frag_base = (
+            (b_idx * nheads + h_idx) * num_m_blocks + m_block
+        ) * (2 * WG_F32)
     var d_wl: Int = (ft // 32) * 16 + (ft % 32) // 4
     var q_lp: Int = 2 * (ft % 4)
     comptime for i in range(NCOMBO // 2):
@@ -1213,12 +1361,24 @@ def bwd_convert_kernel[
     comptime for p in range((BM + ROWS_PER_PASS - 1) // ROWS_PER_PASS):
         var s_local: Int = p * ROWS_PER_PASS + row_in_pass
         var s: Int = m_block * BM + s_local
-        if s_local < BM and s < seq_len:
-            var dq_off: Int = (
-                (b_idx * seq_len + s) * nheads + h_idx
-            ) * D + d_base
-            var fv = (
-                tile + s_local * (D + PAD) + d_base
-            ).load[width=OV, alignment=16]()
-            var out = (fv * softmax_scale).cast[dtype]()
-            (dq_ptr + dq_off).store[width=OV, alignment=32](out)
+        comptime if varlen:
+            # dq is packed (total_q, H, D); rows >= seqlen_q are pad.
+            if s_local < BM and s < vl_slq:
+                var dq_off: Int = (
+                    (vl_q_base + s) * Int(grid_dim.y) + h_idx
+                ) * D + d_base
+                var fv = (
+                    tile + s_local * (D + PAD) + d_base
+                ).load[width=OV, alignment=16]()
+                var out = (fv * softmax_scale).cast[dtype]()
+                (dq_ptr + dq_off).store[width=OV, alignment=32](out)
+        else:
+            if s_local < BM and s < seq_len:
+                var dq_off: Int = (
+                    (b_idx * seq_len + s) * nheads + h_idx
+                ) * D + d_base
+                var fv = (
+                    tile + s_local * (D + PAD) + d_base
+                ).load[width=OV, alignment=16]()
+                var out = (fv * softmax_scale).cast[dtype]()
+                (dq_ptr + dq_off).store[width=OV, alignment=32](out)

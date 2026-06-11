@@ -49,7 +49,11 @@ def flash_attn_bwd_fa4_preprocess(
         Int(py=args[9]),  # dk_accum_addr (GQA; 0 otherwise)
         Int(py=args[10]),  # dv_accum_addr (GQA; 0 otherwise)
         Int(py=args[11]),  # stream
-        Int(py=args[12]),  # ctx handle
+        Int(py=args[16]),  # ctx handle
+        Int(py=args[12]),  # vl_num_q_tiles (0 when dense)
+        Int(py=args[13]),  # vl_table_addr
+        Int(py=args[14]),  # vl_total_q
+        Int(py=args[15]),  # vl_total_qpad
     )
     return PythonObject(None)
 
@@ -75,7 +79,12 @@ def flash_attn_bwd_fa4_main(
         Int(py=args[11]),  # dpsum_addr
         Int(py=args[12]),  # dq_accum_addr
         Int(py=args[13]),  # stream
-        Int(py=args[14]),  # ctx handle
+        Int(py=args[19]),  # ctx handle
+        Int(py=args[14]),  # vl_num_kv_tiles (0 when dense)
+        Int(py=args[15]),  # vl_table_addr
+        Int(py=args[16]),  # vl_total_q
+        Int(py=args[17]),  # vl_total_k
+        Int(py=args[18]),  # vl_num_mpad
     )
     return PythonObject(None)
 
@@ -94,7 +103,10 @@ def flash_attn_bwd_fa4_convert(
         Int(py=args[4]),  # dq_accum_addr
         Int(py=args[5]),  # dq_addr
         Int(py=args[6]),  # stream
-        Int(py=args[7]),  # ctx handle
+        Int(py=args[10]),  # ctx handle
+        Int(py=args[7]),  # vl_num_q_tiles (0 when dense)
+        Int(py=args[8]),  # vl_table_addr
+        Int(py=args[9]),  # vl_num_mpad
     )
     return PythonObject(None)
 

@@ -157,6 +157,166 @@ def flash_attn_func(
     return out
 
 
+def _check_varlen_envelope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+) -> None:
+    if q.dim() != 3:
+        raise ValueError(
+            f"varlen q must be packed (total_tokens, nheads, head_dim), "
+            f"got {tuple(q.shape)}"
+        )
+    _total, nheads, head_dim = q.shape
+    if q.dtype != torch.bfloat16:
+        raise ValueError(f"only bf16 is supported, got {q.dtype}")
+    if head_dim != _SUPPORTED_HEAD_DIM:
+        raise ValueError(
+            f"only head_dim={_SUPPORTED_HEAD_DIM} is supported, got "
+            f"{head_dim}"
+        )
+    if (
+        k.dim() != 3
+        or v.shape != k.shape
+        or k.shape[2] != head_dim
+        or nheads % max(k.shape[1], 1) != 0
+    ):
+        raise ValueError(
+            "k/v must be packed (total_tokens, nheads_kv, head_dim) "
+            "with Hq % Hkv == 0 (MHA or GQA): "
+            f"q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+        )
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ValueError("q, k, v must share one dtype")
+    for name, cu in (
+        ("cu_seqlens_q", cu_seqlens_q),
+        ("cu_seqlens_k", cu_seqlens_k),
+    ):
+        if cu.dim() != 1 or cu.dtype != torch.int32:
+            raise ValueError(
+                f"{name} must be a 1-D int32 tensor, got "
+                f"{tuple(cu.shape)} {cu.dtype}"
+            )
+    if cu_seqlens_q.shape != cu_seqlens_k.shape:
+        raise ValueError(
+            "cu_seqlens_q and cu_seqlens_k must have the same length"
+        )
+
+
+class _FlashAttnVarlenFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale, causal):
+        from flash_attn_mojo.fwd_fa4 import fa4_varlen_fwd
+
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        out, lse = fa4_varlen_fwd(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale,
+            causal=causal,
+        )
+        ctx.save_for_backward(
+            q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k
+        )
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.mark_non_differentiable(lse)
+        return out, lse
+
+    @staticmethod
+    def backward(ctx, dout, _dlse):
+        from flash_attn_mojo.bwd_fa4 import bwd_fa4_varlen
+
+        q, k, v, out, lse, cu_q, cu_k = ctx.saved_tensors
+        dq, dk, dv = bwd_fa4_varlen(
+            q, k, v, out, dout.contiguous(), lse, cu_q, cu_k,
+            ctx.softmax_scale, causal=ctx.causal,
+        )
+        return dq, dk, dv, None, None, None, None
+
+
+def flash_attn_varlen_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    *,
+    return_lse: bool = False,
+):
+    """Packed variable-length attention via the FA4-class Mojo
+    kernels.
+
+    Args:
+        q, k, v: bf16 CUDA tensors packed as (total_tokens, nheads,
+            head_dim) / (total_tokens, nheads_kv, head_dim);
+            head_dim=128. Current envelope: every sequence length a
+            multiple of 128, self-attention lengths (cu_seqlens_q ==
+            cu_seqlens_k); the backward additionally requires MHA.
+            Non-CUDA tensors run the pure-PyTorch reference instead.
+        cu_seqlens_q, cu_seqlens_k: (nseq+1,) int32 cumulative
+            sequence lengths, starting at 0.
+        max_seqlen_q, max_seqlen_k: accepted for flash-attn signature
+            compatibility (computed internally when omitted).
+        softmax_scale: defaults to head_dim**-0.5.
+        causal: causal masking (per sequence).
+        return_lse: also return the packed (nheads, total_q) fp32
+            natural-log row logsumexp.
+
+    Returns:
+        out (total_tokens, nheads, head_dim), or (out, lse).
+    """
+    _check_varlen_envelope(q, k, v, cu_seqlens_q, cu_seqlens_k)
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    _ = max_seqlen_q, max_seqlen_k
+
+    if not q.is_cuda:
+        from flash_attn_mojo.reference import flash_attn_varlen_ref
+
+        g = q.shape[1] // k.shape[1]
+        k_r = k.repeat_interleave(g, dim=1) if g > 1 else k
+        v_r = v.repeat_interleave(g, dim=1) if g > 1 else v
+        out = flash_attn_varlen_ref(
+            q, k_r, v_r, cu_seqlens_q, cu_seqlens_k,
+            softmax_scale=softmax_scale, causal=causal,
+        )
+        if return_lse:
+            cu = cu_seqlens_q.detach().cpu().tolist()
+            lse = torch.empty(
+                (q.shape[1], q.shape[0]),
+                dtype=torch.float32, device=q.device,
+            )
+            for i in range(len(cu) - 1):
+                s, e = cu[i], cu[i + 1]
+                scores = (
+                    torch.einsum(
+                        "shd,thd->hst", q[s:e].float(), k_r[s:e].float()
+                    )
+                    * softmax_scale
+                )
+                if causal:
+                    tri = torch.ones(
+                        e - s, e - s, dtype=torch.bool,
+                        device=scores.device,
+                    ).triu(1)
+                    scores = scores.masked_fill(tri, float("-inf"))
+                lse[:, s:e] = torch.logsumexp(scores, dim=-1)
+            return out, lse
+        return out
+
+    out, lse = _FlashAttnVarlenFunc.apply(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale, causal
+    )
+    if return_lse:
+        return out, lse
+    return out
+
+
 def flash_attn_qkvpacked_func(
     qkv: torch.Tensor,
     softmax_scale: float | None = None,

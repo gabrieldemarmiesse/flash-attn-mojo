@@ -48,7 +48,12 @@ def flash_attn_fwd_fa4_variant(
     var o_h_stride: Int = Int(py=args[11])
     var stream_handle_addr: Int = Int(py=args[12])
     # args[13..18] are comptime gates (read via get_defined_*).
-    var ctx_handle_addr: Int = Int(py=args[19])
+    # args[19..22]: varlen runtime extras (0 when dense).
+    var vl_total_q: Int = Int(py=args[19])
+    var vl_total_k: Int = Int(py=args[20])
+    var vl_table_addr: Int = Int(py=args[21])
+    var vl_num_tiles: Int = Int(py=args[22])
+    var ctx_handle_addr: Int = Int(py=args[23])
 
     if batch_int == 0 or seqlen_int == 0 or nheads_int == 0:
         return PythonObject(None)
@@ -75,6 +80,10 @@ def flash_attn_fwd_fa4_variant(
         o_h_stride,
         stream_handle_addr,
         ctx_handle_addr,
+        vl_total_q,
+        vl_total_k,
+        vl_table_addr,
+        vl_num_tiles,
     )
     return PythonObject(None)
 

@@ -100,6 +100,7 @@ def fwd_fa4_kernel[
     o_desc_shape: IndexList[3],
     causal: Bool = False,
     gqa_ratio: Int = 1,
+    varlen: Bool = False,
 ](
     q_tma: TMATensorTile[dtype, 3, q_tile_shape, q_desc_shape],
     k_tma: TMATensorTile[dtype, 3, kv_tile_shape, kv_desc_shape],
@@ -173,33 +174,67 @@ def fwd_fa4_kernel[
     var m_block: Int
     var h_idx: Int
     var b_idx: Int
-    comptime if causal:
-        # FA4's SingleTileLPTScheduler (static, non-persistent): flat
-        # 1-D grid; heaviest m_blocks launch FIRST (LPT reversal) and
-        # sched_swizzle (head,batch) pairs sweep each m together so
-        # their K/V tiles stay L2-resident.
-        var bx: Int = Int(block_idx.x)
-        var num_m: Int = (seq_len + BM - 1) // BM
-        var l2_major: Int = num_m * sched_swizzle
-        var bidhb: Int = bx // l2_major
-        var l2_mod: Int = bx - bidhb * l2_major
-        var dvsr: Int = (
-            sched_swizzle if bidhb < sched_num_hb_q else sched_residual
+    # Varlen per-CTA scalars (0/unused when dense; from the host work
+    # table otherwise).
+    var vl_q_base: Int = 0
+    var vl_k_base: Int = 0
+    var vl_seqlen_k: Int = 0
+    comptime if varlen:
+        # Host work-item table, one int32[8] row per CTA: (m_block,
+        # q_row_base, k_row_base, seqlen_q, seqlen_k, _, _, _). Its
+        # address rides the sched_swizzle slot (LPT is dense-causal
+        # only) and seq_len carries total_q (for the packed LSE
+        # layout) — the kernel signature stays identical to dense.
+        # Every per-CTA scalar is warp.broadcast-laundered so ptxas
+        # sees it warp-uniform (same hazard class as the tid-widening
+        # trap; see HANDOFF.md).
+        var tbl = (
+            UnsafePointer[Int32, ImmutAnyOrigin](
+                unsafe_from_address=sched_swizzle
+            )
+            + 8 * Int(block_idx.x)
         )
-        var blk: Int = l2_mod // dvsr
-        var res: Int = l2_mod - blk * dvsr
-        var bidhb_act: Int = bidhb * sched_swizzle + res
-        b_idx = bidhb_act // nheads
-        h_idx = bidhb_act - b_idx * nheads
-        m_block = num_m - 1 - blk
-    else:
-        m_block = Int(block_idx.x)
+        m_block = Int(warp.broadcast(tbl[0]))
+        vl_q_base = Int(warp.broadcast(tbl[1]))
+        vl_k_base = Int(warp.broadcast(tbl[2]))
+        vl_seqlen_k = Int(warp.broadcast(tbl[4]))
         h_idx = Int(block_idx.y)
-        b_idx = Int(block_idx.z)
-    var num_kv_blocks: Int = (seq_len + BN - 1) // BN
+        b_idx = 0
+    else:
+        comptime if causal:
+            # FA4's SingleTileLPTScheduler (static, non-persistent):
+            # flat 1-D grid; heaviest m_blocks launch FIRST (LPT
+            # reversal) and sched_swizzle (head,batch) pairs sweep
+            # each m together so their K/V tiles stay L2-resident.
+            var bx: Int = Int(block_idx.x)
+            var num_m: Int = (seq_len + BM - 1) // BM
+            var l2_major: Int = num_m * sched_swizzle
+            var bidhb: Int = bx // l2_major
+            var l2_mod: Int = bx - bidhb * l2_major
+            var dvsr: Int = (
+                sched_swizzle if bidhb < sched_num_hb_q else sched_residual
+            )
+            var blk: Int = l2_mod // dvsr
+            var res: Int = l2_mod - blk * dvsr
+            var bidhb_act: Int = bidhb * sched_swizzle + res
+            b_idx = bidhb_act // nheads
+            h_idx = bidhb_act - b_idx * nheads
+            m_block = num_m - 1 - blk
+        else:
+            m_block = Int(block_idx.x)
+            h_idx = Int(block_idx.y)
+            b_idx = Int(block_idx.z)
+    var num_kv_blocks: Int
+    comptime if varlen:
+        num_kv_blocks = (vl_seqlen_k + BN - 1) // BN
+    else:
+        num_kv_blocks = (seq_len + BN - 1) // BN
     comptime if causal:
         # BM == BN: row block m attends KV tiles 0..m inclusive; the
         # tile n == m_block is the (only) masked diagonal tile.
+        # (Varlen v1 is self-attn — seqlen_q == seqlen_k per sequence
+        # — so the dense diagonal formula carries over. The general
+        # FA4 form is min(·, ceil_div((m+1)*BM + slk - slq, BN)).)
         comptime assert BM == BN, "causal block-skip assumes BM == BN"
         num_kv_blocks = min(num_kv_blocks, m_block + 1)
 
@@ -217,15 +252,26 @@ def fwd_fa4_kernel[
         warpgroup_reg_dealloc[NUM_PRODUCER_REGS]()
         if thread_idx.x == 0:
             mbar_q[0].expect_bytes(Int32(BM * D * size_of[dtype]()))
-            q_tma.async_copy_3d(
-                q_smem, mbar_q[0], (0, h_idx, b_idx * seq_len + m_block * BM)
-            )
+            comptime if varlen:
+                q_tma.async_copy_3d(
+                    q_smem, mbar_q[0], (0, h_idx, vl_q_base + m_block * BM)
+                )
+            else:
+                q_tma.async_copy_3d(
+                    q_smem,
+                    mbar_q[0],
+                    (0, h_idx, b_idx * seq_len + m_block * BM),
+                )
             # Incremental ring state: K(n) in slot 2n%6, V(n) in
             # (2n+1)%6; the empty-barrier phase flips every 3 tiles.
             var slot: Int = 0
             var phase: UInt32 = 0
             var wrap: Int = 0
-            var row: Int = b_idx * seq_len
+            var row: Int
+            comptime if varlen:
+                row = vl_k_base
+            else:
+                row = b_idx * seq_len
             for _ in range(num_kv_blocks):
                 empty[slot].wait(phase)
                 var k_st = LayoutTensor[
@@ -557,9 +603,12 @@ def fwd_fa4_kernel[
     # row-reduced, so lse = rowmax*ln2 + ln(rowsum). lane_pair 0
     # writes its thread's two rows; (B, H, S) f32, grid.y == nheads.
     if lane_pair == 0:
-        var lse_row_base: Int = (
-            b_idx * nheads + h_idx
-        ) * seq_len + m_block * BM
+        var lse_row_base: Int
+        comptime if varlen:
+            # Packed (H, total_q) layout; seq_len carries total_q.
+            lse_row_base = h_idx * seq_len + vl_q_base + m_block * BM
+        else:
+            lse_row_base = (b_idx * nheads + h_idx) * seq_len + m_block * BM
         comptime LN2: Scalar[accum_type] = 0.6931471805599453
         comptime for i in range(rows_per_thread):
             var r: Int = row_warp_base + lane_group + 8 * i
@@ -572,8 +621,13 @@ def fwd_fa4_kernel[
     # (id 3: ids 1-2 are the scheduler pingpong barriers.)
     named_barrier[Int32(NWG * 128)](Int32(3))
     if thread_idx.x == 128:
-        o_tma.async_store_3d(
-            o_smem, (0, h_idx, b_idx * seq_len + m_block * BM)
-        )
+        comptime if varlen:
+            o_tma.async_store_3d(
+                o_smem, (0, h_idx, vl_q_base + m_block * BM)
+            )
+        else:
+            o_tma.async_store_3d(
+                o_smem, (0, h_idx, b_idx * seq_len + m_block * BM)
+            )
         o_tma.commit_group()
         o_tma.wait_group()

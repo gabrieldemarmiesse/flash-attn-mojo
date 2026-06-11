@@ -267,3 +267,119 @@ def test_gqa_vs_fa4_when_available():
     out = flash_attn_func(q, k, v)
     ref_out, _ = fa4_func(q, k, v, return_lse=True)
     assert (out - ref_out).abs().max().item() < 5e-3
+
+
+# ---- varlen (packed cu_seqlens) ----
+# v1 envelope: every length % 128 == 0, self-attn lengths, MHA bwd.
+VARLEN_SETS = [[128], [128, 256, 640], [1024, 128]]
+
+
+def _make_varlen(lens, requires_grad=False):
+    total = sum(lens)
+    cu_list = [0]
+    for L in lens:
+        cu_list.append(cu_list[-1] + L)
+    cu = torch.tensor(cu_list, dtype=torch.int32, device="cuda")
+    q = torch.randn(
+        total, 4, 128, dtype=torch.bfloat16, device="cuda",
+        requires_grad=requires_grad,
+    )
+    k = torch.randn_like(q, requires_grad=requires_grad)
+    v = torch.randn_like(q, requires_grad=requires_grad)
+    return q, k, v, cu, cu_list
+
+
+def _sdpa_varlen_fp32(q, k, v, cu_list, causal=False):
+    import torch.nn.functional as F
+
+    outs = []
+    for i in range(len(cu_list) - 1):
+        s, e = cu_list[i], cu_list[i + 1]
+        outs.append(
+            F.scaled_dot_product_attention(
+                q[s:e].transpose(0, 1).float(),
+                k[s:e].transpose(0, 1).float(),
+                v[s:e].transpose(0, 1).float(),
+                is_causal=causal,
+            ).transpose(0, 1)
+        )
+    return torch.cat(outs, dim=0)
+
+
+@requires_cuda
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("lens", VARLEN_SETS)
+def test_varlen_fwd_out_and_lse(lens, causal):
+    from flash_attn_mojo import flash_attn_varlen_func
+
+    q, k, v, cu, cu_list = _make_varlen(lens)
+    with torch.no_grad():
+        out, lse = flash_attn_varlen_func(
+            q, k, v, cu, cu, causal=causal, return_lse=True
+        )
+    ref = _sdpa_varlen_fp32(q, k, v, cu_list, causal)
+    assert (out.float() - ref).abs().max().item() < 2e-2
+
+    scale = q.shape[-1] ** -0.5
+    for i, L in enumerate(lens):
+        s, e = cu_list[i], cu_list[i + 1]
+        scores = (
+            torch.einsum("shd,thd->hst", q[s:e].float(), k[s:e].float())
+            * scale
+        )
+        if causal:
+            tri = torch.ones(
+                L, L, dtype=torch.bool, device="cuda"
+            ).triu(1)
+            scores = scores.masked_fill(tri, float("-inf"))
+        ref_lse = torch.logsumexp(scores, dim=-1)
+        assert (lse[:, s:e] - ref_lse).abs().max().item() < LSE_TOL
+
+
+@requires_cuda
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("lens", VARLEN_SETS)
+def test_varlen_backward_grads(lens, causal):
+    from flash_attn_mojo import flash_attn_varlen_func
+
+    q, k, v, cu, cu_list = _make_varlen(lens, requires_grad=True)
+    dout = torch.randn_like(q)
+    out = flash_attn_varlen_func(q, k, v, cu, cu, causal=causal)
+    out.backward(dout)
+
+    qf = q.detach().float().requires_grad_()
+    kf = k.detach().float().requires_grad_()
+    vf = v.detach().float().requires_grad_()
+    ref = _sdpa_varlen_fp32(qf, kf, vf, cu_list, causal)
+    ref.backward(dout.float())
+    for name, got, want in (
+        ("dq", q.grad, qf.grad),
+        ("dk", k.grad, kf.grad),
+        ("dv", v.grad, vf.grad),
+    ):
+        d = (got.float() - want).abs().max().item()
+        assert d < 5e-2, f"{name} maxdiff {d:.3e} lens={lens}"
+
+
+@requires_cuda
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+@pytest.mark.parametrize("causal", [False, True])
+def test_varlen_vs_fa4_when_available(causal):
+    try:
+        from flash_attn.cute import flash_attn_varlen_func as fa4_varlen
+    except ImportError:
+        pytest.skip("flash_attn.cute not importable")
+    from flash_attn_mojo import flash_attn_varlen_func
+
+    q, k, v, cu, _ = _make_varlen([1024, 256, 128])
+    with torch.no_grad():
+        out, lse = flash_attn_varlen_func(
+            q, k, v, cu, cu, causal=causal, return_lse=True
+        )
+    ref_out, ref_lse = fa4_varlen(
+        q, k, v, cu_seqlens_q=cu, cu_seqlens_k=cu,
+        max_seqlen_q=1024, max_seqlen_k=1024,
+        causal=causal, return_lse=True,
+    )
+    assert (out - ref_out).abs().max().item() < 2e-2
+    assert (lse - ref_lse).abs().max().item() < 1e-5

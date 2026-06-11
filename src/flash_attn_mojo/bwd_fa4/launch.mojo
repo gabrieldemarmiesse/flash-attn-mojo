@@ -79,14 +79,29 @@ def launch_bwd_preprocess[
     dv_accum_addr: Int,
     stream_handle_addr: Int,
     ctx_handle_addr: Int,
+    vl_num_q_tiles: Int = 0,
+    vl_table_addr: Int = 0,
+    vl_total_q: Int = 0,
+    vl_total_qpad: Int = 0,
 ) raises:
     var ctx = _ctx_and_stream(ctx_handle_addr)
     var stream_opaque = OpaquePointer[MutAnyOrigin](
         unsafe_from_address=stream_handle_addr
     )
 
+    # Varlen slot-riding (kernel signature unchanged): dk_accum
+    # carries the q-tile work table, seq_len carries total_q and
+    # nheads carries total_qpad.
+    var dk_accum_addr_eff: Int = dk_accum_addr
+    var seq_len_arg: Int = seqlen_int
+    var nheads_arg: Int = nheads_int
+    comptime if varlen:
+        dk_accum_addr_eff = vl_table_addr
+        seq_len_arg = vl_total_q
+        nheads_arg = vl_total_qpad
+
     var dk_accum_ptr = UnsafePointer[Float32, MutAnyOrigin](
-        unsafe_from_address=dk_accum_addr
+        unsafe_from_address=dk_accum_addr_eff
     )
     var dv_accum_ptr = UnsafePointer[Float32, MutAnyOrigin](
         unsafe_from_address=dv_accum_addr
@@ -111,20 +126,25 @@ def launch_bwd_preprocess[
     )
 
     comptime kernel_inst = bwd_preprocess_kernel[
-        dtype, head_dim, causal, gqa_ratio
+        dtype, head_dim, causal, gqa_ratio, varlen
     ]
     var compiled = ctx.compile_function[kernel_inst, kernel_inst]()
     # Grid covers Spad rows (side buffers padded to the main-kernel
-    # m-block size; pad rows get lse=+inf / dpsum=0).
+    # m-block size; pad rows get lse=+inf / dpsum=0). Varlen: one CTA
+    # per main-kernel m-block (q-tile table row).
     comptime bm_main: Int = 64 if causal else kBwdBlockM
     var spad: Int = (
         ceildiv(seqlen_int, Int(bm_main)) * Int(bm_main)
     )
-    var grid = (
-        ceildiv(spad, Int(kBwdPreBlockM)),
-        nheads_int,
-        batch_int,
-    )
+    var grid: Tuple[Int, Int, Int]
+    comptime if varlen:
+        grid = (vl_num_q_tiles, nheads_int, 1)
+    else:
+        grid = (
+            ceildiv(spad, Int(kBwdPreBlockM)),
+            nheads_int,
+            batch_int,
+        )
 
     comptime if use_external_stream:
         var stream = ctx.create_external_stream(stream_opaque)
@@ -138,8 +158,8 @@ def launch_bwd_preprocess[
             dq_accum_ptr,
             dk_accum_ptr,
             dv_accum_ptr,
-            seqlen_int,
-            nheads_int,
+            seq_len_arg,
+            nheads_arg,
             grid_dim=grid,
             block_dim=(kBwdPreThreads,),
         )
@@ -154,8 +174,8 @@ def launch_bwd_preprocess[
             dq_accum_ptr,
             dk_accum_ptr,
             dv_accum_ptr,
-            seqlen_int,
-            nheads_int,
+            seq_len_arg,
+            nheads_arg,
             grid_dim=grid,
             block_dim=(kBwdPreThreads,),
         )
@@ -185,6 +205,11 @@ def launch_bwd_main[
     dq_accum_addr: Int,
     stream_handle_addr: Int,
     ctx_handle_addr: Int,
+    vl_num_kv_tiles: Int = 0,
+    vl_table_addr: Int = 0,
+    vl_total_q: Int = 0,
+    vl_total_k: Int = 0,
+    vl_num_mpad: Int = 0,
 ) raises:
     var ctx = _ctx_and_stream(ctx_handle_addr)
     var stream_opaque = OpaquePointer[MutAnyOrigin](
@@ -248,14 +273,26 @@ def launch_bwd_main[
     comptime q_smem_shape = IndexList[3](bm, 1, head_dim)
     comptime kv_smem_shape = IndexList[3](kBwdBlockN, 1, head_dim)
 
+    # Varlen: flat descriptors over the packed (total_tokens, H, D)
+    # arrays; per-seq row offsets come from the kv-tile work table,
+    # whose address rides the dk_accum_ptr kernel slot (MHA-only
+    # v1); seq_len carries num_mpad = total_qpad / BM.
     var rows: Int = batch_int * seqlen_int
+    var rows_kv: Int = rows
+    var dk_accum_addr_eff: Int = dk_addr
+    var seq_len_arg: Int = seqlen_int
+    comptime if varlen:
+        rows = vl_total_q
+        rows_kv = vl_total_k
+        dk_accum_addr_eff = vl_table_addr
+        seq_len_arg = vl_num_mpad
     var nheads_kv: Int = nheads_int // gqa_ratio
     # Under GQA the dk/dv addresses carry the fp32 per-kv-head
     # accumulators (the epilogue bulk-reduce-adds into them; a torch
     # permute-cast converts). The bf16 TMA descriptors below are
     # then unused by the kernel (comptime-dead store path).
     var dk_accum_ptr = UnsafePointer[Float32, MutAnyOrigin](
-        unsafe_from_address=dk_addr
+        unsafe_from_address=dk_accum_addr_eff
     )
     var dv_accum_ptr = UnsafePointer[Float32, MutAnyOrigin](
         unsafe_from_address=dv_addr
@@ -268,16 +305,16 @@ def launch_bwd_main[
     ](ctx, do_ptr, rows, nheads_int)
     var k_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
-    ](ctx, k_ptr, rows, nheads_kv)
+    ](ctx, k_ptr, rows_kv, nheads_kv)
     var v_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
-    ](ctx, v_ptr, rows, nheads_kv)
+    ](ctx, v_ptr, rows_kv, nheads_kv)
     var dk_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
-    ](ctx, dk_ptr, rows, nheads_kv)
+    ](ctx, dk_ptr, rows_kv, nheads_kv)
     var dv_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
-    ](ctx, dv_ptr, rows, nheads_kv)
+    ](ctx, dv_ptr, rows_kv, nheads_kv)
 
     comptime kernel_inst = bwd_main_kernel[
         dtype,
@@ -290,6 +327,7 @@ def launch_bwd_main[
         type_of(dk_tma).desc_shape,
         causal,
         gqa_ratio,
+        varlen,
     ]
 
     var compiled = ctx.compile_function[
@@ -302,11 +340,15 @@ def launch_bwd_main[
         )
     )
 
-    var grid = (
-        ceildiv(seqlen_int, Int(kBwdBlockN)),
-        nheads_int,
-        batch_int,
-    )
+    var grid: Tuple[Int, Int, Int]
+    comptime if varlen:
+        grid = (vl_num_kv_tiles, nheads_int, 1)
+    else:
+        grid = (
+            ceildiv(seqlen_int, Int(kBwdBlockN)),
+            nheads_int,
+            batch_int,
+        )
 
     comptime if use_external_stream:
         var stream = ctx.create_external_stream(stream_opaque)
@@ -323,7 +365,7 @@ def launch_bwd_main[
             dq_accum_ptr,
             dk_accum_ptr,
             dv_accum_ptr,
-            seqlen_int,
+            seq_len_arg,
             softmax_scale,
             grid_dim=grid,
             block_dim=(kBwdNThreads,),
@@ -343,7 +385,7 @@ def launch_bwd_main[
             dq_accum_ptr,
             dk_accum_ptr,
             dv_accum_ptr,
-            seqlen_int,
+            seq_len_arg,
             softmax_scale,
             grid_dim=grid,
             block_dim=(kBwdNThreads,),
@@ -368,6 +410,9 @@ def launch_bwd_convert[
     dq_addr: Int,
     stream_handle_addr: Int,
     ctx_handle_addr: Int,
+    vl_num_q_tiles: Int = 0,
+    vl_table_addr: Int = 0,
+    vl_num_mpad: Int = 0,
 ) raises:
     var ctx = _ctx_and_stream(ctx_handle_addr)
     var stream_opaque = OpaquePointer[MutAnyOrigin](
@@ -381,11 +426,21 @@ def launch_bwd_convert[
         unsafe_from_address=dq_addr
     )
 
+    # Varlen slot-riding (kernel signature unchanged): seq_len
+    # carries the q-tile work-table address, nheads carries num_mpad.
+    var seq_len_arg: Int = seqlen_int
+    var nheads_arg: Int = nheads_int
+    comptime if varlen:
+        seq_len_arg = vl_table_addr
+        nheads_arg = vl_num_mpad
+
     # (BM q) x (128+4 d) f32 decode tile.
     comptime bm_cvt: Int = 64 if causal else kBwdBlockM
     comptime cvt_smem_bytes: Int = bm_cvt * (head_dim + 4) * 4
 
-    comptime kernel_inst = bwd_convert_kernel[dtype, head_dim, causal]
+    comptime kernel_inst = bwd_convert_kernel[
+        dtype, head_dim, causal, varlen
+    ]
     _ = gqa_ratio  # dq convert is ratio-independent
     var compiled = ctx.compile_function[kernel_inst, kernel_inst](
         func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
@@ -393,11 +448,15 @@ def launch_bwd_convert[
         )
     )
     # One CTA per main-kernel m-block.
-    var grid = (
-        ceildiv(seqlen_int, Int(bm_cvt)),
-        nheads_int,
-        batch_int,
-    )
+    var grid: Tuple[Int, Int, Int]
+    comptime if varlen:
+        grid = (vl_num_q_tiles, nheads_int, 1)
+    else:
+        grid = (
+            ceildiv(seqlen_int, Int(bm_cvt)),
+            nheads_int,
+            batch_int,
+        )
 
     comptime if use_external_stream:
         var stream = ctx.create_external_stream(stream_opaque)
@@ -405,8 +464,8 @@ def launch_bwd_convert[
             compiled,
             dq_accum_ptr,
             dq_ptr,
-            seqlen_int,
-            nheads_int,
+            seq_len_arg,
+            nheads_arg,
             softmax_scale,
             grid_dim=grid,
             block_dim=(kBwdCvtThreads,),
@@ -417,8 +476,8 @@ def launch_bwd_convert[
             compiled,
             dq_accum_ptr,
             dq_ptr,
-            seqlen_int,
-            nheads_int,
+            seq_len_arg,
+            nheads_arg,
             softmax_scale,
             grid_dim=grid,
             block_dim=(kBwdCvtThreads,),

@@ -215,6 +215,63 @@ Hard-won bugs (see also memory notes):
   MOVs). If grads go wrong after touching that code, check the
   SASS for real register moves before the GMMA scoreboard clears.
 
+## Varlen (2026-06-11, fifth session)
+
+Packed cu_seqlens support across all four kernels (fwd + the bwd
+trio), `flash_attn_varlen_func` differentiable end-to-end. v1
+envelope: every seqlen % 128 == 0, self-attn lengths, bwd MHA-only.
+
+Results at the canonical packed config (8 seqs, 16384 tokens,
+lengths 1280–3072, H=16, locked clocks, 3-run spreads):
+- bwd: 0.981–0.987x (mojo FASTER) noncausal, 1.001–1.004x causal —
+  parity on the first bench, zero perf work needed.
+- fwd: 1.040–1.045x both causal and noncausal — but this is NOT a
+  varlen gap: degenerate-uniform cu_seqlens=[0,8192,16384] runs
+  0.983–0.988x (mojo FASTER than FA4's varlen kernel), and dense
+  B=8 S=2048 shows the same 1.054x. It is a pre-existing
+  short-sequence amortization gap in the dense fwd (per-CTA
+  trip-count ~16 vs 64); open task. Note FA4's varlen fwd is itself
+  ~1–3% slower than FA4's dense fwd at identical work (its
+  in-kernel scan); ours adds ~0.
+
+Design (full spec in the audit output; deltas vs FA4):
+- Host work-item tables instead of FA4's in-kernel 32-lane
+  prefix-scan scheduler (~186 PTX lines/CTA): int32[8] rows, built
+  with vectorized torch on a host copy of cu_seqlens (one D2H sync
+  per call). fwd/preprocess/convert tables are per q-tile
+  (m_local, q_row_base, seqlen_q[, mpad_base]); bwd main per
+  kv-tile (n_block, q_base, k_base, slq, slk, num_m, m_start,
+  mpad_base — m_start and the //80-derived fields HOST-precomputed,
+  so no signed-div chains on device).
+- KERNEL SIGNATURES ARE UNCHANGED vs dense (byte-identity gate per
+  edit): the table address rides comptime-dead arg slots — fwd:
+  sched_swizzle (LPT is dense-causal-only) with seq_len carrying
+  total_q; bwd main: dk_accum_ptr (GQA varlen deferred) with
+  seq_len carrying num_mpad; preprocess: dk_accum_ptr +
+  seq_len=total_q + nheads=total_qpad; convert: seq_len=table addr
+  + nheads=num_mpad (H from grid_dim.y).
+- Loads/stores: flat TMA descriptors over packed (total, H, D),
+  runtime per-seq row coords (rows=total_q / total_k at descriptor
+  creation). Tile-aligned v1 → full-tile TMA stores stay safe.
+- Stats: FA4's padded-packed layout verbatim — (H, total_qpad)
+  with padded_offset_q[i] = ((cu_q[i]+i*BM)//BM)*BM and
+  total_qpad = ceil((total_q+(nseq+1)*BM)/BM)*BM (multiplier is
+  len(cu_seqlens) — under-allocating overlaps the last window;
+  asserted host-side). Pad rows keep OUR +inf-LSE/0-dpsum
+  convention (FA4 uses lse=0 + an in-loop seqlen_q mask — the two
+  are coupled; swapping one without the other silently corrupts
+  dQ).
+- LSE is packed (H, total_q) (FA4's varlen layout) — the bwd
+  preprocess reads it back with the same indexing.
+- Every per-CTA table scalar is warp.broadcast-laundered (the
+  tid-widening hazard class; spills stayed 0/168 regs across all
+  varlen variants).
+
+Bench plumbing: `bench_fa4.py --varlen [--varlen-lens ...]`
+(check sets + canonical mixed bench; per-seq fp32 references; FA4
+varlen cross-checked through the same harness), `master_bench.sh
+--varlen` (PTX refs `reference_ptx/fa4_*_varlen.ptx`).
+
 ## Not yet tried (fwd)
 
 - ~~L2 cache hints on TMA loads~~ DEBUNKED (third session): FA4's

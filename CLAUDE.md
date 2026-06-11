@@ -3,7 +3,7 @@
 Guidance for working on this repo: FlashAttention-4-class attention
 kernels written from scratch in Mojo.
 
-## State (2026-06-10): parity with FlashAttention-4 on H100
+## State (2026-06-11): parity with FlashAttention-4 on H100
 
 The package races Tri Dao's **FlashAttention-4** (`flash_attn.cute`,
 CuTe DSL) at one minimalist config — bf16, head_dim=128, non-causal,
@@ -30,6 +30,25 @@ run-to-run variance (locked clocks, interleaved):
   FA4's unswapped form + per-wg column split is documented in the
   causal-bwd audit if ever needed). Causal bwd scheduler: plain 3-D
   grid — FA4 uses NO LPT for the bwd (PTX-verified).
+- VARLEN (2026-06-11, packed cu_seqlens, `flash_attn_varlen_func`,
+  fully differentiable): bwd at parity at the canonical mixed
+  16384-token config (0.981x noncausal — mojo faster — / 1.003x
+  causal); the fwd varlen machinery itself is FREE
+  (degenerate-uniform [8192,8192] = 0.988x, mojo faster) but the
+  mixed config shows ~1.04x — that is the pre-existing
+  SHORT-SEQUENCE fwd amortization gap (dense B=8 S=2048 is 1.054x
+  too; open task, not varlen-specific). Design: host work-item
+  tables (int32[8] rows; fwd/preprocess/convert per q-tile, bwd
+  main per kv-tile) whose addresses ride existing kernel arg slots
+  (sched_swizzle in the fwd, dk_accum_ptr in the bwd) so kernel
+  signatures stay byte-identical to dense (gated per edit); FA4's
+  padded-packed stats layout (`padded_offset_q =
+  ((cu_q[i]+i*BM)//BM)*BM`, host-precomputed — no device //80);
+  packed (H, total_q) LSE; our +inf-LSE/0-dpsum per-seq window
+  padding (NOT FA4's lse=0 + in-loop mask — the two are coupled;
+  documented at the preprocess write site). v1 envelope: every
+  seqlen % 128 == 0, self-attn lengths, bwd MHA-only (fwd takes
+  GQA). All per-CTA table scalars are warp.broadcast-laundered.
 
 `HANDOFF.md` is the full race log: architecture, the perf journey,
 the codegen lessons (uniform-register file capacity, the
@@ -50,7 +69,8 @@ attempting any perf change**.
 
 ## Iteration tooling
 
-- **Master script: `scripts/master_bench.sh [--kind bwd] [--no-ncu]`**
+- **Master script: `scripts/master_bench.sh [--kind bwd] [--causal]
+  [--hkv N] [--varlen] [--quick] [--no-ncu]`**
   — clears the flash_attn_mojo JIT cache (not the mojo compiler
   cache), recompiles, runs correctness checks, benches mojo vs FA4
   interleaved (CUPTI kernel-only time), dumps the mojo kernel's PTX
@@ -60,7 +80,10 @@ attempting any perf change**.
   `uv run python scripts/bench_fa4.py --impl mojo --kind {fwd,bwd}
   --check-only` — fp32-reference checks at S ∈ {128, 256, 640, 1024}
   (640 = 8×80 exercises the bwd tile_m=80 exact-fit path; the others
-  leave partial tail m-tiles). fwd also checks LSE.
+  leave partial tail m-tiles). fwd also checks LSE. Add `--varlen`
+  for the packed cu_seqlens check sets (per-seq fp32 references);
+  `--varlen-lens` sets the bench lengths (default: the canonical
+  mixed 16384-token config).
 - **`scripts/ptxas_ur_probe.py`** — generates toy wgmma-loop PTX in
   varying dataflow shapes, compiles with ptxas, reports
   UR-allocation / R2UR / spills. Use it to test any codegen
@@ -211,11 +234,14 @@ HANDOFF.md and the memory notes):
 
 ## Extending the envelope (if/when)
 
-The natural next features, in rough order of value: varlen
-(cu_seqlens; the big one for packed training), other head dims,
-arbitrary seqlen. The
-FA4-class algorithm core (warp specialization, tile_m=80 bwd, the
-mailbox dQ drain) carries over; these are predicate/indexing
-variations. Keep every change inside the measurement protocol above
-— and add new seqlen/shape cases to `bench_fa4.py --check-only` and
+The natural next features, in rough order of value: the
+short-sequence fwd gap (task #18 — dense B=8 S=2048 is 1.054x),
+arbitrary (non-%128) seqlens via varlen tail masking (lifts the
+varlen v1 envelope: boundary-tile-only kv mask + predicated tail
+stores — the audit's steps 2/5b), varlen GQA (the bwd needs
+`total_k_rounded_padded`/`padded_offset_k` accum windows; the fwd
+already takes GQA), other head dims. The FA4-class algorithm core
+(warp specialization, tile_m=80 bwd, the mailbox dQ drain) carries
+over. Keep every change inside the measurement protocol above — and
+add new seqlen/shape cases to `bench_fa4.py --check-only` and
 `tests/test_fa4.py`, not ad-hoc scripts.

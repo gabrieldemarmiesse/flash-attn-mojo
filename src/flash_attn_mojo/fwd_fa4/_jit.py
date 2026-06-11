@@ -43,7 +43,9 @@ def call_fwd_fa4(args: tuple) -> None:
         16     causal         (comptime)
         17     gqa_ratio      (comptime)
         18     varlen         (comptime)
-    ``ctx_handle`` is appended as index 19 by this dispatcher.
+        19..22 varlen runtime extras: total_q, total_k,
+               tile-table addr, num_tiles (all 0 when dense)
+    ``ctx_handle`` is appended as index 23 by this dispatcher.
     """
     variant_fn, ctx_handle = _get_variant_fn(_config_from_args(args))
     variant_fn(*args, ctx_handle)
