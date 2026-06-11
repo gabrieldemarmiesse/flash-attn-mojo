@@ -19,6 +19,8 @@ FA4's kernel time within run-to-run variance:
 | bwd (GQA 4x) | 0.98 / 1.01x (plain/causal) |
 | fwd (varlen) | 1.00 / 0.98x (plain/causal) |
 | bwd (varlen) | 0.98 / 1.00x (plain/causal) |
+| fwd (hdim64) | 0.96 / 0.95x (plain/causal, mojo faster) |
+| bwd (hdim64) | 0.97 / 0.97x (plain/causal) |
 
 (Locked clocks, interleaved kernel-only CUPTI timing; both kernels
 wobble ~2–4% run to run, so everything above straddles parity. The
@@ -37,7 +39,7 @@ fp32 precision.
 return_lse=False)` with:
 
 - bf16 or fp16, contiguous `(batch, seqlen, nheads, head_dim)`
-- `head_dim == 128`, `seqlen % 128 == 0`, MHA or GQA
+- `head_dim` 64 or 128, `seqlen % 128 == 0`, MHA or GQA
   (`Hq % Hkv == 0`)
 - causal or non-causal (both differentiable, both at parity); no
   dropout / windows / ALiBi

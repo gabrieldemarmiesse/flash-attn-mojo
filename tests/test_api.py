@@ -40,7 +40,7 @@ def test_envelope_errors():
     q, k, v = _qkv(dtype=torch.float32)
     with pytest.raises(ValueError, match="bf16 and fp16"):
         flash_attn_func(q, k, v)
-    q, k, v = _qkv(head_dim=64)
+    q, k, v = _qkv(head_dim=96)
     with pytest.raises(ValueError, match="head_dim"):
         flash_attn_func(q, k, v)
     q, k, v = _qkv(seqlen=100)

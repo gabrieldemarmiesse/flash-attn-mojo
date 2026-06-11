@@ -404,6 +404,42 @@ SM100-gated cp.reduce):
   B descriptor + k*stride11*2*sizeof steps, trans_b=1 for the
   mn-major views).
 
+## head_dim 64 (2026-06-11, eighth session)
+
+Full playbook run: FA4 reference PTX + targets captured (H=32
+canonical), 4-reader audit with 9 PTX-resolved contradictions
+(reference_ptx/hdim64_port_spec.md), comptime parameterization
+sweep gated byte-identical per edit, then fwd and bwd ports. End
+state: every dense hdim64 config at or below FA4 (fwd 0.949-0.975x
+mojo faster; bwd 0.931-1.004x straddling).
+
+What the spec got right up front (zero debugging needed): the 3-wg
+fwd structure (512 thr, 32/160 regs), rank-4 Q/O TMA for the
+192-tails, the NWG-ring pingpong with the 2*128 barrier count, the
+causal 2-tile band mask, BM=128 bwd with shapes flowing from the
+comptime sweep, the GQA staging relocation to dead sdS. The ONE
+real bug: the dQ^T N-split's per-WG sdS window — I offset by
+64*BN*2 = 16 KiB assuming 128-elem rows, but the canonical SW128
+(BM, BN) tile is COLUMN-SLAB-major (64-col slabs of BM*64 elems;
+the existing k-steps already jump slabs via sds_slab_bytes), so 64
+q-rows = 8 cores x 512 elems = 8 KiB. Symptom signature: dq exact
+for q rows 0-63, garbage for 64-127 — wg-half error = operand
+window error. Diagnose by error-structure FIRST (rows-vs-cols x
+wg halves localizes descriptor bugs in one run).
+
+Deviations from FA4 kept deliberately: our 6-slot K/V ring (FA4
+ships 2+2 at hdim64; ours benches faster), plain paired-store
+epilogue staging at D=64 instead of rederiving the stmatrix
+schemes (the constants encode D=128 geometry; parity did not
+demand it — we're already faster), and the swapped dQ^T retained
+with the split moved M->N (instruction-identical to FA4's
+AtomLayoutMdQ=2 inventory).
+
+Deferred: hdim64 varlen (the spec's step 9: run the (128,128,
+NWG=2) fallback config — FA4-blessed — to dodge in-pack 192-tails)
+and hdim64 fp16 (m64n64 arm for _wgmma_f16.mojo, mirror the
+stdlib's n==64 arm).
+
 ## Not yet tried (fwd)
 
 - ~~L2 cache hints on TMA loads~~ DEBUNKED (third session): FA4's

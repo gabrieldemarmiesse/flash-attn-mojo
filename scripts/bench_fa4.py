@@ -111,8 +111,9 @@ def _run_check_suite(args) -> None:
     if not args.varlen:
         parts.append("gqa" if args.hkv else "mha")
     # dtype axis: bf16 selects bf16-id'd + un-id'd (canonical) tests;
-    # fp16 selects only the fp16-id'd ones.
+    # fp16 selects only the fp16-id'd ones. Same scheme for hdim.
     parts.append("not fp16" if args.dtype == "bf16" else "fp16")
+    parts.append("hd64" if args.shape[3] == 64 else "not hd64")
     kexpr = " and ".join(parts)
     tests = Path(__file__).resolve().parent.parent / "tests" / "test_kernels.py"
     print(f"CHECK pytest -k '{kexpr}' (impl={args.impl})")

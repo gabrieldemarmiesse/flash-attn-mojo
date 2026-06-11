@@ -342,3 +342,31 @@ def test_varlen_gqa_grads(causal):
     ):
         d = (got.float() - want).abs().max().item()
         assert d < 5e-2, f"{name} maxdiff {d:.3e} causal={causal}"
+
+
+@requires_cuda
+@pytest.mark.parametrize("causal", [False, True])
+def test_hdim64_public_api(causal):
+    """hdim64 through flash_attn_func end-to-end (autograd)."""
+    q = torch.randn(
+        2, 384, 4, 64, dtype=torch.bfloat16, device="cuda",
+        requires_grad=True,
+    )
+    k = torch.randn_like(q, requires_grad=True)
+    v = torch.randn_like(q, requires_grad=True)
+    dout = torch.randn_like(q)
+    out = flash_attn_func(q, k, v, causal=causal)
+    out.backward(dout)
+    qf = q.detach().float().requires_grad_()
+    kf = k.detach().float().requires_grad_()
+    vf = v.detach().float().requires_grad_()
+    ref = flash_attn_ref(qf, kf, vf, causal=causal)
+    ref.backward(dout.float())
+    assert (out.float() - ref).abs().max().item() < 2e-2
+    for name, got, want in (
+        ("dq", q.grad, qf.grad),
+        ("dk", k.grad, kf.grad),
+        ("dv", v.grad, vf.grad),
+    ):
+        d = (got.float() - want).abs().max().item()
+        assert d < 5e-2, f"{name} maxdiff {d:.3e}"

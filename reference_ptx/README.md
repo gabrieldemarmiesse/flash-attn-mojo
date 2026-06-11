@@ -70,6 +70,15 @@ D=128, locked clocks): fwd 674 µs / causal 423; bwd 2002 / causal
 dense canonical shape's work (FA4: ~2271 µs fwd) and isolates pure
 varlen overhead.
 
+## hdim64 counterparts (2026-06-11)
+
+`fa4_{fwd,bwd}_sm90_bf16_hdim64_{causal,noncausal}.ptx` — configs
+per interface.py: fwd FwdConfig(192,128,RS,OL) = 512 threads / 3
+consumer warpgroups, setmaxnreg 32/160; bwd BwdConfig(m=128,n=128,
+dQ_swapAB=False, AtomLayoutMdQ=2). Targets at B=2,S=8192,H=32,D=64
+(locked clocks): fwd 2798 / causal 1596; bwd 7642 / 3853. Full
+audited anatomy: hdim64_port_spec.md (in this directory).
+
 ## Canonical config ("the simplest call")
 
 ```python

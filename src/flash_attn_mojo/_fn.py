@@ -27,7 +27,7 @@ import torch
 
 from flash_attn_mojo.reference import flash_attn_ref
 
-_SUPPORTED_HEAD_DIM = 128
+_SUPPORTED_HEAD_DIMS = (64, 128)
 _SEQLEN_MULTIPLE = 128
 
 
@@ -47,10 +47,15 @@ def _check_envelope(
         raise ValueError(
             f"only bf16 and fp16 are supported, got {q.dtype}"
         )
-    if head_dim != _SUPPORTED_HEAD_DIM:
+    if head_dim not in _SUPPORTED_HEAD_DIMS:
         raise ValueError(
-            f"only head_dim={_SUPPORTED_HEAD_DIM} is supported, got "
-            f"{head_dim}"
+            f"only head_dim in {_SUPPORTED_HEAD_DIMS} is supported, "
+            f"got {head_dim}"
+        )
+    if head_dim == 64 and q.dtype == torch.float16:
+        raise ValueError(
+            "head_dim=64 is bf16-only for now (fp16 needs the n=64 "
+            "RS wgmma arm)"
         )
     if seqlen % _SEQLEN_MULTIPLE != 0:
         raise ValueError(
@@ -161,10 +166,10 @@ def _check_varlen_envelope(
         raise ValueError(
             f"only bf16 and fp16 are supported, got {q.dtype}"
         )
-    if head_dim != _SUPPORTED_HEAD_DIM:
+    if head_dim != 128:
         raise ValueError(
-            f"only head_dim={_SUPPORTED_HEAD_DIM} is supported, got "
-            f"{head_dim}"
+            "varlen currently supports head_dim=128 only (hdim64 "
+            "varlen is a follow-up)"
         )
     if (
         k.dim() != 3

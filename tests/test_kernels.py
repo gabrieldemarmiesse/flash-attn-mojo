@@ -31,7 +31,7 @@ IMPL = os.environ.get("FLASH_ATTN_MOJO_TEST_IMPL", "mojo")
 
 # 640 = 8*80 exercises the bwd tile_m=80 exact-fit path; the others
 # leave partial tail m-tiles. 128 is the minimum supported seqlen.
-SEQLENS = [128, 256, 640, 1024]
+SEQLENS = [128, 256, 384, 640, 1024]
 # Varlen check sets: tile-aligned plus ragged (arbitrary lengths;
 # sub-tile, +-1-around-tile, multi-tile-with-tail, and a TRAILING
 # partial tile — the last one turns a tail-store overshoot into an
@@ -119,13 +119,16 @@ def _varlen_bwd(q, k, v, out, dout, lse, cu, causal):
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 
-def _make(seqlen, hq=4, hkv=4, batch=2, requires_grad=False, dt=torch.bfloat16):
+def _make(
+    seqlen, hq=4, hkv=4, batch=2, requires_grad=False,
+    dt=torch.bfloat16, hd=128,
+):
     q = torch.randn(
-        batch, seqlen, hq, 128, dtype=dt, device="cuda",
+        batch, seqlen, hq, hd, dtype=dt, device="cuda",
         requires_grad=requires_grad,
     )
     k = torch.randn(
-        batch, seqlen, hkv, 128, dtype=dt, device="cuda",
+        batch, seqlen, hkv, hd, dtype=dt, device="cuda",
         requires_grad=requires_grad,
     )
     v = torch.randn_like(k, requires_grad=requires_grad)
@@ -148,16 +151,20 @@ def _make_varlen(lens, hq=4, hkv=4):
 
 # ---------------------------------------------------------- dense
 @requires_cuda
+@pytest.mark.parametrize("hdim", [128, 64], ids=["hd128", "hd64"])
 @pytest.mark.parametrize("dtype", ["bf16", "fp16"])
 @pytest.mark.parametrize("seqlen", SEQLENS)
 @pytest.mark.parametrize("heads", ["mha", "gqa"])
 @pytest.mark.parametrize("mask", ["plain", "causal"])
-def test_fwd_dense(seqlen, mask, heads, dtype):
+def test_fwd_dense(seqlen, mask, heads, dtype, hdim):
     _skip_if_impl_unavailable()
+    if hdim == 64 and dtype == "fp16":
+        pytest.skip("hdim64 fp16 pending the n=64 RS arm")
     torch.manual_seed(1)
     causal = mask == "causal"
     q, k, v = _make(
-        seqlen, hkv=4 if heads == "mha" else 2, dt=DTYPES[dtype]
+        seqlen, hkv=4 if heads == "mha" else 2, dt=DTYPES[dtype],
+        hd=hdim,
     )
     out, lse = _fwd(q, k, v, causal)
     ref, ref_lse = flash_attn_ref(
@@ -171,16 +178,20 @@ def test_fwd_dense(seqlen, mask, heads, dtype):
 
 
 @requires_cuda
+@pytest.mark.parametrize("hdim", [128, 64], ids=["hd128", "hd64"])
 @pytest.mark.parametrize("dtype", ["bf16", "fp16"])
 @pytest.mark.parametrize("seqlen", SEQLENS)
 @pytest.mark.parametrize("heads", ["mha", "gqa"])
 @pytest.mark.parametrize("mask", ["plain", "causal"])
-def test_bwd_dense(seqlen, mask, heads, dtype):
+def test_bwd_dense(seqlen, mask, heads, dtype, hdim):
     _skip_if_impl_unavailable()
+    if hdim == 64 and dtype == "fp16":
+        pytest.skip("hdim64 fp16 pending the n=64 RS arm")
     torch.manual_seed(1)
     causal = mask == "causal"
     q, k, v = _make(
-        seqlen, hkv=4 if heads == "mha" else 2, dt=DTYPES[dtype]
+        seqlen, hkv=4 if heads == "mha" else 2, dt=DTYPES[dtype],
+        hd=hdim,
     )
     dout = torch.randn_like(q)
     out, lse = _fwd(q, k, v, causal)

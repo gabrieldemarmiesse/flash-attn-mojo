@@ -103,6 +103,29 @@ run-to-run variance (locked clocks, interleaved):
   bf16 codegen byte-identical; fp16 parity fwd 1.01-1.03x / bwd
   1.016x (in-band); 0 spills.
 
+- HEAD_DIM 64 (2026-06-11, dense matrix complete, all at/below
+  parity — canonical B=2,S=8192,H=32,D=64, locked clocks): fwd
+  0.957-0.975x and causal 0.949-0.955x (mojo FASTER both); bwd
+  0.960-0.989x / causal 0.931-1.004x; GQA correct both directions.
+  FA4's hdim64 configs (audited spec: reference_ptx/
+  hdim64_port_spec.md): fwd BM=192/BN=128 with THREE consumer
+  warpgroups (512 thr, setmaxnreg 32/160 — the pool is exactly the
+  64K regfile; scheduler pingpong generalizes to an NWG-ring with
+  barrier count fixed at 2*128; epilogue barrier id = NWG+1); Q/O
+  TMA goes RANK-4 (S its own dim — 192-tails clamp in hardware;
+  vendored 3-runtime-dim creator in _tma4.mojo); causal diagonal
+  BAND spans 2 kv tiles (global-offset mask col + n*BN - m*BM >
+  row). bwd BM=128 both masks; dQ^T per-WG split moves M->N (the
+  wg's sdS B-window is +8 KiB — the canonical SW128 (BM,BN) tile is
+  COLUMN-SLAB-major: 64 q-rows = 8 cores x 512 elems per 64-col
+  slab, NOT 64*BN elems — the port's one real bug); GQA f32 staging
+  moves to dead sdS (dead K+V is only 32 KiB at D=64). D=64
+  epilogues stage via plain canonical-SW128 paired stores (the
+  stmatrix schemes encode D=128 geometry; parity did not demand
+  rederiving them). DEFERRED: hdim64 varlen (use the (128,128,
+  NWG=2) fallback config per the spec, FA4-blessed) and hdim64 fp16
+  (needs an m64n64 arm in _wgmma_f16.mojo).
+
 `HANDOFF.md` is the full race log: architecture, the perf journey,
 the codegen lessons (uniform-register file capacity, the
 tid-widening trap, descriptor rematerialization), the measurement
@@ -298,10 +321,11 @@ HANDOFF.md and the memory notes):
 
 ## Extending the envelope (if/when)
 
-The natural next features, in rough order of value: other head
-dims, the varlen-GQA bwd gap (pack-GQA-style head packing — see the
-State note), dense arbitrary seqlen routing through the varlen
-path. The FA4-class algorithm core
+The natural next features, in rough order of value: dense
+arbitrary seqlen routing through the varlen path, sliding window,
+softcap, varlen cross-attention, hdim64 varlen + fp16 (see the
+hdim64 State note), hdim 96/256, the varlen-GQA bwd gap
+(pack-GQA-style head packing). The FA4-class algorithm core
 (warp specialization, tile_m=80 bwd, the mailbox dQ drain) carries
 over. Keep every change inside the measurement protocol above — and
 add new seqlen/shape cases to `bench_fa4.py --check-only` and
