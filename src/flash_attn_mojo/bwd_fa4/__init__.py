@@ -53,7 +53,10 @@ def bwd_fa4(
     assert q.dtype in (torch.bfloat16, torch.float16), (
         "bwd_fa4 is bf16/fp16-only"
     )
-    assert head_dim == 128, "bwd_fa4 is head_dim=128-only"
+    assert head_dim in (64, 128), "bwd_fa4 supports head_dim 64/128"
+    assert not (head_dim == 64 and q.dtype == torch.float16), (
+        "hdim64 fp16 needs the n=64 RS wgmma arm"
+    )
     assert seqlen % _BLOCK == 0, "bwd_fa4 needs seqlen % 128 == 0"
     assert k.shape == (batch, seqlen, nheads_kv, head_dim)
     assert v.shape == k.shape

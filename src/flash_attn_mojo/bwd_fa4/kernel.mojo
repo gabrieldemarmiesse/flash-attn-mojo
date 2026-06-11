@@ -242,7 +242,9 @@ def bwd_main_kernel[
     # warp cp.reduce.async.bulk's it into dq_accum. Named-barrier
     # protocol per wg (count 128 + 32): empty 9+wg (drain arrives,
     # wg syncs), full 6+wg (wg arrives, drain syncs).
-    comptime DQ_MAIL_F32: Int = WGMMA_M * BM  # 5120 (64 d x 80 q)
+    comptime DQ_MAIL_F32: Int = WGMMA_M * (
+        BM if D == 128 else BM // 2
+    )  # 64 x (q cols per wg): 5120 at hdim128/BM=80, 4096 at hdim64
     comptime DRAIN_BAR: Int = 128 + 32
     var dq_mail = dps_smem + (STAGES // 2) * BM
 
@@ -590,7 +592,11 @@ def bwd_main_kernel[
     ].stack_allocation()
     _ = dv_acc.fill(0)
     _ = dk_acc.fill(0)
-    comptime c_frag_dq: Int = WGMMA_M * BM // 128  # 32
+    # Per-WG dQ^T tile: D=128 splits M (each wg owns a 64-row D
+    # slab, n = BM); D=64 has a single m64 so the split moves to N
+    # (each wg owns 64 of the BM q-columns).
+    comptime DQ_N: Int = BM if D == 128 else BM // 2
+    comptime c_frag_dq: Int = WGMMA_M * DQ_N // 128
     var dq_reg = LayoutTensor[
         accum_type,
         Layout.row_major(1, c_frag_dq),
@@ -835,6 +841,9 @@ def bwd_main_kernel[
         warpgroup_fence(dv_acc)
         wgmma_dkv.arrive()
         comptime if dtype == DType.float16:
+            comptime assert head_dim == 128, (
+                "fp16 hdim64 needs an m64n64 RS arm in _wgmma_f16"
+            )
             var dvb_desc = _wgmma_descriptor[
                 qt_canonical, False, swizzle
             ](ring_base + (slot + 1) * q_slot_size)
@@ -877,17 +886,26 @@ def bwd_main_kernel[
                 wgmma_sdp.arrive()
                 var a_desc = _wgmma_descriptor[
                     kt_canonical, False, swizzle
-                ](k_base_l) + wg * a_wg_stride
+                ](k_base_l)
+                comptime if D == 128:
+                    a_desc = a_desc + wg * a_wg_stride
                 var b_desc = _wgmma_descriptor[
                     sds_canonical, True, swizzle
                 ](sds_stage_base)
+                comptime if D == 64:
+                    # N-split: each wg's B window is 64 sdS q-ROWS.
+                    # The canonical (BM, BN) SW128 tile is COLUMN-
+                    # SLAB-major (64-col slabs of BM*64 elems; the
+                    # k-steps below jump slabs), so 64 rows = 8 cores
+                    # x 512 elems = 8 KiB within every slab.
+                    b_desc = b_desc + wg * (64 * 64 * size_of[dtype]())
                 var dq_tup = StaticTuple[
                     Scalar[accum_type], c_frag_dq
                 ]()
                 comptime for k_mma in range(BN // WGMMA_K):
                     dq_tup = wgmma_async[
                         WGMMA_M,
-                        BM,
+                        DQ_N,
                         WGMMA_K,
                         accum_type,
                         c_frag_dq,
@@ -920,6 +938,9 @@ def bwd_main_kernel[
         warpgroup_fence(dk_acc)
         wgmma_dkv.arrive()
         comptime if dtype == DType.float16:
+            comptime assert head_dim == 128, (
+                "fp16 hdim64 needs an m64n64 RS arm in _wgmma_f16 "
+            )
             var dkb_desc = _wgmma_descriptor[
                 qt_canonical, False, swizzle
             ](ring_base + slot * q_slot_size)
@@ -1045,7 +1066,14 @@ def bwd_main_kernel[
         # the per-kv-head accumulator; a torch permute-cast converts.
         comptime for c in range(c_frag_dkv):
             dk_acc.ptr[c] *= scale_acc
-        var acc32 = k_base.bitcast[Float32]()
+        # Staging area for the row-major f32 tile (BN x D x 4 B):
+        # D=128 uses the dead K+V smem (exactly 64 KiB); D=64's tile
+        # is 32 KiB but dead K+V is also only 32 KiB COMBINED with
+        # live mbarriers nearby — use the dead sdS stage 0 instead
+        # (32 KiB, dead after the pre-epilogue barrier).
+        var acc32 = (
+            k_base if D == 128 else sds_base
+        ).bitcast[Float32]()
         var kv_acc_base: Int = 0
         comptime if not varlen:
             kv_acc_base = (
@@ -1139,26 +1167,55 @@ def bwd_main_kernel[
     )
     var st_off_raw: Int = st_row * 64 + (st_lane // 16) * 8
 
-    var dv_raw: Int = Int(v_base) + 2 * st_off_raw
-    comptime for i in range(c_frag_dkv // 8):
-        var packed = SIMD[DType.float32, 4](0)
-        comptime for jm in range(4):
-            comptime p: Int = 4 * i + jm
-            packed[jm] = bitcast[DType.float32, 1](
-                SIMD[accum_type, 2](
-                    dv_acc.ptr[2 * p], dv_acc.ptr[2 * p + 1]
-                ).cast[dtype]()
+    comptime if D == 64:
+        # D=64: plain paired stores at canonical SW128 addresses
+        # (64-elem rows = one 128-B period; the stmatrix scheme
+        # below encodes D=128 geometry).
+        comptime for c2 in range(c_frag_dkv // 2):
+            comptime e_chunk: Int = c2 // 2
+            comptime e_bot: Int = c2 % 2
+            var e_row: Int = (
+                wg * WGMMA_M + warp_in_wg * 16 + lane_group
+                + (8 if e_bot == 1 else 0)
             )
-        # XOR per call: the 32-B column steps live in the swizzled
-        # bits, so the fold must apply to each logical address.
-        var raw_i: Int = dv_raw + (i % 4) * 32 + (i // 4) * (BN * 128)
-        var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
-        st_matrix[simd_width=4](
-            (v_base + ((sw_i >> 1) - (Int(v_base) >> 1))).bitcast[
-                BFloat16
-            ](),
-            packed,
-        )
+            var e_col: Int = e_chunk * 8 + 2 * lane_pair
+            var e_pair = SIMD[dtype, 2](
+                dv_acc.ptr[2 * c2].cast[dtype](),
+                dv_acc.ptr[2 * c2 + 1].cast[dtype](),
+            )
+            var e_addr: Int = (
+                Int(v_base)
+                + (e_row >> 3) * 1024
+                + (e_row & 7) * 128
+                + 2 * e_col
+            )
+            var e_sw: Int = e_addr ^ ((e_addr >> 3) & 112)
+            (
+                v_base + ((e_sw >> 1) - (Int(v_base) >> 1))
+            ).store[width=2, alignment=4](e_pair)
+    else:
+        var dv_raw: Int = Int(v_base) + 2 * st_off_raw
+        comptime for i in range(c_frag_dkv // 8):
+            var packed = SIMD[DType.float32, 4](0)
+            comptime for jm in range(4):
+                comptime p: Int = 4 * i + jm
+                packed[jm] = bitcast[DType.float32, 1](
+                    SIMD[accum_type, 2](
+                        dv_acc.ptr[2 * p], dv_acc.ptr[2 * p + 1]
+                    ).cast[dtype]()
+                )
+            # XOR per call: the 32-B column steps live in the
+            # swizzled bits, so the fold must apply per address.
+            var raw_i: Int = (
+                dv_raw + (i % 4) * 32 + (i // 4) * (BN * 128)
+            )
+            var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
+            st_matrix[simd_width=4](
+                (
+                    v_base + ((sw_i >> 1) - (Int(v_base) >> 1))
+                ).bitcast[BFloat16](),
+                packed,
+            )
     fence_async_view_proxy()
     named_barrier[Int32(NWG * 128)](Int32(4))
     if thread_idx.x == 128:
@@ -1175,24 +1232,50 @@ def bwd_main_kernel[
     # dK *= scale; staged under dV's in-flight TMA store.
     comptime for c in range(c_frag_dkv):
         dk_acc.ptr[c] *= scale_acc
-    var dk_raw: Int = Int(k_base) + 2 * st_off_raw
-    comptime for i in range(c_frag_dkv // 8):
-        var packed = SIMD[DType.float32, 4](0)
-        comptime for jm in range(4):
-            comptime p: Int = 4 * i + jm
-            packed[jm] = bitcast[DType.float32, 1](
-                SIMD[accum_type, 2](
-                    dk_acc.ptr[2 * p], dk_acc.ptr[2 * p + 1]
-                ).cast[dtype]()
+    comptime if D == 64:
+        comptime for c2 in range(c_frag_dkv // 2):
+            comptime f_chunk: Int = c2 // 2
+            comptime f_bot: Int = c2 % 2
+            var f_row: Int = (
+                wg * WGMMA_M + warp_in_wg * 16 + lane_group
+                + (8 if f_bot == 1 else 0)
             )
-        var raw_i: Int = dk_raw + (i % 4) * 32 + (i // 4) * (BN * 128)
-        var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
-        st_matrix[simd_width=4](
-            (k_base + ((sw_i >> 1) - (Int(k_base) >> 1))).bitcast[
-                BFloat16
-            ](),
-            packed,
-        )
+            var f_col: Int = f_chunk * 8 + 2 * lane_pair
+            var f_pair = SIMD[dtype, 2](
+                dk_acc.ptr[2 * c2].cast[dtype](),
+                dk_acc.ptr[2 * c2 + 1].cast[dtype](),
+            )
+            var f_addr: Int = (
+                Int(k_base)
+                + (f_row >> 3) * 1024
+                + (f_row & 7) * 128
+                + 2 * f_col
+            )
+            var f_sw: Int = f_addr ^ ((f_addr >> 3) & 112)
+            (
+                k_base + ((f_sw >> 1) - (Int(k_base) >> 1))
+            ).store[width=2, alignment=4](f_pair)
+    else:
+        var dk_raw: Int = Int(k_base) + 2 * st_off_raw
+        comptime for i in range(c_frag_dkv // 8):
+            var packed = SIMD[DType.float32, 4](0)
+            comptime for jm in range(4):
+                comptime p: Int = 4 * i + jm
+                packed[jm] = bitcast[DType.float32, 1](
+                    SIMD[accum_type, 2](
+                        dk_acc.ptr[2 * p], dk_acc.ptr[2 * p + 1]
+                    ).cast[dtype]()
+                )
+            var raw_i: Int = (
+                dk_raw + (i % 4) * 32 + (i // 4) * (BN * 128)
+            )
+            var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
+            st_matrix[simd_width=4](
+                (
+                    k_base + ((sw_i >> 1) - (Int(k_base) >> 1))
+                ).bitcast[BFloat16](),
+                packed,
+            )
     fence_async_view_proxy()
     named_barrier[Int32(NWG * 128)](Int32(4))
     if thread_idx.x == 128:
@@ -1510,8 +1593,11 @@ def bwd_convert_kernel[
     # docstring): per m-block, layout [wg(2)][chunk(BM/8)][tid(128)]
     # [4] f32. Thread (sub, ft) reads the cells (combo = i*2 + sub,
     # ft) — consecutive ft -> consecutive 16B: fully coalesced.
-    comptime NCH: Int = BM // 8  # chunks per wg
-    comptime WG_F32: Int = (D // 2) * BM
+    # Per-WG dQ^T q-columns: BM at D=128 (M split), BM/2 at D=64
+    # (N split) — mirrors the main kernel's DQ_N.
+    comptime DQ_COLS_WG: Int = BM if D == 128 else BM // 2
+    comptime NCH: Int = DQ_COLS_WG // 8  # chunks per wg
+    comptime WG_F32: Int = 64 * DQ_COLS_WG  # == (D//2)*BM at both dims
     comptime NCOMBO: Int = 2 * NCH  # wg x ch
     var sub: Int = tid // 128
     var ft: Int = tid % 128
@@ -1538,8 +1624,15 @@ def bwd_convert_kernel[
             + ft * 4
         ).load[width=4]()
         comptime for e in range(4):
-            var d: Int = wg * 64 + d_wl + 8 * (e // 2)
-            var q: Int = ch * 8 + q_lp + (e % 2)
+            var d: Int
+            var q: Int
+            comptime if D == 64:
+                # Single m64: d has no wg slab; the wg split is on q.
+                d = d_wl + 8 * (e // 2)
+                q = wg * 64 + ch * 8 + q_lp + (e % 2)
+            else:
+                d = wg * 64 + d_wl + 8 * (e // 2)
+                q = ch * 8 + q_lp + (e % 2)
             tile[q * (D + PAD) + d] = v[e]
     barrier()
 
@@ -1547,9 +1640,10 @@ def bwd_convert_kernel[
     # warp store covers 4 full 256B rows — full 32B sectors, fully
     # coalesced. Tail m-block: rows s >= seq_len are pad, skipped.
     comptime OV: Int = 16
-    comptime ROWS_PER_PASS: Int = NT // 8  # 32
-    var row_in_pass: Int = tid // 8
-    var d_base: Int = (tid % 8) * OV
+    comptime LPR: Int = D // OV  # lanes per row: 8 at D=128, 4 at 64
+    comptime ROWS_PER_PASS: Int = NT // LPR
+    var row_in_pass: Int = tid // LPR
+    var d_base: Int = (tid % LPR) * OV
     comptime for p in range((BM + ROWS_PER_PASS - 1) // ROWS_PER_PASS):
         var s_local: Int = p * ROWS_PER_PASS + row_in_pass
         var s: Int = m_block * BM + s_local

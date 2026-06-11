@@ -229,9 +229,11 @@ def launch_bwd_main[
     comptime mbar_bytes: Int = 256
     # + 2-stage lse_log2/dpsum staging ring (2 x 2 x BM f32).
     comptime lse_dps_bytes: Int = 2 * (kBwdQdOStages // 2) * bm * 4
-    # + per-MMA-wg dQ mailbox (64 x BM f32 each, bulk-reduce-drained).
+    # + per-MMA-wg dQ mailbox (64 x DQ_N f32 each, bulk-reduce-
+    # drained; DQ_N = bm at D=128, bm/2 at D=64 — the N split).
+    comptime dq_n: Int = bm if head_dim == 128 else bm // 2
     comptime dq_mail_bytes: Int = (
-        kBwdNMmaWarpgroups * 64 * bm * 4
+        kBwdNMmaWarpgroups * 64 * dq_n * 4
     )
     comptime smem_bytes: Int = (
         2 * kv_bytes
