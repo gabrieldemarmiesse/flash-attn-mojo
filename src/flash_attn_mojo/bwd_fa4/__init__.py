@@ -190,6 +190,7 @@ def _build_bwd_tables(
     causal: bool,
     seqused_q: torch.Tensor | None = None,
     seqused_k: torch.Tensor | None = None,
+    window_left: int = 0,
 ) -> tuple:
     """Host work tables for the varlen bwd (vectorized torch on a
     host copy; one D2H sync).
@@ -266,7 +267,7 @@ def _build_bwd_tables(
     kt[:, 2] = cu_k[:-1][k_sidx].to(torch.int32)
     kt[:, 3] = seqlens_q[k_sidx].to(torch.int32)
     kt[:, 4] = seqlens_k[k_sidx].to(torch.int32)
-    kt[:, 5] = m_counts[k_sidx].to(torch.int32)
+    num_m_col = m_counts[k_sidx].clone()
     if causal:
         # First q tile attending kv tile n (bottom-right diagonal):
         # q row i attends kv j <= i + offs, so kv tile n's first
@@ -276,7 +277,25 @@ def _build_bwd_tables(
         kt[:, 6] = (
             torch.clamp(n_local * _BLOCK - offs, min=0) // block_m
         ).to(torch.int32)
+        if window_left:
+            # Window upper bound, folded into the num_m column (the
+            # kernel's m_trips = num_m - m_start needs no new code):
+            # last attending i = n*BN + BN - 1 + left - offs.
+            m_end = torch.clamp(
+                -(-(n_local * _BLOCK + _BLOCK + window_left - offs)
+                  // block_m),
+                max=m_counts[k_sidx],
+            )
+            num_m_col = m_end
+    kt[:, 5] = num_m_col.to(torch.int32)
     kt[:, 7] = mpad_base[k_sidx].to(torch.int32)
+    if window_left:
+        # Drop kv tiles no q row can reach (deep caches with small
+        # windows): their dK/dV are zero (the caller zero-allocates)
+        # and an empty m-sweep CTA would store garbage c-frags.
+        keep = num_m_col > kt[:, 6].to(torch.int64)
+        kt = kt[keep].contiguous()
+        num_kv_tiles = int(keep.sum())
 
     dev = cu_seqlens_q.device
     return (
@@ -299,6 +318,7 @@ def bwd_fa4_varlen(
     seqused_q: torch.Tensor | None = None,
     seqused_k: torch.Tensor | None = None,
     softcap: float = 0.0,
+    window_left: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Packed varlen backward (dq, dk, dv).
 
@@ -336,22 +356,31 @@ def bwd_fa4_varlen(
         assert cu.dtype == torch.int32 and cu.is_cuda and cu.is_contiguous()
 
     block_m = 128 if head_dim == 64 else (64 if causal else _BLOCK_M)
+    if window_left:
+        assert causal and window_left >= 1, (
+            "varlen window: causal + left >= 1"
+        )
     (
         q_table, num_q_tiles, kv_table, num_kv_tiles,
         num_mpad, total_q_, total_k_,
     ) = _build_bwd_tables(
         cu_seqlens_q, cu_seqlens_k, block_m, causal,
-        seqused_q, seqused_k,
+        seqused_q, seqused_k, window_left,
     )
     assert total_q_ == total_q and total_k_ == total_k
     total_qpad = num_mpad * block_m
 
-    # With seqused, rows past each sequence's used prefix are never
+    # With seqused (rows past the used prefix) or a window (kv tiles
+    # no q row reaches — dropped from the grid), some rows are never
     # touched by the kernels — zero-allocate so their gradients are
-    # a defined 0 (they genuinely receive no gradient).
+    # a defined 0.
     alloc = (
         torch.zeros_like
-        if (seqused_q is not None or seqused_k is not None)
+        if (
+            seqused_q is not None
+            or seqused_k is not None
+            or window_left
+        )
         else torch.empty_like
     )
     dq = alloc(q)
@@ -385,6 +414,7 @@ def bwd_fa4_varlen(
 
     config = make_config(
         _DTYPE_CODE[q.dtype], head_dim, True, causal, gqa_ratio, True,
+        window=bool(window_left),
         softcap_x1000=round(float(softcap) * 1000),
     )
     stream = torch.cuda.current_stream().cuda_stream
@@ -432,7 +462,7 @@ def bwd_fa4_varlen(
             total_q,
             total_k,
             num_mpad,
-            0,  # window_left (varlen window not in v1)
+            window_left,
         ),
         config,
     )

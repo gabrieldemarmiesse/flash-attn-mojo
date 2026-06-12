@@ -94,11 +94,13 @@ def flash_attn_ref(
             B, H, Lq, Lk = scores.shape
             i = torch.arange(Lq, device=scores.device).view(-1, 1)
             j = torch.arange(Lk, device=scores.device).view(1, -1)
-            # Keep j in [i - left, i + right]. Use very negative bias
-            # instead of -inf so softmax gradients don't explode.
+            # Keep j in [i + offs - left, i + offs + right] with the
+            # flash-attn BOTTOM-RIGHT alignment offs = Lk - Lq (the
+            # window slides along the same diagonal causal uses).
+            offs = Lk - Lq
             in_window = (
-                ((j >= i - left) | (left < 0))
-                & ((j <= i + right) | (right < 0))
+                ((j >= i + offs - left) | (left < 0))
+                & ((j <= i + offs + right) | (right < 0))
             )
             mask = ~in_window
             scores = scores.masked_fill(mask, float("-inf"))
@@ -152,9 +154,10 @@ def flash_attn_ref(
         Lq, Lk = scores.shape[-2:]
         i = torch.arange(Lq, device=scores.device).view(-1, 1)
         j = torch.arange(Lk, device=scores.device).view(1, -1)
+        offs = Lk - Lq  # bottom-right alignment (see above)
         in_window = (
-            ((j >= i - left) | (left < 0))
-            & ((j <= i + right) | (right < 0))
+            ((j >= i + offs - left) | (left < 0))
+            & ((j <= i + offs + right) | (right < 0))
         )
         scores = scores.masked_fill(~in_window, float("-inf"))
     if causal:

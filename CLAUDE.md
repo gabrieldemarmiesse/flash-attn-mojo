@@ -165,6 +165,23 @@ run-to-run variance (locked clocks, interleaved):
   constant flags). The bwd needed NOTHING (its mask_w < BM guard
   and m_end ceil-div were already exact). left == 0 is rejected
   (the no-window sentinel; self-only attention unsupported).
+  VARLEN WINDOW (2026-06-12): fwd win_left rides the q-tile
+  table's free col 5 (sched_swizzle carries the table); the band
+  causal_mask_d gains +first_kv*BN (loop trip it processes tile
+  first_kv+it+1 — THE bug the uniform-K probe caught was missing
+  this) and win_mask_d gains -offs; varlen windows always compile
+  as WINDOW_UNALIGNED (per-seq offs breaks alignment). bwd: m_end
+  folds into the kv-table's num_m column HOST-side (zero kernel
+  trip changes); the S^T window mask forks to win_left -
+  vl_mask_base - m_it*BM (pack-GQA composes via the within-head m);
+  win_left packs onto num_mpad's high seq_len bits; kv tiles no q
+  row reaches are DROPPED from the table (their dk/dv stay at the
+  zeros_like alloc — an empty m-sweep CTA would store garbage
+  c-frags). The full Gemma-2 packed combo (varlen + causal + SWA +
+  softcap + GQA) is tested end-to-end. SECOND reference
+  mask-alignment bug found by the same probe: flash_attn_ref's
+  window was top-left-relative (j >= i - left) — flash-attn windows
+  slide along the BOTTOM-RIGHT diagonal (j >= i + offs - left).
 
 - VARLEN CROSS-ATTENTION (2026-06-11, cu_q != cu_k, fully
   differentiable, MHA + GQA, arbitrary lengths): FA4's bottom-right

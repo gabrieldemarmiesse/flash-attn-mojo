@@ -194,6 +194,7 @@ def fwd_fa4_kernel[
     var vl_k_base: Int = 0
     var vl_seqlen_q: Int = 0
     var vl_seqlen_k: Int = 0
+    var vl_win_left: Int = 0
     comptime if varlen:
         # Host work-item table, one int32[8] row per CTA: (m_block,
         # q_row_base, k_row_base, seqlen_q, seqlen_k, _, _, _). Its
@@ -214,6 +215,8 @@ def fwd_fa4_kernel[
         vl_k_base = Int(warp.broadcast(tbl[2]))
         vl_seqlen_q = Int(warp.broadcast(tbl[3]))
         vl_seqlen_k = Int(warp.broadcast(tbl[4]))
+        comptime if window:
+            vl_win_left = Int(warp.broadcast(tbl[5]))
         h_idx = Int(block_idx.y)
         b_idx = 0
     else:
@@ -290,8 +293,17 @@ def fwd_fa4_kernel[
     var kv_trips: Int = num_kv_blocks
     comptime if window:
         comptime assert causal, "window v1 requires causal"
-        win_left = sched_swizzle  # rides the (free) LPT slot
-        first_kv = max(0, (m_block * BM - win_left) // BN)
+        comptime if varlen:
+            # sched_swizzle carries the work table under varlen;
+            # win_left rides the table's free col 5 instead. The
+            # bottom-right offset shifts the leading edge: attended
+            # j ∈ [i + offs - left, i + offs].
+            win_left = vl_win_left
+        else:
+            win_left = sched_swizzle  # rides the (free) LPT slot
+        first_kv = max(
+            0, (m_block * BM + vl_offs - win_left) // BN
+        )
         kv_trips = num_kv_blocks - first_kv
 
     # Varlen ragged kv tail: garbage columns live only in the
@@ -352,7 +364,10 @@ def fwd_fa4_kernel[
             var row: Int
             var row_step: Int = BN
             comptime if window:
-                row = b_idx * seq_len + first_kv * BN
+                comptime if varlen:
+                    row = vl_k_base + first_kv * BN
+                else:
+                    row = b_idx * seq_len + first_kv * BN
             elif varlen:
                 comptime if causal:
                     row = vl_k_base
@@ -578,6 +593,9 @@ def fwd_fa4_kernel[
     var win_mask_d: Int = 0
     comptime if window:
         win_mask_d = first_kv * BN - m_block * BM + win_left
+        comptime if varlen:
+            # Bottom-right alignment: masked iff j < i + offs - left.
+            win_mask_d -= vl_offs
 
     @parameter
     @always_inline
@@ -707,6 +725,9 @@ def fwd_fa4_kernel[
             causal_mask_d = -m_block * BM
             comptime if varlen:
                 causal_mask_d -= vl_offs
+            comptime if window:
+                # The prologue tile is first_kv, not 0.
+                causal_mask_d += first_kv * BN
     softmax_block(prologue_diag, True)
     pack_p()  # P(0)
     # The window leading edge can straddle into the FIRST loop tile
@@ -771,6 +792,9 @@ def fwd_fa4_kernel[
                 causal_mask_d = (it + 1) * BN - m_block * BM
                 comptime if varlen:
                     causal_mask_d -= vl_offs
+                comptime if window:
+                    # Loop trip it processes tile first_kv + it + 1.
+                    causal_mask_d += first_kv * BN
         # Window, unaligned left only: the first loop tile can hold
         # leading-edge columns (win_mask_d was advanced after the
         # prologue). Aligned variants pass a comptime False so the

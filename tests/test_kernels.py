@@ -296,6 +296,96 @@ def test_bwd_window(case, heads):
         assert d < BWD_TOL_MASKED, f"{name} maxdiff {d:.3e}"
 
 
+WINDOW_VARLEN_CASES = [
+    # (lens_q, lens_k, window_left)
+    ([512], [512], 100),
+    ([300, 640], [300, 640], 256),
+    ([128, 200], [384, 200], 130),   # cross + unaligned left
+    ([128], [1024], 130),            # deep cache: empty kv tiles
+]
+WINDOW_VARLEN_IDS = ["vW100", "vW256", "vXW130", "vDeepW130"]
+
+
+@requires_cuda
+@pytest.mark.parametrize("heads", ["mha", "gqa"])
+@pytest.mark.parametrize("case", WINDOW_VARLEN_CASES, ids=WINDOW_VARLEN_IDS)
+def test_bwd_window_varlen(case, heads):
+    """Sliding window over packed varlen sequences (fwd + bwd)."""
+    _skip_if_impl_unavailable()
+    if IMPL == "fa4":
+        pytest.skip("kwarg plumbing differs; mojo-only composition")
+    from flash_attn_mojo.fwd_fa4 import fa4_varlen_fwd
+    from flash_attn_mojo.bwd_fa4 import bwd_fa4_varlen
+
+    torch.manual_seed(4)
+    lens_q, lens_k, wl = case
+    hkv = 4 if heads == "mha" else 2
+    q, k, v, cu_q, cu_k = _make_xattn(lens_q, lens_k, hkv=hkv)
+    dout = torch.randn_like(q)
+    out, lse = fa4_varlen_fwd(
+        q, k, v, cu_q, cu_k, causal=True, window_left=wl
+    )
+    dq, dk, dv = bwd_fa4_varlen(
+        q, k, v, out, dout, lse, cu_q, cu_k, causal=True,
+        window_left=wl,
+    )
+    qf = q.detach().float().requires_grad_()
+    kf = k.detach().float().requires_grad_()
+    vf = v.detach().float().requires_grad_()
+    ref, ref_lse = flash_attn_varlen_ref(
+        qf, kf, vf, cu_q, cu_k, causal=True, window_size=(wl, 0),
+        return_lse=True,
+    )
+    ref.backward(dout.float())
+    assert (out.float() - ref).abs().max().item() < FWD_TOL_MASKED
+    assert (lse - ref_lse).abs().max().item() < LSE_TOL
+    for name, got, want in (
+        ("dq", dq, qf.grad), ("dk", dk, kf.grad), ("dv", dv, vf.grad)
+    ):
+        d = (got.float() - want).abs().max().item()
+        assert d < BWD_TOL_MASKED, f"{name} maxdiff {d:.3e}"
+
+
+@requires_cuda
+def test_gemma2_packed_combo():
+    """The full Gemma-2 packed-training config in one call: varlen
+    + causal + sliding window + softcap + GQA, differentiable."""
+    _skip_if_impl_unavailable()
+    if IMPL == "fa4":
+        pytest.skip("kwarg plumbing differs; mojo-only composition")
+    from flash_attn_mojo import flash_attn_varlen_func
+
+    torch.manual_seed(6)
+    q, k, v, cu_q, cu_k = _make_xattn(
+        [300, 640], [300, 640], hq=4, hkv=2
+    )
+    q.requires_grad_()
+    k.requires_grad_()
+    v.requires_grad_()
+    dout = torch.randn_like(q)
+    out = flash_attn_varlen_func(
+        q, k, v, cu_q, cu_k, causal=True, softcap=SOFTCAP_CAP,
+        window_size=(256, 0),
+    )
+    out.backward(dout)
+    qf = q.detach().float().requires_grad_()
+    kf = k.detach().float().requires_grad_()
+    vf = v.detach().float().requires_grad_()
+    ref = flash_attn_varlen_ref(
+        qf, kf, vf, cu_q, cu_k, causal=True, softcap=SOFTCAP_CAP,
+        window_size=(256, 0),
+    )
+    ref.backward(dout.float())
+    assert (out.float() - ref).abs().max().item() < FWD_TOL_MASKED
+    for name, got, want in (
+        ("dq", q.grad, qf.grad),
+        ("dk", k.grad, kf.grad),
+        ("dv", v.grad, vf.grad),
+    ):
+        d = (got.float() - want).abs().max().item()
+        assert d < BWD_TOL_MASKED, f"{name} maxdiff {d:.3e}"
+
+
 # -------------------------------------------------------- softcap
 # Gemma-2 attention-logit softcap. `swa` is the full Gemma-2 layer
 # config: causal + sliding window + softcap. cap=30 here vs 50 in

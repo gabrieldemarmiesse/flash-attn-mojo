@@ -145,6 +145,7 @@ def _build_fwd_tile_table(
     causal: bool = False,
     seqused_q: torch.Tensor | None = None,
     seqused_k: torch.Tensor | None = None,
+    window_left: int = 0,
 ) -> tuple[torch.Tensor, int, int]:
     """Host work-item table: one int32[8] row per CTA m-tile —
     (m_block, q_row_base, k_row_base, seqlen_q, seqlen_k, 0, 0, 0).
@@ -180,6 +181,10 @@ def _build_fwd_tile_table(
     table[:, 2] = cu_k[:-1][sidx].to(torch.int32)
     table[:, 3] = seqlens_q[sidx].to(torch.int32)
     table[:, 4] = seqlens_k[sidx].to(torch.int32)
+    if window_left:
+        # sched_swizzle carries this table's address under varlen,
+        # so win_left rides the free col 5 instead of the LPT slot.
+        table[:, 5] = window_left
     return (
         table.to(cu_seqlens_q.device),
         num_tiles,
@@ -198,6 +203,7 @@ def fa4_varlen_fwd(
     seqused_q: torch.Tensor | None = None,
     seqused_k: torch.Tensor | None = None,
     softcap: float = 0.0,
+    window_left: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Packed varlen forward. Mirrors
     ``flash_attn.cute.flash_attn_varlen_func``'s simplest call.
@@ -227,9 +233,14 @@ def fa4_varlen_fwd(
     for cu in (cu_seqlens_q, cu_seqlens_k):
         assert cu.dtype == torch.int32 and cu.is_cuda and cu.is_contiguous()
     assert cu_seqlens_q.shape == cu_seqlens_k.shape
+    if window_left:
+        assert causal and window_left >= 1, (
+            "varlen window: causal + left >= 1"
+        )
 
     table, num_tiles, max_seqlen_q = _build_fwd_tile_table(
-        cu_seqlens_q, cu_seqlens_k, causal, seqused_q, seqused_k
+        cu_seqlens_q, cu_seqlens_k, causal, seqused_q, seqused_k,
+        window_left,
     )
 
     # With seqused the rows past each sequence's used prefix are
@@ -270,8 +281,8 @@ def fa4_varlen_fwd(
             total_k,
             table.data_ptr(),
             num_tiles,
-            0,  # window (comptime)
-            0,  # window_left
+            1 if window_left else 0,  # window (comptime)
+            window_left,  # (keys window_unaligned; rides table col 5)
             round(float(softcap) * 1000),  # softcap_x1000 (comptime)
         )
     )

@@ -869,16 +869,22 @@ def bwd_main_kernel[
 
         comptime if window:
             # Trailing window-edge trips: q cols past kv row +
-            # win_left fall outside the window. left % 128 == 0
-            # keeps the boundary m-tile-aligned, so exactly BN//BM
-            # trailing trips mask (fewer when the sequence end
-            # clamps m_end first); with left >= BN they never
-            # overlap the diagonal trips above. Masked entries
-            # exp2 to 0 in P^T, zeroing their dV/dK/dS/dQ
-            # contributions.
-            var mask_w: Int = (
-                n_block * BN + win_left - (m_start + it) * BM
-            )
+            # win_left fall outside the window (the guard skips
+            # trips with no masked pairs; unaligned lefts simply
+            # mask one more trailing trip). Masked entries exp2 to
+            # 0 in P^T, zeroing their dV/dK/dS/dQ contributions.
+            var mask_w: Int
+            comptime if varlen:
+                # Bottom-right offset folds in via vl_mask_base;
+                # within-head m position under pack-GQA.
+                var mw_it: Int = it
+                comptime if pack:
+                    mw_it = pk_mc
+                mask_w = win_left - vl_mask_base - mw_it * BM
+            else:
+                mask_w = (
+                    n_block * BN + win_left - (m_start + it) * BM
+                )
             if mask_w < BM:
                 var wrow_lo: Int = (
                     wg * WGMMA_M + warp_in_wg * 16 + lane_group

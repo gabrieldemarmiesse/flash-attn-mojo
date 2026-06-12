@@ -319,8 +319,10 @@ def launch_fwd_fa4[
         seq_len_arg = varlen_total_q
         sched_swizzle_arg = varlen_table_addr
         sched_num_hb_q_arg = o_addr
-    comptime if window:
+    comptime if window and not varlen:
         sched_swizzle_arg = window_left  # the LPT slot is free
+        # (varlen keeps the table in this slot; win_left rides the
+        # table's col 5 instead.)
 
     comptime if use_external_stream:
         var stream = ctx.create_external_stream(stream_opaque)

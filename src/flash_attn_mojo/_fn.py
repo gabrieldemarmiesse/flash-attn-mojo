@@ -167,10 +167,8 @@ def flash_attn_func(
                 "window; left == 0 self-only attention is not "
                 "supported)"
             )
-        if q.shape[-1] != 128 or q.shape[1] % 128:
-            raise ValueError(
-                "window envelope: head_dim=128, seqlen % 128 == 0"
-            )
+        if q.shape[-1] != 128:
+            raise ValueError("window envelope: head_dim=128")
         window_left = int(left)
 
     softcap = float(softcap)
@@ -208,6 +206,7 @@ def flash_attn_func(
             k.reshape(batch * seqlen, nheads_kv, head_dim),
             v.reshape(batch * seqlen, nheads_kv, head_dim),
             cu, cu, softmax_scale, causal, None, None, softcap,
+            window_left,
         )
         out = out_p.view(batch, seqlen, nheads, head_dim)
         if return_lse:
@@ -282,6 +281,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
     def forward(
         ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale,
         causal, seqused_q=None, seqused_k=None, softcap=0.0,
+        window_left=0,
     ):
         from flash_attn_mojo.fwd_fa4 import fa4_varlen_fwd
 
@@ -289,7 +289,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         out, lse = fa4_varlen_fwd(
             q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale,
             causal=causal, seqused_q=seqused_q, seqused_k=seqused_k,
-            softcap=softcap,
+            softcap=softcap, window_left=window_left,
         )
         ctx.save_for_backward(
             q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k
@@ -298,6 +298,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.causal = causal
         ctx.seqused = (seqused_q, seqused_k)
         ctx.softcap = softcap
+        ctx.window_left = window_left
         ctx.mark_non_differentiable(lse)
         return out, lse
 
@@ -311,10 +312,11 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             q, k, v, out, dout.contiguous(), lse, cu_q, cu_k,
             ctx.softmax_scale, causal=ctx.causal,
             seqused_q=seqused_q, seqused_k=seqused_k,
-            softcap=ctx.softcap,
+            softcap=ctx.softcap, window_left=ctx.window_left,
         )
         return (
-            dq, dk, dv, None, None, None, None, None, None, None
+            dq, dk, dv, None, None, None, None, None, None, None,
+            None,
         )
 
 
@@ -331,6 +333,7 @@ def flash_attn_varlen_func(
     seqused_q: torch.Tensor | None = None,
     seqused_k: torch.Tensor | None = None,
     softcap: float = 0.0,
+    window_size: tuple[int, int] = (-1, -1),
     *,
     return_lse: bool = False,
 ):
@@ -408,6 +411,20 @@ def flash_attn_varlen_func(
             "seqlen_q > seqlen_k would leave query rows attending "
             "nothing)"
         )
+    window_left = 0
+    if window_size != (-1, -1):
+        wl, wr = window_size
+        if not causal or wr not in (0, -1):
+            raise ValueError(
+                "window_size requires causal=True with right "
+                "window 0 (Mistral-style SWA)"
+            )
+        if wl is None or wl < 1:
+            raise ValueError(
+                "window_size left must be >= 1 (use (-1, -1) for "
+                "no window)"
+            )
+        window_left = int(wl)
     if int(cu_q_host[-1]) != q.shape[0]:
         raise ValueError(
             f"cu_seqlens_q[-1] ({int(cu_q_host[-1])}) must equal "
@@ -453,12 +470,16 @@ def flash_attn_varlen_func(
         return flash_attn_varlen_ref(
             q, k, v, cu_seqlens_q, cu_seqlens_k,
             softmax_scale=softmax_scale, causal=causal,
-            softcap=softcap, return_lse=return_lse,
+            softcap=softcap,
+            window_size=(
+                (window_left, 0) if window_left else (-1, -1)
+            ),
+            return_lse=return_lse,
         )
 
     out, lse = _FlashAttnVarlenFunc.apply(
         q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale, causal,
-        seqused_q, seqused_k, softcap,
+        seqused_q, seqused_k, softcap, window_left,
     )
     if return_lse:
         return out, lse

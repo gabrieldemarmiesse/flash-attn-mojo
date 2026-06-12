@@ -295,8 +295,9 @@ def launch_bwd_main[
     comptime if window:
         # win_left rides the high 32 bits of the seq_len kernel arg
         # (signature stays byte-identical to dense; see the kernel's
-        # decode comment).
-        seq_len_arg = seqlen_int | (window_left << 32)
+        # decode comment). Packs ON TOP of the varlen substitution
+        # (num_mpad) when both apply.
+        seq_len_arg = seq_len_arg | (window_left << 32)
     var nheads_kv: Int = nheads_int // gqa_ratio
     # Under GQA the dk/dv addresses carry the fp32 per-kv-head
     # accumulators (the epilogue bulk-reduce-adds into them; a torch

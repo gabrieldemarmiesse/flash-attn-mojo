@@ -62,7 +62,11 @@ def _config_from_args(args: tuple) -> tuple:
     # Unaligned window lefts compile the in-loop leading-edge mask
     # arm; aligned lefts keep the original mask-free steady loop
     # (the arm's mere presence cost 2-4% at the canonical config).
-    window_unaligned = window and (int(args[24]) % 128 != 0)
+    # Varlen windows are always "unaligned": the per-sequence
+    # bottom-right offset breaks tile alignment regardless of left.
+    window_unaligned = window and (
+        varlen or int(args[24]) % 128 != 0
+    )
     softcap_x1000 = int(args[25])
     dump_ptx = os.environ.get("MOJO_DUMP_PTX", "")
     return (
