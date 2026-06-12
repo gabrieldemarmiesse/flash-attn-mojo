@@ -393,6 +393,47 @@ def test_bwd_softcap(mode, heads):
         assert d < BWD_TOL_MASKED, f"{name} maxdiff {d:.3e}"
 
 
+@requires_cuda
+@pytest.mark.parametrize("heads", ["mha", "gqa"])
+@pytest.mark.parametrize("mask", ["plain", "causal"])
+def test_bwd_softcap_varlen(mask, heads):
+    """softcap composed with the varlen kernels (fwd + bwd)."""
+    _skip_if_impl_unavailable()
+    if IMPL == "fa4":
+        pytest.skip("kwarg plumbing differs; mojo-only composition")
+    from flash_attn_mojo.fwd_fa4 import fa4_varlen_fwd
+    from flash_attn_mojo.bwd_fa4 import bwd_fa4_varlen
+
+    torch.manual_seed(2)
+    causal = mask == "causal"
+    q, k, v, cu = _make_varlen(
+        [128, 100, 640], hkv=4 if heads == "mha" else 2
+    )
+    dout = torch.randn_like(q)
+    out, lse = fa4_varlen_fwd(
+        q, k, v, cu, cu, causal=causal, softcap=SOFTCAP_CAP
+    )
+    dq, dk, dv = bwd_fa4_varlen(
+        q, k, v, out, dout, lse, cu, cu, causal=causal,
+        softcap=SOFTCAP_CAP,
+    )
+    qf = q.detach().float().requires_grad_()
+    kf = k.detach().float().requires_grad_()
+    vf = v.detach().float().requires_grad_()
+    ref, ref_lse = flash_attn_varlen_ref(
+        qf, kf, vf, cu, cu, causal=causal, softcap=SOFTCAP_CAP,
+        return_lse=True,
+    )
+    ref.backward(dout.float())
+    assert (out.float() - ref).abs().max().item() < FWD_TOL_MASKED
+    assert (lse - ref_lse).abs().max().item() < SOFTCAP_LSE_TOL
+    for name, got, want in (
+        ("dq", dq, qf.grad), ("dk", dk, kf.grad), ("dv", dv, vf.grad)
+    ):
+        d = (got.float() - want).abs().max().item()
+        assert d < BWD_TOL_MASKED, f"{name} maxdiff {d:.3e}"
+
+
 # --------------------------------------------------------- varlen
 @requires_cuda
 @pytest.mark.parametrize("lens", VARLEN_SETS, ids=VARLEN_IDS)

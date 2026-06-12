@@ -74,7 +74,9 @@ def test_softcap_envelope_errors():
     q, k, v = _qkv()
     with pytest.raises(ValueError, match="softcap must be >= 0"):
         flash_attn_func(q, k, v, softcap=-1.0)
-    q, k, v = _qkv(seqlen=100)
+    # non-%128 seqlens route through varlen, which supports softcap;
+    # head_dim=64 does not (yet).
+    q, k, v = _qkv(head_dim=64)
     with pytest.raises(ValueError, match="softcap v1"):
         flash_attn_func(q, k, v, softcap=50.0)
 

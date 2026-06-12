@@ -145,9 +145,9 @@ def flash_attn_func(
             envelope: left % 128 == 0, head_dim=128, seqlen % 128 == 0.
         softcap: Gemma-2 attention-logit softcap, S := softcap *
             tanh(S / softcap) (fully differentiable; composes with
-            causal/window/GQA). v1 envelope: head_dim=128,
-            seqlen % 128 == 0. The cap compiles into the kernel
-            (one JIT variant per value).
+            causal/window/GQA and any seqlen — non-%128 routes
+            through varlen). v1 envelope: head_dim=128. The cap
+            compiles into the kernel (one JIT variant per value).
         return_lse: also return the (batch, nheads, seqlen) fp32
             natural-log row logsumexp.
 
@@ -179,10 +179,8 @@ def flash_attn_func(
     if softcap:
         if softcap < 0:
             raise ValueError("softcap must be >= 0")
-        if q.shape[-1] != 128 or q.shape[1] % 128:
-            raise ValueError(
-                "softcap v1 envelope: head_dim=128, seqlen % 128 == 0"
-            )
+        if q.shape[-1] != 128:
+            raise ValueError("softcap v1 envelope: head_dim=128")
 
     if not q.is_cuda:
         # flash_attn_ref handles GQA (repeat-interleave) and the
@@ -211,7 +209,7 @@ def flash_attn_func(
             q.reshape(batch * seqlen, nheads, head_dim),
             k.reshape(batch * seqlen, nheads_kv, head_dim),
             v.reshape(batch * seqlen, nheads_kv, head_dim),
-            cu, cu, softmax_scale, causal,
+            cu, cu, softmax_scale, causal, None, None, softcap,
         )
         out = out_p.view(batch, seqlen, nheads, head_dim)
         if return_lse:
@@ -285,7 +283,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale,
-        causal, seqused_q=None, seqused_k=None,
+        causal, seqused_q=None, seqused_k=None, softcap=0.0,
     ):
         from flash_attn_mojo.fwd_fa4 import fa4_varlen_fwd
 
@@ -293,6 +291,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         out, lse = fa4_varlen_fwd(
             q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale,
             causal=causal, seqused_q=seqused_q, seqused_k=seqused_k,
+            softcap=softcap,
         )
         ctx.save_for_backward(
             q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k
@@ -300,6 +299,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.seqused = (seqused_q, seqused_k)
+        ctx.softcap = softcap
         ctx.mark_non_differentiable(lse)
         return out, lse
 
@@ -313,8 +313,11 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             q, k, v, out, dout.contiguous(), lse, cu_q, cu_k,
             ctx.softmax_scale, causal=ctx.causal,
             seqused_q=seqused_q, seqused_k=seqused_k,
+            softcap=ctx.softcap,
         )
-        return dq, dk, dv, None, None, None, None, None, None
+        return (
+            dq, dk, dv, None, None, None, None, None, None, None
+        )
 
 
 def flash_attn_varlen_func(
@@ -329,6 +332,7 @@ def flash_attn_varlen_func(
     causal: bool = False,
     seqused_q: torch.Tensor | None = None,
     seqused_k: torch.Tensor | None = None,
+    softcap: float = 0.0,
     *,
     return_lse: bool = False,
 ):
@@ -354,6 +358,8 @@ def flash_attn_varlen_func(
             only the first seqused tokens of each sequence (KV-cache
             style over-allocated buffers; cu_seqlens still define
             the memory layout). Unused rows get out/lse/grads of 0.
+        softcap: Gemma-2 attention-logit softcap (fully
+            differentiable; the cap compiles into the kernel).
         return_lse: also return the packed (nheads, total_q) fp32
             natural-log row logsumexp.
 
@@ -432,6 +438,10 @@ def flash_attn_varlen_func(
             f"longest sequence ({max_len_k})"
         )
 
+    softcap = float(softcap)
+    if softcap < 0:
+        raise ValueError("softcap must be >= 0")
+
     if not q.is_cuda:
         if seqused_q is not None or seqused_k is not None:
             raise NotImplementedError(
@@ -445,12 +455,12 @@ def flash_attn_varlen_func(
         return flash_attn_varlen_ref(
             q, k, v, cu_seqlens_q, cu_seqlens_k,
             softmax_scale=softmax_scale, causal=causal,
-            return_lse=return_lse,
+            softcap=softcap, return_lse=return_lse,
         )
 
     out, lse = _FlashAttnVarlenFunc.apply(
         q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale, causal,
-        seqused_q, seqused_k,
+        seqused_q, seqused_k, softcap,
     )
     if return_lse:
         return out, lse

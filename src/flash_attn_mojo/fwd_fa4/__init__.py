@@ -200,6 +200,7 @@ def fa4_varlen_fwd(
     causal: bool = False,
     seqused_q: torch.Tensor | None = None,
     seqused_k: torch.Tensor | None = None,
+    softcap: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Packed varlen forward. Mirrors
     ``flash_attn.cute.flash_attn_varlen_func``'s simplest call.
@@ -274,7 +275,7 @@ def fa4_varlen_fwd(
             num_tiles,
             0,  # window (comptime)
             0,  # window_left
-            0,  # softcap_x1000 (comptime; varlen softcap not in v1)
+            round(float(softcap) * 1000),  # softcap_x1000 (comptime)
         )
     )
     return out, lse

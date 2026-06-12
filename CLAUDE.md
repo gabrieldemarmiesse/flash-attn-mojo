@@ -207,9 +207,11 @@ run-to-run variance (locked clocks, interleaved):
   — the clamp keeps masked entries' dS exactly 0 (their (-1e30)^2
   overflows to +inf; unclamped that's a -inf factor and NaN dS).
   dK/dQ keep their existing softmax_scale epilogue multiplies
-  (chain rule: d(qk) = dS_capped*(1-t^2)*scale). v1 envelope:
-  dense, hdim128. LSE tol vs exact-tanh references is 1e-4 (HW
-  tanh is ~2^-11 relative).
+  (chain rule: d(qk) = dS_capped*(1-t^2)*scale). Envelope: hdim128,
+  dense AND varlen (2026-06-12: composed for free — the comptime
+  transform is mask-orthogonal; flash_attn_varlen_func(softcap=)
+  and non-%128 dense seqlens route with softcap intact). LSE tol
+  vs exact-tanh references is 1e-4 (HW tanh is ~2^-11 relative).
 
 `HANDOFF.md` is the full race log: architecture, the perf journey,
 the codegen lessons (uniform-register file capacity, the

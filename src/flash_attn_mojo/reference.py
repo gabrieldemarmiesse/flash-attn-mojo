@@ -174,6 +174,8 @@ def flash_attn_varlen_ref(
     cu_seqlens_k: torch.Tensor,
     softmax_scale: float | None = None,
     causal: bool = False,
+    softcap: float = 0.0,
+    window_size: tuple[int, int] = (-1, -1),
     return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Packed-varlen reference: per-sequence `flash_attn_ref` over
@@ -191,6 +193,8 @@ def flash_attn_varlen_ref(
             v[cu_k[i] : cu_k[i + 1]].unsqueeze(0),
             softmax_scale=softmax_scale,
             causal=causal,
+            softcap=softcap,
+            window_size=window_size,
             return_lse=return_lse,
         )
         if return_lse:

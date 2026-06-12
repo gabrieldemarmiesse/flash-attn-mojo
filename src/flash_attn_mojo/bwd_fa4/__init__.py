@@ -301,6 +301,7 @@ def bwd_fa4_varlen(
     causal: bool = False,
     seqused_q: torch.Tensor | None = None,
     seqused_k: torch.Tensor | None = None,
+    softcap: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Packed varlen backward (dq, dk, dv).
 
@@ -386,7 +387,8 @@ def bwd_fa4_varlen(
     )
 
     config = make_config(
-        _DTYPE_CODE[q.dtype], head_dim, True, causal, gqa_ratio, True
+        _DTYPE_CODE[q.dtype], head_dim, True, causal, gqa_ratio, True,
+        softcap_x1000=round(float(softcap) * 1000),
     )
     stream = torch.cuda.current_stream().cuda_stream
     nseq = cu_seqlens_q.numel() - 1
