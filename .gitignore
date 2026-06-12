@@ -18,3 +18,16 @@ causal-conv1d/
 modular/
 ptx/
 uv.lock
+
+# Metal race (branch metal-fwd): reference clones + local artifacts.
+# reference_air/ itself IS tracked (committed .metal/.air + bench
+# wrapper sources), but not build products. Clone ignores are
+# root-anchored — an unanchored `ccv/` also matches reference_air/ccv/.
+/metal-flash-attention/
+/ccv/
+/air/
+reference_air/**/.build/
+reference_air/**/*.o
+reference_air/ccv/bench_ccv/bench_ccv_attn
+*.trace/
+*.gputrace/
