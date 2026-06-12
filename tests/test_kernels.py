@@ -217,10 +217,12 @@ def test_bwd_dense(seqlen, mask, heads, dtype, hdim):
 WINDOW_CASES = [
     (256, 128), (640, 256), (1024, 512), (1024, 128),
     (1024, 1024),  # W >= S degenerates to plain causal
+    (640, 100), (1024, 333), (256, 1),  # non-%128 lefts
 ]
 WINDOW_IDS = [
     "S256-W128", "S640-W256", "S1024-W512", "S1024-W128",
     "S1024-W1024",
+    "S640-W100", "S1024-W333", "S256-W1",
 ]
 
 

@@ -21,6 +21,9 @@ comptime CAUSAL: Bool = get_defined_bool["CAUSAL", False]()
 comptime GQA_RATIO: Int = get_defined_int["GQA_RATIO", 1]()
 comptime VARLEN: Bool = get_defined_bool["VARLEN", False]()
 comptime WINDOW: Bool = get_defined_bool["WINDOW", False]()
+comptime WINDOW_UNALIGNED: Bool = get_defined_bool[
+    "WINDOW_UNALIGNED", False
+]()
 comptime SOFTCAP_X1000: Int = get_defined_int["SOFTCAP_X1000", 0]()
 
 
@@ -71,6 +74,7 @@ def flash_attn_fwd_fa4_variant(
         GQA_RATIO,
         VARLEN,
         WINDOW,
+        WINDOW_UNALIGNED,
         SOFTCAP_X1000,
     ](
         batch_int,

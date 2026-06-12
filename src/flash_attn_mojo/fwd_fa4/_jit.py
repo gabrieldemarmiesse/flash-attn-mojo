@@ -59,27 +59,38 @@ def _config_from_args(args: tuple) -> tuple:
     gqa_ratio = int(args[17])
     varlen = bool(args[18])
     window = bool(args[23])
+    # Unaligned window lefts compile the in-loop leading-edge mask
+    # arm; aligned lefts keep the original mask-free steady loop
+    # (the arm's mere presence cost 2-4% at the canonical config).
+    window_unaligned = window and (int(args[24]) % 128 != 0)
     softcap_x1000 = int(args[25])
     dump_ptx = os.environ.get("MOJO_DUMP_PTX", "")
     return (
         dtype_code, head_dim, use_external_stream, causal, gqa_ratio,
-        varlen, window, softcap_x1000, dump_ptx,
+        varlen, window, window_unaligned, softcap_x1000, dump_ptx,
     )
 
 
 def _mod_name(config: tuple) -> str:
-    (dt, hd, ues, causal, ratio, varlen, window, scap, dump_ptx) = config
+    (
+        dt, hd, ues, causal, ratio, varlen, window, winu, scap,
+        dump_ptx,
+    ) = config
     suffix = "_causal" if causal else ""
     suffix += f"_gqa{ratio}" if ratio > 1 else ""
     suffix += "_varlen" if varlen else ""
     suffix += "_win" if window else ""
+    suffix += "u" if winu else ""
     suffix += f"_scap{scap}" if scap else ""
     suffix += "_dumpptx" if dump_ptx else ""
     return f"{_DTYPE_NAME[dt]}_hd{hd}_extstr{int(ues)}{suffix}"
 
 
 def _defines(config: tuple) -> dict[str, str]:
-    (dt, hd, ues, causal, ratio, varlen, window, scap, dump_ptx) = config
+    (
+        dt, hd, ues, causal, ratio, varlen, window, winu, scap,
+        dump_ptx,
+    ) = config
 
     defines = {
         "DTYPE": _DTYPE_DEFINE[dt],
@@ -89,6 +100,7 @@ def _defines(config: tuple) -> dict[str, str]:
         "GQA_RATIO": str(ratio),
         "VARLEN": "true" if varlen else "false",
         "WINDOW": "true" if window else "false",
+        "WINDOW_UNALIGNED": "true" if winu else "false",
         "SOFTCAP_X1000": str(scap),
     }
     if dump_ptx:

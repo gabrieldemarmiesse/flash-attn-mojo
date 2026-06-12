@@ -57,9 +57,9 @@ def test_window_envelope_errors():
     q, k, v = _qkv()
     with pytest.raises(ValueError, match="causal=True"):
         flash_attn_func(q, k, v, window_size=(256, 256))
-    with pytest.raises(ValueError, match="left % 128"):
-        flash_attn_func(q, k, v, causal=True, window_size=(100, 0))
-    with pytest.raises(ValueError, match="left must be >= 0"):
+    with pytest.raises(ValueError, match="left must be >= 1"):
+        flash_attn_func(q, k, v, causal=True, window_size=(0, 0))
+    with pytest.raises(ValueError, match="left must be >= 1"):
         flash_attn_func(q, k, v, causal=True, window_size=(-2, 0))
 
 

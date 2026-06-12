@@ -50,6 +50,7 @@ def launch_fwd_fa4[
     gqa_ratio: Int = 1,
     varlen: Bool = False,
     window: Bool = False,
+    window_unaligned: Bool = False,
     softcap_x1000: Int = 0,
 ](
     batch_int: Int,
@@ -173,6 +174,7 @@ def launch_fwd_fa4[
             gqa_ratio,
             varlen,
             window,
+            window_unaligned,
             softcap_x1000,
         ]
         comptime assert not window, "window v1 is hdim128-only"
@@ -267,6 +269,7 @@ def launch_fwd_fa4[
         gqa_ratio,
         varlen,
         window,
+        window_unaligned,
         softcap_x1000,
     ]
 

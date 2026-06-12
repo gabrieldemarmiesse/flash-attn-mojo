@@ -166,12 +166,15 @@ def flash_attn_func(
                 "window_size currently requires causal=True with "
                 "right window 0 (Mistral-style SWA)"
             )
-        if left is None or left < 0:
-            raise ValueError("window_size left must be >= 0")
-        if left % 128 != 0 or q.shape[-1] != 128 or q.shape[1] % 128:
+        if left is None or left < 1:
             raise ValueError(
-                "window v1 envelope: left % 128 == 0, head_dim=128, "
-                "seqlen % 128 == 0"
+                "window_size left must be >= 1 (use (-1, -1) for no "
+                "window; left == 0 self-only attention is not "
+                "supported)"
+            )
+        if q.shape[-1] != 128 or q.shape[1] % 128:
+            raise ValueError(
+                "window envelope: head_dim=128, seqlen % 128 == 0"
             )
         window_left = int(left)
 

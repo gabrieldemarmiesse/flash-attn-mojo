@@ -111,6 +111,7 @@ def fwd_fa4_kernel[
     gqa_ratio: Int = 1,
     varlen: Bool = False,
     window: Bool = False,
+    window_unaligned: Bool = False,
     softcap_x1000: Int = 0,
 ](
     q_tma: TMATensorTile[dtype, qo_rank, q_tile_shape, q_desc_shape],
@@ -277,11 +278,13 @@ def fwd_fa4_kernel[
                 ((m_block + 1) * BM + BN - 1) // BN,
             )
 
-    # Sliding window (v1: causal + left % BN == 0): the kv trip
-    # range gains a LOWER bound; with the alignment restriction the
-    # window's left edge cuts exactly at a tile boundary minus the
-    # diagonal slope, so ONLY the first (prologue) tile needs the
-    # leading mask and the steady loop stays mask-free.
+    # Sliding window (causal, any left >= 1): the kv trip range
+    # gains a LOWER bound. The leading edges for an m-tile's rows
+    # span a BM-wide range, which straddles at most TWO kv tiles
+    # (BM == BN): the prologue tile and, when left % BN != 0, the
+    # first loop tile — both get the leading mask; the steady loop
+    # stays mask-free. (Aligned left makes the second tile's mask a
+    # provable no-op.)
     var win_left: Int = 0
     var first_kv: Int = 0
     var kv_trips: Int = num_kv_blocks
@@ -562,8 +565,8 @@ def fwd_fa4_kernel[
     # masked-tile softmax call. Unused (and DCE'd) when BM == BN.
     var causal_mask_d: Int = 0
     # Window leading-edge offset: mask col + win_mask_d < row on the
-    # prologue (first-kv) tile. left % BN == 0 keeps it out of the
-    # steady loop.
+    # leading tile(s); per-tile, advanced by BN for the second
+    # masked tile (first loop trip).
     var win_mask_d: Int = 0
     comptime if window:
         win_mask_d = first_kv * BN - m_block * BM + win_left
@@ -698,6 +701,15 @@ def fwd_fa4_kernel[
                 causal_mask_d -= vl_offs
     softmax_block(prologue_diag, True)
     pack_p()  # P(0)
+    # The window leading edge can straddle into the FIRST loop tile
+    # when left % BN != 0: advance the mask offset ONCE here (the
+    # prologue consumed the first tile's value). COMPTIME-split:
+    # aligned lefts keep the loop's inlined softmax_block free of
+    # the window arm entirely (constant-False flag, DCE'd) — having
+    # the arm merely PRESENT behind a runtime flag cost a
+    # consistent 2-4% at the canonical aligned config.
+    comptime if window_unaligned:
+        win_mask_d += BN
 
     # ---- Main loop: QK(n+1) + PV(n) per iteration. Ring slots and
     # empty-barrier phases track incrementally (no div/mod per iter):
@@ -751,7 +763,14 @@ def fwd_fa4_kernel[
                 causal_mask_d = (it + 1) * BN - m_block * BM
                 comptime if varlen:
                     causal_mask_d -= vl_offs
-        softmax_block(loop_diag, False)
+        # Window, unaligned left only: the first loop tile can hold
+        # leading-edge columns (win_mask_d was advanced after the
+        # prologue). Aligned variants pass a comptime False so the
+        # window arm is DCE'd from the loop's inlined copy.
+        var loop_lead: Bool = False
+        comptime if window_unaligned:
+            loop_lead = it == 0
+        softmax_block(loop_diag, loop_lead)
 
         # PV(n) retired: p_reg and o_reg are safe to touch.
         wgmma_pv.wait_group[0]()

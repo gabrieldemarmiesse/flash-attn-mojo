@@ -151,8 +151,16 @@ run-to-run variance (locked clocks, interleaved):
   trips are exactly BN/BM leading + BN/BM trailing. preprocess/
   convert are window-blind (every q row still attends itself; outer
   dq_accum stays zeroed). Degenerate W >= S == plain causal
-  (tested). General (non-%128) window_left needs only the fwd
-  trip-0 mask + the bwd guard relaxation — formulas already exact.
+  (tested). GENERAL window_left (any >= 1) landed 2026-06-12 via a
+  comptime WINDOW_UNALIGNED split: left % 128 != 0 compiles the
+  loop's leading-edge arm (the edge straddles 2 tiles); aligned
+  lefts keep the ORIGINAL mask-free steady loop byte-identically
+  (parity by construction — the arm's mere PRESENCE behind a
+  runtime flag cost a consistent 2.6-3.9%, in-loop mutation or
+  hoisted alike: inlined-closure DCE only fires on comptime-
+  constant flags). The bwd needed NOTHING (its mask_w < BM guard
+  and m_end ceil-div were already exact). left == 0 is rejected
+  (the no-window sentinel; self-only attention unsupported).
 
 - VARLEN CROSS-ATTENTION (2026-06-11, cu_q != cu_k, fully
   differentiable, MHA + GQA, arbitrary lengths): FA4's bottom-right

@@ -72,8 +72,8 @@ def native_fwd_fa4(
     )
     assert seqlen % _BLOCK_N == 0, "fwd_fa4 needs seqlen % 128 == 0"
     if window_left:
-        assert causal and head_dim == 128 and window_left % 128 == 0, (
-            "window v1: causal + head_dim=128 + left % 128 == 0"
+        assert causal and head_dim == 128, (
+            "window: causal + head_dim=128 (any left >= 1)"
         )
     # The cap is comptime (one JIT variant per value); x1000 keeps
     # the define an int while representing Gemma-class caps exactly.
