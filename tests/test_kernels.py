@@ -158,8 +158,6 @@ def _make_varlen(lens, hq=4, hkv=4):
 @pytest.mark.parametrize("mask", ["plain", "causal"])
 def test_fwd_dense(seqlen, mask, heads, dtype, hdim):
     _skip_if_impl_unavailable()
-    if hdim == 64 and dtype == "fp16":
-        pytest.skip("hdim64 fp16 pending the n=64 RS arm")
     torch.manual_seed(1)
     causal = mask == "causal"
     q, k, v = _make(
@@ -185,8 +183,6 @@ def test_fwd_dense(seqlen, mask, heads, dtype, hdim):
 @pytest.mark.parametrize("mask", ["plain", "causal"])
 def test_bwd_dense(seqlen, mask, heads, dtype, hdim):
     _skip_if_impl_unavailable()
-    if hdim == 64 and dtype == "fp16":
-        pytest.skip("hdim64 fp16 pending the n=64 RS arm")
     torch.manual_seed(1)
     causal = mask == "causal"
     q, k, v = _make(

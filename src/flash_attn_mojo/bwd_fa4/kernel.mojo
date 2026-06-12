@@ -90,7 +90,7 @@ from layout.tensor_core_async import (
 )
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
-from _wgmma_f16 import wgmma_rs_f16_m64n128
+from _wgmma_f16 import wgmma_rs_f16_m64n128, wgmma_rs_f16_m64n64
 
 from common import (
     kBwdBlockM,
@@ -1042,23 +1042,31 @@ def bwd_main_kernel[
         warpgroup_fence(dv_acc)
         wgmma_dkv.arrive()
         comptime if dtype == DType.float16:
-            comptime assert head_dim == 128, (
-                "fp16 hdim64 needs an m64n64 RS arm in _wgmma_f16"
-            )
             var dvb_desc = _wgmma_descriptor[
                 qt_canonical, False, swizzle
             ](ring_base + (slot + 1) * q_slot_size)
             var dv_simd = dv_acc.ptr.load[width=c_frag_dkv]()
             comptime for k_mma in range(num_k_mmas_rs):
-                dv_simd = rebind[SIMD[accum_type, c_frag_dkv]](
-                    wgmma_rs_f16_m64n128(
-                        rebind[SIMD[DType.float16, 8]](
-                            (p_reg.ptr + 8 * k_mma).load[width=8]()
-                        ),
-                        (dvb_desc + k_mma * qt_k_stride).desc,
-                        rebind[SIMD[DType.float32, 64]](dv_simd),
+                comptime if head_dim == 128:
+                    dv_simd = rebind[SIMD[accum_type, c_frag_dkv]](
+                        wgmma_rs_f16_m64n128(
+                            rebind[SIMD[DType.float16, 8]](
+                                (p_reg.ptr + 8 * k_mma).load[width=8]()
+                            ),
+                            (dvb_desc + k_mma * qt_k_stride).desc,
+                            rebind[SIMD[DType.float32, 64]](dv_simd),
+                        )
                     )
-                )
+                else:
+                    dv_simd = rebind[SIMD[accum_type, c_frag_dkv]](
+                        wgmma_rs_f16_m64n64(
+                            rebind[SIMD[DType.float16, 8]](
+                                (p_reg.ptr + 8 * k_mma).load[width=8]()
+                            ),
+                            (dvb_desc + k_mma * qt_k_stride).desc,
+                            rebind[SIMD[DType.float32, 32]](dv_simd),
+                        )
+                    )
             dv_acc.ptr.store[width=c_frag_dkv](dv_simd)
         else:
             wgmma_dkv.wgmma(p_reg, dot_view, dv_acc)
@@ -1139,23 +1147,31 @@ def bwd_main_kernel[
         warpgroup_fence(dk_acc)
         wgmma_dkv.arrive()
         comptime if dtype == DType.float16:
-            comptime assert head_dim == 128, (
-                "fp16 hdim64 needs an m64n64 RS arm in _wgmma_f16 "
-            )
             var dkb_desc = _wgmma_descriptor[
                 qt_canonical, False, swizzle
             ](ring_base + slot * q_slot_size)
             var dk_simd = dk_acc.ptr.load[width=c_frag_dkv]()
             comptime for k_mma in range(num_k_mmas_rs):
-                dk_simd = rebind[SIMD[accum_type, c_frag_dkv]](
-                    wgmma_rs_f16_m64n128(
-                        rebind[SIMD[DType.float16, 8]](
-                            (ds_reg.ptr + 8 * k_mma).load[width=8]()
-                        ),
-                        (dkb_desc + k_mma * qt_k_stride).desc,
-                        rebind[SIMD[DType.float32, 64]](dk_simd),
+                comptime if head_dim == 128:
+                    dk_simd = rebind[SIMD[accum_type, c_frag_dkv]](
+                        wgmma_rs_f16_m64n128(
+                            rebind[SIMD[DType.float16, 8]](
+                                (ds_reg.ptr + 8 * k_mma).load[width=8]()
+                            ),
+                            (dkb_desc + k_mma * qt_k_stride).desc,
+                            rebind[SIMD[DType.float32, 64]](dk_simd),
+                        )
                     )
-                )
+                else:
+                    dk_simd = rebind[SIMD[accum_type, c_frag_dkv]](
+                        wgmma_rs_f16_m64n64(
+                            rebind[SIMD[DType.float16, 8]](
+                                (ds_reg.ptr + 8 * k_mma).load[width=8]()
+                            ),
+                            (dkb_desc + k_mma * qt_k_stride).desc,
+                            rebind[SIMD[DType.float32, 32]](dk_simd),
+                        )
+                    )
             dk_acc.ptr.store[width=c_frag_dkv](dk_simd)
         else:
             wgmma_dkv.wgmma(ds_reg, qt_view, dk_acc)

@@ -126,9 +126,13 @@ run-to-run variance (locked clocks, interleaved):
   moves to dead sdS (dead K+V is only 32 KiB at D=64). D=64
   epilogues stage via plain canonical-SW128 paired stores (the
   stmatrix schemes encode D=128 geometry; parity did not demand
-  rederiving them). DEFERRED: hdim64 varlen (use the (128,128,
-  NWG=2) fallback config per the spec, FA4-blessed) and hdim64 fp16
-  (needs an m64n64 arm in _wgmma_f16.mojo).
+  rederiving them). HDIM64 FP16 landed 2026-06-12 (m64n64k16
+  f32.f16.f16 RS arm vendored in _wgmma_f16.mojo, mirroring the
+  n=128 arm; head_dim comptime forks at the three RS sites): fwd
+  0.960x / bwd 0.983x causal canonical — mojo faster; hd64-bf16 and
+  hd128-fp16 byte-identical (stash-gated); 0 spills. DEFERRED:
+  hdim64 varlen (use the (128,128, NWG=2) fallback config per the
+  spec, FA4-blessed).
 
 - SLIDING WINDOW (2026-06-11, Mistral SWA, fully differentiable,
   MHA + GQA): fwd 1.007-1.009x / bwd 0.983-0.985x (mojo FASTER) at

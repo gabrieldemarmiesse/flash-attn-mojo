@@ -71,7 +71,7 @@ from layout.tensor_core_async import (
     warpgroup_fence,
 )
 
-from _wgmma_f16 import wgmma_rs_f16_m64n128
+from _wgmma_f16 import wgmma_rs_f16_m64n128, wgmma_rs_f16_m64n64
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
 from common import (
@@ -532,23 +532,31 @@ def fwd_fa4_kernel[
     @always_inline
     def pv_gemm(slot_arg: Int):
         comptime if dtype == DType.float16:
-            comptime assert head_dim == 128, (
-                "fp16 hdim64 needs an m64n64 RS arm in _wgmma_f16"
-            )
             var b_desc = _wgmma_descriptor[v_canonical, False, swizzle](
                 kv_smem_base + slot_arg * kv_slot_size
             )
             var o_simd = o_reg.ptr.load[width=c_frag_size_pv]()
             comptime for k_mma in range(num_k_mmas_pv):
-                o_simd = rebind[SIMD[accum_type, c_frag_size_pv]](
-                    wgmma_rs_f16_m64n128(
-                        rebind[SIMD[DType.float16, 8]](
-                            (p_reg.ptr + 8 * k_mma).load[width=8]()
-                        ),
-                        (b_desc + k_mma * v_k_stride).desc,
-                        rebind[SIMD[DType.float32, 64]](o_simd),
+                comptime if head_dim == 128:
+                    o_simd = rebind[SIMD[accum_type, c_frag_size_pv]](
+                        wgmma_rs_f16_m64n128(
+                            rebind[SIMD[DType.float16, 8]](
+                                (p_reg.ptr + 8 * k_mma).load[width=8]()
+                            ),
+                            (b_desc + k_mma * v_k_stride).desc,
+                            rebind[SIMD[DType.float32, 64]](o_simd),
+                        )
                     )
-                )
+                else:
+                    o_simd = rebind[SIMD[accum_type, c_frag_size_pv]](
+                        wgmma_rs_f16_m64n64(
+                            rebind[SIMD[DType.float16, 8]](
+                                (p_reg.ptr + 8 * k_mma).load[width=8]()
+                            ),
+                            (b_desc + k_mma * v_k_stride).desc,
+                            rebind[SIMD[DType.float32, 32]](o_simd),
+                        )
+                    )
             o_reg.ptr.store[width=c_frag_size_pv](o_simd)
         else:
             wgmma_pv.wgmma(p_reg, v_tile(slot_arg), o_reg)

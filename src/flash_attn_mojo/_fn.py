@@ -52,11 +52,6 @@ def _check_envelope(
             f"only head_dim in {_SUPPORTED_HEAD_DIMS} is supported, "
             f"got {head_dim}"
         )
-    if head_dim == 64 and q.dtype == torch.float16:
-        raise ValueError(
-            "head_dim=64 is bf16-only for now (fp16 needs the n=64 "
-            "RS wgmma arm)"
-        )
     if seqlen % _SEQLEN_MULTIPLE != 0 and head_dim != 128:
         raise ValueError(
             f"seqlen must be a multiple of {_SEQLEN_MULTIPLE} at "

@@ -67,9 +67,6 @@ def native_fwd_fa4(
         "fwd_fa4 is bf16/fp16-only"
     )
     assert head_dim in (64, 128), "fwd_fa4 supports head_dim 64/128"
-    assert not (head_dim == 64 and q.dtype == torch.float16), (
-        "hdim64 fp16 needs the n=64 RS wgmma arm"
-    )
     assert seqlen % _BLOCK_N == 0, "fwd_fa4 needs seqlen % 128 == 0"
     if window_left:
         assert causal and head_dim == 128, (
