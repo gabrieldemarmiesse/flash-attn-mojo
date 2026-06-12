@@ -39,8 +39,10 @@ build-backend = "setuptools.build_meta"
 dev = [
     # Tri Dao FlashAttention-4 (CuTe DSL) — the perf target the Mojo
     # kernel benchmarks against. Explicit pre-release pin (uv allows
-    # pre-releases when the specifier names one).
-    "flash-attn-4[cu13]==4.0.0b16",
+    # pre-releases when the specifier names one). Linux-only: its
+    # nvidia-cutlass-dsl-libs-base dep ships manylinux wheels only,
+    # and there is no FA4 implementation to race on macOS anyway.
+    "flash-attn-4[cu13]==4.0.0b16 ; sys_platform == 'linux'",
     "matplotlib>=3.10.9",
     "pytest>=9.0.3",
     "ruff",
