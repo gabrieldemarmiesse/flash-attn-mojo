@@ -19,6 +19,7 @@ FA4's kernel time within run-to-run variance:
 | bwd (GQA 4x) | 0.98 / 1.01x (plain/causal) |
 | fwd (varlen) | 1.00 / 0.98x (plain/causal) |
 | bwd (varlen) | 0.98 / 1.00x (plain/causal) |
+| bwd (varlen GQA 4x) | 0.98 / 0.98x (plain/causal, mojo faster) |
 | fwd (hdim64) | 0.96 / 0.95x (plain/causal, mojo faster) |
 | bwd (hdim64) | 0.97 / 0.97x (plain/causal) |
 | fwd (sliding window) | 1.01x |

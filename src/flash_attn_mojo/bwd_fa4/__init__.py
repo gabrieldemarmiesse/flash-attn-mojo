@@ -367,31 +367,12 @@ def bwd_fa4_varlen(
         a[4] = extra32
         return a.reshape(1, 8).to(q.device)
 
-    if gqa_ratio > 1:
-        # Packed (Hkv, total_k_alloc, D) f32 accumulators: every
-        # q-head CTA of a group bulk-reduce-adds its dK/dV tile.
-        # total_k_alloc pads the BUFFER END to a full kv tile —
-        # boundary tiles reduce-add exact zeros (masked S^T rows)
-        # into neighbouring rows, which is a numerical no-op, so no
-        # per-sequence padded windows are needed (deliberate
-        # divergence from FA4's padded_offset_k design).
-        total_k_alloc = -(-total_k // _BLOCK) * _BLOCK
-        dk_accum = torch.empty(
-            (nheads_kv, total_k_alloc, head_dim),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        dv_accum = torch.empty_like(dk_accum)
-        # Aux rows (table index = grid_dim.x): the accumulator
-        # pointers + total_k_alloc, for the main kernel's cp.reduce
-        # epilogue (kv table) and the preprocess zeroing (q table).
-        aux = _aux_row(
-            dk_accum.data_ptr(), dv_accum.data_ptr(), total_k_alloc
-        )
-    else:
-        # Aux row: raw bf16 dk/dv pointers for the kernel's
-        # row-predicated ragged-tail stores.
-        aux = _aux_row(dk.data_ptr(), dv.data_ptr())
+    # Aux row (table index = grid_dim.x): raw bf16 dk/dv pointers
+    # for the kernel's row-predicated ragged-tail stores. GQA needs
+    # nothing more: pack-GQA runs one CTA per KV head, accumulating
+    # the whole group's dK/dV in registers — no f32 accumulators,
+    # no preprocess zeroing, no permute-cast.
+    aux = _aux_row(dk.data_ptr(), dv.data_ptr())
     kv_table = torch.cat([kv_table, aux], dim=0).contiguous()
     q_table = torch.cat([q_table, aux], dim=0).contiguous()
     dpsum = torch.empty(
@@ -471,11 +452,4 @@ def bwd_fa4_varlen(
         ),
         config,
     )
-    if gqa_ratio > 1:
-        # (Hkv, total_k_alloc, D) f32 -> (total_k, Hkv, D) bf16, one
-        # fused permute-cast each (a cast-then-permute split was
-        # measured SLOWER: the extra kernel + slice-cast ran at
-        # 0.9 TB/s).
-        dk.copy_(dk_accum[:, :total_k].permute(1, 0, 2))
-        dv.copy_(dv_accum[:, :total_k].permute(1, 0, 2))
     return dq, dk, dv

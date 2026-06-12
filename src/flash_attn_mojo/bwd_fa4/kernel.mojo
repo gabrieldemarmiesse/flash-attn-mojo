@@ -345,6 +345,16 @@ def bwd_main_kernel[
         m_start = Int(warp.broadcast(tbl[6]))
         vl_mpad_base = Int(warp.broadcast(tbl[7]))
         h_idx = Int(block_idx.y)
+        comptime if gqa_ratio > 1:
+            # pack-GQA (varlen): block_idx.y is the KV head; h_idx
+            # tracks the group's FIRST q head, so every existing
+            # h_idx // gqa_ratio (K/V coords) and stat/dq window
+            # base below stays valid. The three loops then walk all
+            # gqa_ratio heads' m-sweeps in one CTA: K/V load ONCE
+            # per kv head and dK/dV accumulate in registers across
+            # the whole group — no f32 accumulators, no cp.reduce
+            # epilogue, no permute-cast.
+            h_idx = Int(block_idx.y) * gqa_ratio
         b_idx = 0
         kv_row = vl_k_base + n_block * BN
         vl_kv_tail = vl_slk - n_block * BN  # >= BN on full tiles
@@ -367,6 +377,11 @@ def bwd_main_kernel[
             m_start = (n_block * BN) // BM
         kv_row = b_idx * slen + n_block * BN
     var m_trips: Int = num_m_blocks - m_start
+    # pack-GQA: every loop runs the whole group's m-sweeps.
+    comptime pack: Bool = varlen and gqa_ratio > 1
+    var total_trips: Int = m_trips
+    comptime if pack:
+        total_trips = gqa_ratio * m_trips
     comptime if window:
         # Upper trip bound: kv tile n receives gradient only from q
         # tiles with m*BM <= n*BN + BN - 1 + win_left (q rows past
@@ -427,7 +442,20 @@ def bwd_main_kernel[
                 ) * 4
             var lse_byte: Int = Int(lse_log2_ptr) + bh_stat
             var dps_byte: Int = Int(dpsum_ptr) + bh_stat
-            for _ in range(m_trips):
+            # h_cur: SSA copy of h_idx outside pack-GQA (byte-
+            # neutral); walks the group's q heads under pack. The
+            # wrap constants are PRECOMPUTED so vl_q_base/m_start/
+            # slen don't stay live across the loop (the producer
+            # warp runs on the dealloc'd 32-reg budget — extra
+            # liveness here is what ptxas spills).
+            var h_cur: Int = h_idx
+            var pk_m: Int = 0
+            var pk_q_row0: Int = 0
+            var pk_stat_adv: Int = 0
+            comptime if pack:
+                pk_q_row0 = vl_q_base + m_start * BM
+                pk_stat_adv = (slen - m_trips) * BM * 4
+            for _ in range(total_trips):
                 # Tight TMA-issue loop. lse (Q slot) and dpsum (dO
                 # slot) ride each stage's mbarrier as 320-B 1-D
                 # cp.async.bulk copies counted by the same
@@ -446,7 +474,7 @@ def bwd_main_kernel[
                         Int32(BM * D * size_of[dtype]() + BM * 4)
                     )
                     q_tma.async_copy_3d(
-                        q_st, full[slot], (0, h_idx, q_row)
+                        q_st, full[slot], (0, h_cur, q_row)
                     )
                     inlined_assembly[
                         "cp.async.bulk.shared::cluster.global"
@@ -474,7 +502,7 @@ def bwd_main_kernel[
                         Int32(BM * D * size_of[dtype]() + BM * 4)
                     )
                     do_tma.async_copy_3d(
-                        do_st, full[slot + 1], (0, h_idx, q_row)
+                        do_st, full[slot + 1], (0, h_cur, q_row)
                     )
                     inlined_assembly[
                         "cp.async.bulk.shared::cluster.global"
@@ -492,6 +520,18 @@ def bwd_main_kernel[
                 q_row += BM
                 lse_byte += BM * 4
                 dps_byte += BM * 4
+                comptime if pack:
+                    # h-wrap: next q head of the group — q rows
+                    # restart at this CTA's m_start; the stat
+                    # windows advance one full head stride (slen
+                    # carries num_mpad here).
+                    pk_m += 1
+                    if pk_m == m_trips:
+                        pk_m = 0
+                        h_cur += 1
+                        q_row = pk_q_row0
+                        lse_byte += pk_stat_adv
+                        dps_byte += pk_stat_adv
                 slot += 2
                 wrap += 1
                 if wrap == STAGES // 2:
@@ -518,7 +558,11 @@ def bwd_main_kernel[
                     (b_idx * Int(grid_dim.y) + h_idx) * num_m_blocks
                     + m_start
                 ) * (2 * DQ_MAIL_F32 * 4)
-            for _ in range(m_trips):
+            var pk_md: Int = 0
+            var pk_dq_adv: Int = 0
+            comptime if pack:
+                pk_dq_adv = (slen - m_trips) * (2 * DQ_MAIL_F32 * 4)
+            for _ in range(total_trips):
                 cp_async_bulk_wait_group[1]()
                 named_barrier_arrive[Int32(DRAIN_BAR)](Int32(9))
                 cp_async_bulk_wait_group[0]()
@@ -540,6 +584,13 @@ def bwd_main_kernel[
                         )
                     cp_async_bulk_commit_group()
                 dq_byte_base += 2 * DQ_MAIL_F32 * 4
+                comptime if pack:
+                    # h-wrap: jump to the next q head's dq_accum
+                    # window (one head stride = slen m-rows).
+                    pk_md += 1
+                    if pk_md == m_trips:
+                        pk_md = 0
+                        dq_byte_base += pk_dq_adv
             cp_async_bulk_wait_group[0]()
         return
 
@@ -671,8 +722,11 @@ def bwd_main_kernel[
     var phase: UInt32 = 0
     var wrap: Int = 0
     var sds_stage: Int = 0
+    # m-position within the current head's sweep (== it outside
+    # pack-GQA; wraps at m_trips under pack — the masks key on it).
+    var pk_mc: Int = 0
 
-    for it in range(m_trips):
+    for it in range(total_trips):
         var q_view = LayoutTensor[
             dtype,
             q_smem_layout,
@@ -779,10 +833,15 @@ def bwd_main_kernel[
             comptime if varlen:
                 # Cross-attention general form: masked iff kv_abs >
                 # q_abs + offs, i.e. mrow > ccol + (vl_mask_base +
-                # it*BM). Self-attn: vl_mask_base == 0 and the guard
-                # degenerates to it < BN//BM as in dense; cross
+                # m*BM). Self-attn: vl_mask_base == 0 and the guard
+                # degenerates to m < BN//BM as in dense; cross
                 # offsets shift which trips the band lands on.
-                var mask_dv: Int = vl_mask_base + it * BM
+                # (m_it == it outside pack-GQA; under pack it is
+                # the m-position within the current head's sweep.)
+                var m_it: Int = it
+                comptime if pack:
+                    m_it = pk_mc
+                var mask_dv: Int = vl_mask_base + m_it * BM
                 if mask_dv < BN:
                     var vrow_lo: Int = (
                         wg * WGMMA_M + warp_in_wg * 16 + lane_group
@@ -1138,18 +1197,21 @@ def bwd_main_kernel[
             wrap = 0
             slot = 0
             phase ^= 1
+        comptime if pack:
+            pk_mc += 1
+            if pk_mc == m_trips:
+                pk_mc = 0
 
     # ---- Epilogue.
-    comptime if varlen and gqa_ratio == 1:
+    comptime if varlen:
         # Ragged kv tail tile: a full-tile TMA store would overwrite
         # the NEXT sequence's dK/dV rows — store the c-frags straight
         # to gmem, row-predicated (no smem staging, no barrier; both
         # warpgroups take this branch together). The raw dk/dv base
         # addresses live in the work table's aux row (row index
-        # grid_dim.x), packed as two int64s. (GQA needs no such path:
-        # its cp.reduce accumulation tolerates full tiles — the
-        # masked garbage rows' c-frags are exactly zero, and adding
-        # zero is a no-op; only the allocator pads the buffer end.)
+        # grid_dim.x), packed as two int64s. (pack-GQA takes this
+        # path too: the group's dK/dV accumulated in registers, so
+        # the store is per-KV-head exactly like MHA.)
         if vl_kv_tail < BN:
             var taux = dk_accum_ptr.bitcast[Int64]() + 4 * Int(
                 grid_dim.x
@@ -1171,8 +1233,12 @@ def bwd_main_kernel[
                 comptime p_bot: Int = c2 % 2
                 var prow: Int = prow_lo + (8 if p_bot == 1 else 0)
                 if prow < vl_kv_tail:
+                    # dk/dv have nheads_kv heads under pack-GQA;
+                    # //gqa_ratio folds away at ratio==1. grid.y is
+                    # the dk/dv head count in both modes.
                     var goff: Int = (
-                        (kv_row + prow) * Int(grid_dim.y) + h_idx
+                        (kv_row + prow) * Int(grid_dim.y)
+                        + h_idx // gqa_ratio
                     ) * D + p_chunk * 8 + 2 * lane_pair
                     (dv_g + goff).store[width=2, alignment=4](
                         SIMD[accum_type, 2](
@@ -1200,9 +1266,11 @@ def bwd_main_kernel[
     # 16384 B never touch addr bits 7-9).
     var scale_acc: Scalar[accum_type] = softmax_scale.cast[accum_type]()
 
-    comptime if gqa_ratio > 1:
-        # GQA epilogue: multiple q-head CTAs accumulate into the same
-        # kv-head's dK/dV (FA4's fp32-accum + postprocess design).
+    comptime if gqa_ratio > 1 and not varlen:
+        # Dense GQA epilogue: multiple q-head CTAs accumulate into
+        # the same kv-head's dK/dV (FA4's fp32-accum + postprocess
+        # design). Varlen GQA packs the group into one CTA instead
+        # and exits through the bf16 path below.
         # Stage each tensor as a row-major 128x128 f32 tile in the
         # dead K+V smem (exactly 64 KiB) and bulk-reduce-add it into
         # the per-kv-head accumulator; a torch permute-cast converts.
@@ -1368,7 +1436,7 @@ def bwd_main_kernel[
             address_space=AddressSpace.SHARED,
             alignment=128,
         ](v_base)
-        dv_tma.async_store_3d(dv_st, (0, h_idx, kv_row))
+        dv_tma.async_store_3d(dv_st, (0, h_idx // gqa_ratio, kv_row))
         dv_tma.commit_group()
 
     # dK *= scale; staged under dV's in-flight TMA store.
@@ -1428,7 +1496,7 @@ def bwd_main_kernel[
             address_space=AddressSpace.SHARED,
             alignment=128,
         ](k_base)
-        dk_tma.async_store_3d(dk_st, (0, h_idx, kv_row))
+        dk_tma.async_store_3d(dk_st, (0, h_idx // gqa_ratio, kv_row))
         dk_tma.commit_group()
         dk_tma.wait_group()
 
@@ -1543,41 +1611,9 @@ def bwd_preprocess_kernel[
             )
             zoff += kBwdPreThreads * ZVEC
 
-        # GQA: zero this kv-head's slice of the packed (Hkv,
-        # total_k_alloc, D) f32 dK/dV accumulators (the main kernel
-        # bulk-reduce-ADDS into them). Done by the h % ratio == 0
-        # grid columns, the flat range split across grid.x. The raw
-        # pointers + total_k_alloc live in the q-tile table's aux
-        # row (index grid_dim.x).
-        comptime if gqa_ratio > 1:
-            if h_idx % gqa_ratio == 0:
-                var paux64 = dk_accum_ptr.bitcast[Int64]() + 4 * Int(
-                    grid_dim.x
-                )
-                var paux32 = dk_accum_ptr.bitcast[Int32]() + 8 * Int(
-                    grid_dim.x
-                )
-                var dk_red = UnsafePointer[Float32, MutAnyOrigin](
-                    unsafe_from_address=Int(paux64[0])
-                )
-                var dv_red = UnsafePointer[Float32, MutAnyOrigin](
-                    unsafe_from_address=Int(paux64[1])
-                )
-                var kvtot: Int = Int(paux32[4]) * D
-                var kvbase: Int = (h_idx // gqa_ratio) * kvtot
-                var knb: Int = Int(grid_dim.x)
-                comptime ZCH: Int = kBwdPreThreads * ZVEC
-                var kpasses: Int = (kvtot + knb * ZCH - 1) // (knb * ZCH)
-                var koff: Int = Int(block_idx.x) * kpasses * ZCH + tid * ZVEC
-                for _ in range(kpasses):
-                    if koff < kvtot:
-                        (dk_red + kvbase + koff).store[width=ZVEC](
-                            SIMD[DType.float32, ZVEC](0)
-                        )
-                        (dv_red + kvbase + koff).store[width=ZVEC](
-                            SIMD[DType.float32, ZVEC](0)
-                        )
-                    koff += ZCH
+        # (Varlen GQA needs no accumulator zeroing: pack-GQA
+        # accumulates the group's dK/dV in registers and stores
+        # bf16 directly — there are no f32 accumulators.)
         return
     var num_main_blocks: Int = (
         seq_len + bm_main - 1

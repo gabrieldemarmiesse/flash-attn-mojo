@@ -544,6 +544,37 @@ mean attended index) proved the kernel's attended sets exact
 before touching any kernel code. Cross-length causal now routes
 through the reference's explicit-mask branch.
 
+## Pack-GQA varlen bwd (2026-06-12, ninth session)
+
+The last above-wobble config (varlen GQA bwd, 1.04x plain / 1.07x
+causal) is now FASTER than FA4: 0.976x both, interleaved
+locked-clock runs. The restructure is FA4's own answer (pack_gqa):
+one CTA per (kv tile, KV head) instead of per (kv tile, q head),
+walking the whole group's m-sweeps in one pass.
+
+Why it wins — all three measured costs die at once, plus a bonus:
+the f32 accumulators, their preprocess zeroing (+48 us), the
+per-CTA cp.reduce epilogue (~3 us/CTA) and the torch permute-cast
+(+43 us) are simply gone (dK/dV accumulate in registers across the
+group and store bf16 like MHA); AND each K/V tile now loads once
+per KV head instead of once per q head — a gqa_ratio x kv-load
+bandwidth saving the old design never had.
+
+The implementation trick that kept it small: h_idx = block_idx.y *
+gqa_ratio (the group's FIRST q head). Every existing
+h_idx // gqa_ratio K/V coordinate and stat/dq window base stays
+literally valid; the only new logic is incremental (h, m) wrap
+tracking in the producer (q_row reset + stat-window stride), the
+drain (dq_accum head stride) and the consumer (masks key on the
+within-head m position). Dense GQA keeps the f32-accum design — it
+is at parity there and dense has no free dk/dv arg slots anyway.
+
+Known exception, documented deliberately: the pack variant carries
+a 40-B ptxas spill (zero PTX local ops — SASS regalloc under the
+32-reg producer/drain budgets; precomputing the wrap constants did
+not clear it). The bench is the ground truth: faster than FA4 with
+the spill. Do not chase it without re-benching.
+
 ## Not yet tried (fwd)
 
 - ~~L2 cache hints on TMA loads~~ DEBUNKED (third session): FA4's

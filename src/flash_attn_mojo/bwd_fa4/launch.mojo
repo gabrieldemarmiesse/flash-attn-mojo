@@ -355,7 +355,12 @@ def launch_bwd_main[
 
     var grid: Tuple[Int, Int, Int]
     comptime if varlen:
-        grid = (vl_num_kv_tiles, nheads_int, 1)
+        comptime if gqa_ratio > 1:
+            # pack-GQA: one CTA per (kv tile, KV head); the kernel
+            # walks the whole group's m-sweeps internally.
+            grid = (vl_num_kv_tiles, nheads_int // gqa_ratio, 1)
+        else:
+            grid = (vl_num_kv_tiles, nheads_int, 1)
     else:
         grid = (
             ceildiv(seqlen_int, Int(kBwdBlockN)),

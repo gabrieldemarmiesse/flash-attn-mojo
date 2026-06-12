@@ -60,23 +60,27 @@ run-to-run variance (locked clocks, interleaved):
   sched_num_hb_q; dk/dv ride an aux work-table row at index
   grid_dim.x). Envelope: any lengths >= 1, self-attn lengths, MHA or
   GQA, fully differentiable. All per-CTA table scalars are
-  warp.broadcast-laundered. VARLEN GQA (2026-06-11): fwd at parity
-  (0.988-0.989x, mojo faster); bwd trails 1.04x plain / 1.07x causal
-  — the ONLY config above wobble. Root cause (per-kernel CUPTI
-  decomposition): the per-CTA GQA epilogue fixed cost (64 KiB smem
-  staging + 2 serialized cp.reduce, ~3 us/CTA) amortizes poorly over
-  varlen's short per-CTA m-sweeps, + accumulator zeroing (+48 us in
-  preprocess) + the torch permute-cast (+43 us); FA4 restructures
-  varlen-GQA (pack_gqa / CLC re-enabled — the audit noted it). Known
-  levers if parity is later required: pack-GQA-style M-dim head
-  packing, or a fused dkv-convert kernel. Design note: varlen GQA
-  needs NO per-seq padded accumulator windows (deliberate divergence
-  from FA4's padded_offset_k) — masked S^T garbage rows give
-  EXACTLY-ZERO c-frags, so full-tile cp.reduce adds into neighbour
-  rows are numeric no-ops; only the buffer END pads to a full tile.
-  Accum ptrs + total_k_alloc ride the aux table rows; the epilogue
-  REBUILDS its addresses from the table/special regs at issue time
-  (keeping them live across the main loop spilled 8-16 B).
+  warp.broadcast-laundered. VARLEN GQA (2026-06-12, PACK-GQA — bwd
+  now FASTER than FA4: 0.976x plain AND causal, from 1.04/1.07x;
+  fwd 0.988-0.989x): one CTA per (kv tile, KV HEAD) — grid.y =
+  Hkv — walking the whole group's m-sweeps (total_trips =
+  ratio*m_trips) with incremental (h, m) wrap tracking in all three
+  warp roles (h_idx = block_idx.y * ratio keeps every existing
+  h_idx // ratio K/V coordinate and window-base computation valid;
+  producer resets q_row/advances stat windows at the h-wrap; drain
+  jumps one head stride in dq_accum; the consumer masks key on the
+  within-head m position). K/V smem tiles load ONCE per kv head
+  (ratio x bandwidth saving) and dK/dV accumulate in REGISTERS
+  across the group, so the epilogue is the MHA path (bf16 stores +
+  raw-ptr predicated ragged tails via the aux row) — the f32
+  accumulators, the cp.reduce epilogue, the preprocess zeroing and
+  the torch permute-cast are all GONE for varlen (the f32-accum
+  design remains for DENSE GQA, where it is at parity). KNOWN
+  EXCEPTION: the pack variant carries a 40-B ptxas spill (no PTX
+  local ops — regalloc under the 32-reg producer/drain budgets;
+  wrap-constant precomputation did not clear it). Kept: the bench
+  is the ground truth and it is FASTER than FA4 with the spill —
+  do not chase it without re-benching.
 
 - SHORT-SEQ FWD (2026-06-11, resolved): the fwd trailed 1.05–1.22x
   at short sequences (B=1 S=512 single-wave: +2.5 µs/CTA,
