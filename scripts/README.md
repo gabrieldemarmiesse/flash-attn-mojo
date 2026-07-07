@@ -117,3 +117,63 @@ scripts/profile_summary.sh /tmp/bwd_main_prof.ncu-rep
 
 For source-level drill-down, copy the report off-box and open in
 `ncu-ui` locally — the CLI can't render the source view.
+
+## ROCm / AMD (MI300X) lane — `master_bench_rocm.sh`
+
+The AMD analog of `master_bench.sh`, for the CDNA (gfx942) race. There is
+no FlashAttention-4 / CuTe on AMD, so the reference is PyTorch fused SDPA
+(ROCm routes fp16 SDPA through its AOTriton/CK flash-attention backend),
+or `flash_attn` if installed (`--impl flash`). The mojo lane is **v0** —
+`bench/bench_mojo_rocm.mojo`, a hand-vectorized SIMD forward kernel
+(wavefront-64, `BK=64`) that does **not** use the CDNA matrix cores
+(MFMA) yet, so it is far behind the reference. This is the M0 milestone
+(correctness + measurement plumbing), the analog of the Metal race's M0.
+
+One invocation mirrors the five master-bench steps:
+
+1. recompile the mojo v0 kernel from source;
+2. run mojo v0 (fp32 CPU correctness + wall-clock time) and the torch
+   reference (kernel-only via roctracer, the CUPTI analog), interleaved;
+3. copy the mojo kernel's **AMDGCN ISA** dump (the PTX analog, written by
+   `dump_asm` on every run) into `asm/`;
+4. print the GCN instruction-mix + resource footprint (`gcn_opmix.py`) —
+   the `vgpr_spill_count` is the spill canary (analog of the ptxas
+   spill-bytes line), and a `matrix` class of 0 confirms v0 uses no MFMA;
+5. re-time the mojo kernel under `rocprofv3` for a kernel-only number +
+   launch resources (`rocprof_summary.py`, the ncu-stats analog).
+
+```bash
+scripts/master_bench_rocm.sh                 # default 4096 x 16 x D128
+scripts/master_bench_rocm.sh --quick         # small shape, fast
+scripts/master_bench_rocm.sh --head-dim 64   # D=64 variant
+scripts/master_bench_rocm.sh --no-prof       # skip the rocprofv3 step
+```
+
+Supporting scripts:
+
+- `bench_rocm.py` — reference lane; benches torch SDPA / `flash_attn`
+  kernel-only via `torch.profiler` (roctracer), emits a `RESULT` line in
+  the same format as `bench_fa4.py`.
+- `gcn_opmix.py` — AMDGCN ISA op-mix histogram / diff (analog of
+  `ptx_stats.py` / `air_opmix.py`): classes opcodes (`v_mfma`→matrix,
+  `ds_`→lds, `ds_bpermute`→shuffle, `global_`→gmem, `scratch_`→spill,
+  `s_waitcnt`→sync) and parses the vgpr/sgpr/LDS/scratch footprint.
+- `rocprof_summary.py` — groups a `rocprofv3 --kernel-trace` CSV by kernel
+  name and prints mean/min device time + VGPR/scratch/LDS/grid.
+
+### Environment setup (once, on the AMD box)
+
+The default `uv sync` installs the CUDA toolchain (the `dev` group's
+`flash-attn-4[cu13]`). For the ROCm lane install a ROCm PyTorch into the
+venv instead — verified working on ROCm 7.2.4 / MI300X:
+
+```bash
+uv pip install "torch==2.8.0" --index-url \
+    https://download.pytorch.org/whl/rocm6.4 --reinstall-package torch
+```
+
+(The `rocm` extra in `pyproject.toml` also pins this torch + triton-rocm;
+the manual `uv pip install` avoids the source build of `flash-attn` that
+the extra pulls in, which is not needed when SDPA is the reference.)
+Mojo itself targets gfx942 out of the box on this toolchain
+(`DeviceContext().api()` reports `hip`).

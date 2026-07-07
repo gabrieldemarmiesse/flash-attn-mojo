@@ -31,3 +31,8 @@ reference_air/**/*.o
 reference_air/ccv/bench_ccv/bench_ccv_attn
 *.trace/
 *.gputrace/
+
+# ROCm/MI300X race: the mojo v0 kernel's AMDGCN ISA dumps are build
+# products regenerated on every master_bench_rocm.sh run (the /air/
+# analog for the Metal lane).
+/asm/
