@@ -4,6 +4,32 @@ Helpers for capturing ncu (Nsight Compute) traces of the flash-attn-mojo
 kernels. The fwd is at perf parity already; the bwd is the active perf
 target — see `HANDOFF.md` for the per-shape gap vs upstream FA3.
 
+## The one-command perf gate: `master_bench.py`
+
+`scripts/master_bench.py` is the high-information, autonomous perf gate —
+run it after any kernel edit and read the summary. One invocation locks
+the GPU clocks (hard gate), clears the JIT cache + runs correctness,
+benches mojo vs FA4 with a per-shape ratio table (ratio | run-to-run
+spread | verdict) and a compute (tensor-core) roofline (achieved TFLOP/s,
+% of peak, regime + hint), captures an ncu metrics summary for both
+kernels side by side, dumps the mojo PTX, diffs its instruction mix vs
+the committed FA4 reference, runs the ptxas spill canary (hard gate), and
+does an independent wall-clock run. It ends with a machine-readable
+`===AGENT-SUMMARY===` JSON block and a non-zero exit on any gate failure.
+
+```bash
+scripts/master_bench.py                   # canonical dense fwd (flash_attn_func)
+scripts/master_bench.py --kind bwd        # backward kernels
+scripts/master_bench.py --causal --hkv 4  # causal GQA; also --varlen/--window/--softcap
+scripts/master_bench.py --full            # multi-shape sweep
+scripts/master_bench.py --no-ncu --no-asm # timing-only fast loop
+scripts/master_bench.py --no-lock --no-clean  # dev loop (keep JIT cache)
+```
+
+The older `master_bench.sh` is the original bash coordinator (fwd/bwd PTX
+diff + ncu side-by-side); `master_bench.py` supersedes it with the richer
+tables, roofline, spread verdicts, and agent summary.
+
 ## Quick start
 
 ```bash

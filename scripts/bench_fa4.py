@@ -175,6 +175,20 @@ def main() -> None:
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="repeat the timed measurement N times (one RESULT line "
+        "each); the caller derives min + run-to-run spread from them",
+    )
+    p.add_argument(
+        "--walltime",
+        action="store_true",
+        help="measure end-to-end wall-clock per step (CUDA-event "
+        "timed, includes launch/sync overhead) instead of CUPTI "
+        "kernel-only time; emits measure=walltime RESULT lines",
+    )
+    p.add_argument(
         "--check",
         action="store_true",
         help="run this variant's pytest checks (tests/test_kernels.py)"
@@ -341,36 +355,61 @@ def main() -> None:
         torch.cuda.cudart().cudaProfilerStop()
         return
 
-    from torch.profiler import ProfilerActivity, profile
-
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        for _ in range(args.iters):
-            step()
-        torch.cuda.synchronize()
-
-    kernel_us = 0.0
-    for e in prof.key_averages():
-        name = e.key.lower()
-        if e.device_time_total > 0 and "memcpy" not in name and "memset" not in name:
-            kernel_us += e.device_time_total
-    us = kernel_us / args.iters
-    tflops = flops / (us * 1e-6) / 1e12
     if args.varlen:
         shape_str = f"varlen:{total}tok,{H},{D}"
         hkv_str = str(h_kv)
     else:
         shape_str = f"{B},{S},{H},{D}"
         hkv_str = str(h_kv)
-    print(
-        f"RESULT impl={args.impl} kind={args.kind} "
-        f"shape={shape_str} causal={int(args.causal)} "
-        f"hkv={hkv_str} dtype={args.dtype} window={args.window} "
-        f"softcap={args.softcap:g} "
-        f"us={us:.1f} tflops={tflops:.1f}"
-    )
-    for e in sorted(
-        prof.key_averages(), key=lambda e: -e.device_time_total
-    ):
+
+    def emit(us: float, measure: str) -> None:
+        tflops = flops / (us * 1e-6) / 1e12
+        print(
+            f"RESULT impl={args.impl} kind={args.kind} "
+            f"shape={shape_str} causal={int(args.causal)} "
+            f"hkv={hkv_str} dtype={args.dtype} window={args.window} "
+            f"softcap={args.softcap:g} measure={measure} "
+            f"us={us:.1f} tflops={tflops:.1f}"
+        )
+
+    # Wall-clock: end-to-end per-step latency (launch + sync overhead
+    # included), CUDA-event timed. Independent of the CUPTI kernel path.
+    if args.walltime:
+        for _ in range(args.runs):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(args.iters):
+                step()
+            end.record()
+            torch.cuda.synchronize()
+            emit(start.elapsed_time(end) * 1e3 / args.iters, "walltime")
+        return
+
+    from torch.profiler import ProfilerActivity, profile
+
+    # CUPTI kernel-only time. Repeat `runs` times so the caller can quote
+    # a run-to-run spread (the H100 wobbles a few % even locked).
+    last_prof = None
+    for _ in range(args.runs):
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            for _ in range(args.iters):
+                step()
+            torch.cuda.synchronize()
+        kernel_us = 0.0
+        for e in prof.key_averages():
+            name = e.key.lower()
+            if (
+                e.device_time_total > 0
+                and "memcpy" not in name
+                and "memset" not in name
+            ):
+                kernel_us += e.device_time_total
+        emit(kernel_us / args.iters, "kernel")
+        last_prof = prof
+
+    # Per-kernel breakdown (from the last run) — one line per device op.
+    for e in sorted(last_prof.key_averages(), key=lambda e: -e.device_time_total):
         name = e.key.lower()
         if e.device_time_total > 0 and "memcpy" not in name and "memset" not in name:
             short = e.key.split("(")[0][:60]
