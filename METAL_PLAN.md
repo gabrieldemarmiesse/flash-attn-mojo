@@ -10,10 +10,30 @@ least as fast as** both references on this machine:
   varlen/mask/sliding-window/sinks) — clone at `./ccv` (gitignored)
 
 Then iterate feature-by-feature the way the NVIDIA/FA4 race did
-(HANDOFF.md is the template). **Status 2026-06-12: milestone M0
-complete** — full 3-way harness running, v0 mojo kernel correct,
-references extracted and measured. v0 is 9.4–14x BEHIND the
-references (expected — see "The v1 fight" below).
+(HANDOFF.md is the template). **Status 2026-07-08: milestone v1
+COMPLETE — mojo is AT PARITY with ccv** (the faster reference) on
+the full shape matrix. Numbers below are TRUE GPU KERNEL TIME on
+both sides — the refs self-report command-buffer gpuEnd-gpuStart;
+the mojo lane's is recovered from an xctrace 'Metal System Trace'
+by `master_bench.py`'s default kernel-time phase (see the
+measurement-protocol section):
+
+| shape       | mojo kern µs | ccv µs | ratio | verdict |
+|-------------|--------------|--------|-------|---------|
+| S1024/D64   | 1162         | 1160   | 1.00x | parity |
+| S1024/D128  | 2345         | 2355   | 1.00x | parity |
+| S4096/D64   | 18192        | 18241  | 1.00x | parity |
+| S4096/D128  | 36912        | 36882  | 1.00x | parity |
+| S8192/D64   | 72837        | 72969  | 1.00x | parity |
+| S8192/D128  | 154111       | ~150k  | 1.02–1.05x | parity (±5% ccv spread) |
+
+MFA is beaten on every shape. mojo ≈ 3.46–3.77 TFLOPS = ccv's
+band. The old 1.05x at S1024/D64 was PURELY the mojo lane's
+~160 µs/enqueue wall-clock bias — the wall column still shows it
+(1214 wall vs 1162 kernel); kernel-to-kernel it is dead-on ccv.
+Correctness: max|err| ≈ 9e-6 vs the strided fp32 CPU reference
+(same band as the references — f16 S-GEMM accumulate). See "The
+v1 fight — resolved" below for the three mechanisms that mattered.
 
 ## Machine / toolchain ground truth (2026-06-12, all verified)
 
@@ -108,10 +128,27 @@ references (expected — see "The v1 fight" below).
   MFA's lane emulates MHA per its docs — one dispatch per head,
   per-head buffers so heads run concurrently like ccv's batched
   kernel).
-- Timing fine print: references report command-buffer GPU time; the
-  mojo lane reports wall-clock around enqueue+sync (its only reliable
-  bracket today) and so eats its own ~160 µs/dispatch overhead — a
-  deliberate conservative bias against mojo, <1% at canonical shapes.
+- Timing fine print: references report command-buffer GPU time
+  (gpuEnd-gpuStart); the mojo lane can only wall-clock enqueue+sync
+  (its only reliable in-process bracket) and so eats ~160 µs/dispatch
+  of overhead the refs don't. `master_bench.py` therefore runs a
+  DEFAULT-ON kernel-time phase after the wall bench: it xctrace-records
+  ONLY the mojo lane (the refs already self-report GPU time) and
+  recovers its true per-dispatch GPU time via
+  `xctrace_gpu_intervals.steady_state_kernel_us`. That estimator is
+  fragmentation-proof: a long dispatch is SPLIT across DVFS clock
+  transitions into several intervals, so it buckets by clock, takes
+  the highest clock the GPU settled at, and within it returns the min
+  (no fragmentation — short kernels, matches the refs' min-over-
+  dispatches) or the median of the tight top cluster (fragmentation —
+  clean dispatches cluster at the top, fragments fall below). The
+  capture is sized from the wall time to ~1.2 s of GPU work so DVFS
+  actually ramps to a stable top clock (short shapes need hundreds of
+  dispatches — else per-dispatch time reads a low ramp clock and
+  over-reports; this is why the naive per-encoder median was wrong).
+  xctrace is flaky (SIGSEGV on finalize ~1/3, 'missing template'
+  export errors) — the phase retries 5x/shape and falls back to wall
+  (flagged) on give-up. Disable with `--no-kernel-time`.
 
 ## Reference ground truth
 
@@ -161,28 +198,95 @@ comptime `sqrt` is uninterpretable on the metal target (lowers to
 of per-row SIMD chunks (comptime indices → SROA keeps them in
 registers).
 
-## The v1 fight (next milestone — making mojo fast)
+## The v1 fight — RESOLVED 2026-07-08 (parity in one day)
 
-The op-mix diff says it all: references = 3 MMA calls + async copies
-in the hot loop; mojo v0 = 0 matrix ops, 128 `air.simd_shuffle` (PV
-broadcasts), ~3000 scalar-vector ops. The path:
+**Toolchain**: `mojo-compiler==1.0.0b2` (PyPI, 2026-06-18) contains
+the 8x8 MMA fix — no conda nightly needed. pyproject now carries
+darwin-markered pins (linux stays on 1.0.0b1 for the validated CUDA
+codegen). Toy probe first (ptxas_ur_probe lesson): the intrinsic is
+`llvm_intrinsic["llvm.air.simdgroup_matrix_8x8_multiply_accumulate",
+SIMD[dtype, 2]](a, b, c)` on 2-elem SIMD fragments — both the f16-
+and f32-accumulate arms verified correct; the per-lane fragment map
+is `matmul_8x8.mojo::_frag8_layout` == MFA's `morton_order`.
 
-1. **Toolchain bump** to a nightly with the 8x8 MMA fix (conda-only;
-   decide: side venv/conda env just for the metal kernels vs waiting
-   for the next stable). Probe the 8x8 MMA with a toy GEMM FIRST
-   (ptxas_ur_probe lesson: test codegen hypotheses on toys).
-2. Rebuild the kernel MFA-shaped: 8x8 simdgroup-matrix tiles,
-   register-resident O accumulator, 2 simdgroups/tg, async-copy
-   staging if/when exposed (or plain loads — M4 has no real async
-   copy in mojo anyway; MFA still hits 3.5 TFLOPS with it, so the
-   copies are not the moat — the MMAs are).
-3. Iterate with `master_bench.py` + AIR op-mix diff per edit,
-   exactly like the PTX workflow. Watch `alloca` in the mojo AIR as
-   the spill-canary stand-in.
+**The kernel** (bench/bench_mojo_metal.mojo): ccv-shaped — blocks
+(16, 128), 2 simdgroups x 8 q rows, raw-unscaled f16-accum S, P
+overwriting S in place (A-operand layout == C layout: zero-cost),
+f32-accum O, 2-hop xor(1)/xor(8) softmax reductions, scale folded
+once into m and the exp2 argument. Deliberate departures: ALL
+fragments (Q/K/V/O) read/written directly from device memory — the
+main loop has ZERO barriers and no functional threadgroup memory
+(ccv stages Q+O through smem only because async_copy is its
+ragged-edge clamp; its own K/V fast path is already direct).
 
-Fallback if the nightly bump is blocked: vendor the 8x8 MMA as a
-`llvm_intrinsic` call on `<64 x half>` SIMD values from 1.0.0b1 —
-risky (that intrinsic path is what SIGSEGVs), so toy-probe first.
+**What actually gated perf** (the initial correct kernel was 3x
+off; three mechanisms, in discovery order):
+
+1. **The D=128 Q-cache register cliff.** Register-caching Q at
+   D=128 (16 extra live f16 frags/lane) ran the NO-LOAD skeleton
+   2.3x off the MMA roofline; the D=64 skeleton (Q cached, half the
+   O frags) sat AT roofline. ccv's table caches Q only at D<=96 —
+   now we know why. Fix: stream Q in 32-col chunks per c-block like
+   ccv, but straight from device (the row stays L1-resident).
+2. **1-D q-tile-major grid.** A (q_tile, head) 2-D grid was 2.5x off
+   at S=8192/D=128: concurrently-resident threadgroups spread over
+   16 heads = 16 desynced K/V streams = DRAM-bound. Flattening to
+   ccv's 1-D q-tile-fastest ordering makes the resident wave share
+   ONE head's K/V stream (SLC hits): S=8192/D=64 went 115.6 ms ->
+   74.0 ms = instant parity.
+3. **Residency throttle.** With zero threadgroup memory, residency
+   runs far above ccv's 4 tgs/core (8 KiB alloc), and every extra
+   resident threadgroup is another desynced K/V reader — the
+   instantaneous working set blows past the SLC exactly when
+   per-head K+V hits 4 MiB (S=8192/D=128 was the one shape still
+   1.42x off). A dummy ~10.7 KiB threadgroup allocation (3 tgs/core;
+   swept: 4 KiB=201 ms, 8=163, 10.7=154.5, 16=160) + an opaque
+   never-taken use recovered 2618 -> 3555 GFLOPS.
+
+**Codegen lessons (Metal/AIR, hard-won):**
+
+- `alloca` in the mojo AIR dump is NOT a spill canary: InlineArray
+  frag arrays always emit allocas + stack load/store in the IR, but
+  the AGX backend compiler promotes them — a pure-MMA probe with the
+  identical InlineArray accumulator pattern sustains 3.67 TFLOPS
+  (probe_mma_rate). Register PRESSURE (mechanism 1) is what's real.
+- Per-lane base pointers + comptime GEP offsets: precompute
+  `k_head + frow (+ (c+fcol)*D)` once per c-block so every fragment
+  load in the unrolled MMA nests is base + constant — no per-load
+  64-bit index math (the references do 32-bit `apply_offset` math).
+- Ablation probes lie under CSE: replacing MMA operands with
+  CONSTANTS lets the backend collapse identical MMA chains (a "no
+  K loads" arm measured 5.7x faster than physically possible).
+  Synthetic operands must vary per fragment AND stay cheap.
+- `barrier()` on Apple == `air.wg.barrier(2,1)` == ccv's only
+  barrier; `syncwarp()` == `simdgroup_barrier(mem_none)` (unused).
+- `std.math.exp2` lowers to `air.exp2.v2f32` — no fast-math needed.
+
+**PyTorch integration (2026-07-08)**: the kernel is packaged as
+`src/flash_attn_mojo/fwd_metal/` (mirrors `fwd_fa4/`: kernel.mojo,
+launch.mojo, variant.mojo, _jit.py, __init__.py). `flash_attn_func`
+routes MPS tensors to it (non-causal, no window/softcap,
+seqlen % 128 == 0, hd 64/128, MHA/GQA); everything else falls to the
+reference. Backward is the reference VJP (no Metal bwd kernel yet).
+Tests: `tests/test_metal.py` (13, all green), correctness ~3e-5 vs
+the fp32 reference. KEY BRIDGING FACT (verified two ways — raw
+UnsafePointer AND DeviceBuffer(owning=False) wrap): mojo's Metal
+runtime CANNOT bind torch's MPS buffers — separate allocators, no
+shared registry, so the CUDA-style zero-copy-over-data_ptr trick
+does NOT work on Metal (the kernel writes land nowhere). The wrapper
+therefore stages through mojo-owned Metal buffers (CPU round-trip).
+Consequence: the wrapper's end-to-end wall time carries ~40–65%
+staging overhead (per-call buffer alloc/free + torch↔mojo copies) —
+the KERNEL is at ccv parity (identical AIR / MMA count to the bench),
+the overhead is the torch/mojo Metal boundary. Copy-optimal
+integration (pooled buffers or a real zero-copy bridge) is the next
+integration task.
+
+**Next (v2 candidates)**: pooled/zero-copy PyTorch buffers (kill the
+staging overhead above); the S1024 dispatch-overhead bias (batch
+more dispatches per command buffer, or a persistent-grid variant);
+causal; bwd; bf16 (currently cast to fp16 in the wrapper); the
+(S,H,D) interleaved layout torch uses natively.
 
 ## Milestone M0 checklist (this ping) — ALL DONE
 

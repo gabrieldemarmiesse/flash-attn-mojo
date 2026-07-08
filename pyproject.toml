@@ -8,8 +8,14 @@ readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
     "torch>=2,<3",
-    "mojo-compiler==1.0.0b1",
-    "mojo-compiler-mojo-libs==1.0.0b1",
+    # linux (H100 lane) stays on 1.0.0b1 — the CUDA kernels' codegen is
+    # validated against it. darwin needs >=1.0.0b2: the 8x8 Apple-GPU
+    # simdgroup-matrix MMA SIGSEGVs the 1.0.0b1 compiler (fixed on
+    # modular main 2026-06-11, first released in 1.0.0b2).
+    "mojo-compiler==1.0.0b1 ; sys_platform == 'linux'",
+    "mojo-compiler-mojo-libs==1.0.0b1 ; sys_platform == 'linux'",
+    "mojo-compiler==1.0.0b2 ; sys_platform == 'darwin'",
+    "mojo-compiler-mojo-libs==1.0.0b2 ; sys_platform == 'darwin'",
     # Modular MAX kernel libraries — ships `layout.mojopkg` etc.; the
     # FA4 kernels import `layout.tensor_core_async` / `layout.tma_async`
     # from these.

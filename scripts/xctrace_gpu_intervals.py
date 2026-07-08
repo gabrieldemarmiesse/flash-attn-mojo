@@ -124,7 +124,66 @@ def _normalize_label(lbl: str) -> str:
     return lbl.strip() or "?"
 
 
-def _parse_intervals(xml: bytes, process: str):
+def steady_state_kernel_us(trace: str, process: str) -> float | None:
+    """True per-dispatch GPU kernel time (us), fragmentation-proof.
+
+    Matches the reference CLIs' protocol (min over dispatches of the
+    command-buffer gpuEnd-gpuStart) from the intervals table, robust
+    to the two ways that table lies:
+
+    1. FRAGMENTATION. A long dispatch is split into several intervals
+       when the DVFS clock transitions mid-dispatch (each interval is
+       a fraction of the real dispatch), so a naive median/min
+       under-reports long kernels. Fragmentation only ever *splits* a
+       dispatch — never merges two, since each dispatch is its own
+       compute encoder — so full un-fragmented dispatches form the
+       TOP cluster of the distribution and every fragment sits below
+       it. We keep only intervals >= 0.6x the max, discarding
+       fragments.
+    2. CONTENTION. Within the full-dispatch cluster, some dispatches
+       run long (WindowServer/other-process GPU contention, DVFS
+       jitter). The reference rejects these by taking the MIN over
+       dispatches; we take the min of the surviving cluster.
+
+    The clock used is whichever the GPU actually settled at — short
+    kernels never ramp past Medium (no clock locking exists on
+    macOS), which is fine: the references run at the same ambient
+    clock, so the comparison stays fair.
+
+    Returns None if no compute intervals are found. Raises
+    RuntimeError if the trace can't be exported (re-record).
+    """
+    xml = _export(trace, _INTERVALS)
+    windows = _clock_timeline(trace)
+    by_clock: dict[str, list[float]] = defaultdict(list)
+    for channel, raw_label, start_ns, ns in _parse_intervals(
+        xml, process, normalize=False
+    ):
+        if "compute" not in channel.lower() or "blit" in raw_label.lower():
+            continue
+        by_clock[_clock_at(windows, start_ns) or "?"].append(ns / 1e3)
+    if not by_clock:
+        return None
+    # Bucket by DVFS clock FIRST: a dispatch's duration depends on the
+    # clock it ran at, so mixing clocks (warmup ramp vs steady state)
+    # would compare apples to oranges. Take the highest clock the GPU
+    # settled at — that's where the references run too.
+    top = max(by_clock, key=lambda c: _CLOCK_RANK.get(c, -1))
+    durs = by_clock[top]
+    hi = max(durs)
+    below = [d for d in durs if d < 0.85 * hi]  # candidate fragments
+    if not below or min(below) >= 0.5 * hi:
+        # No fragmentation within this clock: every interval is a whole
+        # dispatch (the kernel fits inside one clock window). Best-case
+        # per the reference protocol = the min.
+        return min(durs)
+    # Fragmentation present: clean un-fragmented dispatches form the
+    # tight top cluster (>= 0.85x max); fragments sit well below.
+    # Median of the cluster — robust to a lone lopsided split.
+    return statistics.median([d for d in durs if d >= 0.85 * hi])
+
+
+def _parse_intervals(xml: bytes, process: str, normalize: bool = True):
     root = ET.fromstring(xml)
     resolve = _resolver(root)
     for row in root.iter("row"):
@@ -154,7 +213,8 @@ def _parse_intervals(xml: bytes, process: str):
             if k.tag == "start-time":
                 start_ns = int(resolve(k).text)
                 break
-        yield channel, _normalize_label(label), start_ns, int(durations[0].text)
+        out_label = _normalize_label(label) if normalize else label
+        yield channel, out_label, start_ns, int(durations[0].text)
 
 
 def main() -> None:
@@ -165,7 +225,21 @@ def main() -> None:
                     help="only rows whose process name contains this "
                          "(e.g. bench_mojo_metal); default: all processes")
     ap.add_argument("--label", default="", help="only encoder labels containing this")
+    ap.add_argument("--kernel-us", action="store_true",
+                    help="machine mode: print ONLY the steady-state per-dispatch "
+                         "GPU kernel time in us (fragmentation-proof; see "
+                         "steady_state_kernel_us) and nothing else")
     args = ap.parse_args()
+
+    if args.kernel_us:
+        try:
+            us = steady_state_kernel_us(args.trace, args.process)
+        except RuntimeError as e:
+            sys.exit(f"xctrace export failed (unfinalized trace? re-record): {e}")
+        if us is None:
+            sys.exit("no compute intervals")
+        print(f"{us:.2f}")
+        return
 
     try:
         xml = _export(args.trace, _INTERVALS)

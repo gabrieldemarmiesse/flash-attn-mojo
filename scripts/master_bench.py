@@ -14,9 +14,15 @@ GPU backend** and runs that backend's structured, high-information phases:
                        (hard gate), and does an independent wall-clock run.
     * Apple / Metal  — mojo vs metal-flash-attention (MFA) AND ccv, taking the
                        per-shape best of {MFA, ccv} as the empirical ceiling.
-                       Induced-max clock template, 3-way interleaved bench,
-                       compute roofline, an AIR op-mix diff, an optional xctrace
-                       recording, and a per-shape best-time regression ratchet.
+                       Induced-max clock template, 3-way interleaved bench, then
+                       (default on) an xctrace pass that recovers the mojo lane's
+                       TRUE per-dispatch GPU kernel time — the refs self-report
+                       command-buffer GPU time, so this makes the comparison
+                       kernel-to-kernel (mojo's wall-clock lane eats ~160 us/
+                       dispatch of enqueue overhead the refs don't). Plus a
+                       compute roofline, an AIR op-mix diff, and a per-shape
+                       best-time regression ratchet. Disable with
+                       --no-kernel-time.
     * AMD / ROCm     — mojo v0 vs CK-flash (Tri Dao's `flash_attn`, Composable
                        Kernel backend — the only AMD reference). Builds the mojo
                        kernel, benches vs CK (kernel-only via rocprofv3), dumps
@@ -951,6 +957,123 @@ def _mt_print_roofline_hints(rows) -> None:
                       f"best ref {r['baseline_tflops']:.0f} TFLOP/s = {pct:.0f}% of hw peak")
 
 
+# --- true GPU kernel time for the mojo lane (xctrace) --------------------
+# The reference CLIs self-report command-buffer GPU time (gpuEndTime -
+# gpuStartTime); the mojo lane can only wall-clock enqueue+sync, so it
+# eats ~160 us/dispatch of overhead the refs don't. To compare
+# kernel-to-kernel we recover the mojo lane's true per-dispatch GPU time
+# from an xctrace 'Metal System Trace' (the ONE thing on this toolchain
+# that sees per-encoder GPU intervals).
+
+_MT_KERNEL_TARGET_US = 1_200_000  # size each capture to ~1.2 s of GPU work
+                                  # so DVFS ramps to a stable top clock
+
+
+def _mt_capture_kernel_us(seq, head_dim, heads, wall_us, template) -> float | None:
+    """xctrace-record the mojo lane at one shape and return its true
+    steady-state per-dispatch GPU kernel time (us), or None on failure.
+
+    The capture is sized from the wall time so total GPU work ~1.2 s —
+    short shapes need hundreds of dispatches to make the GPU commit to
+    its top DVFS clock (else per-dispatch time is dominated by a low
+    ramp clock and over-reads). xctrace SIGSEGVs on finalize ~1/3 of
+    the time but writes the trace first, and its export intermittently
+    throws 'missing template' — both are retry-recoverable.
+    """
+    import tempfile
+    sys.path.insert(0, str(SCRIPTS))
+    from xctrace_gpu_intervals import steady_state_kernel_us
+
+    total = max(12, min(400, round(_MT_KERNEL_TARGET_US / max(wall_us, 1.0))))
+    disp = 4
+    iters = max(1, -(-total // disp))  # ceil
+    warmup = max(2, min(20, iters // 5))
+    binary = _mt_lane_binary("mojo")
+    argv = [str(binary), "--seq", str(seq), "--head-dim", str(head_dim),
+            "--heads", str(heads), "--iters", str(iters), "--warmup", str(warmup),
+            "--dispatches", str(disp)]
+    for _ in range(5):
+        trace = Path(tempfile.mkdtemp()) / "k.trace"
+        rec = ["xctrace", "record", "--template", template or MT_XCTRACE_TEMPLATE,
+               "--output", str(trace), "--launch", "--", *argv]
+        subprocess.run(rec, capture_output=True, text=True)
+        if not trace.exists():
+            continue
+        try:
+            us = steady_state_kernel_us(str(trace), binary.name)
+        except RuntimeError:
+            us = None
+        shutil.rmtree(trace.parent, ignore_errors=True)
+        if us:
+            return us
+    return None
+
+
+def mt_kernel_time(rows, heads, template, *, enabled: bool) -> None:
+    """Recover the mojo lane's true GPU kernel time per shape (default
+    on for metal) and print a kernel-to-kernel comparison table.
+
+    Augments each row in place: ``impls['mojo']['kernel_us']`` and
+    ``kernel_ratio_over_baseline`` (mojo kernel us / best-ref GPU us).
+    Falls back to the wall time for any shape whose capture fails,
+    flagged in the table.
+    """
+    section("(c2) true GPU kernel time — mojo lane via xctrace (refs "
+            "self-report GPU time)")
+    if not enabled:
+        skip("kernel-time", "--no-kernel-time (mojo column stays wall-clock)")
+        return
+    if shutil.which("xctrace") is None:
+        warn("xctrace not found (needs Xcode) — mojo column stays wall-clock")
+        return
+
+    hdr = (f"  {'shape':>13} | {'mojo kern':>10} | {'mojo wall':>10} | "
+           f"{'best ref':>10} | {'ref':>4} | {'kern ratio':>10} | verdict")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    any_ok = False
+    for row in rows:
+        im = row["impls"]
+        if "mojo" not in im:
+            continue
+        seq, head_dim = row["seq"], row["head_dim"]
+        wall_us = im["mojo"]["min_us"]
+        kern = _mt_capture_kernel_us(seq, head_dim, heads, wall_us, template)
+        base_impl = row.get("baseline_impl")
+        base_us = row.get("baseline_us")
+        shape_lbl = f"S{seq}/D{head_dim}"
+        if kern is None:
+            print(f"  {shape_lbl:>13} | {'FAILED':>10} | {wall_us:9.1f}u | "
+                  f"{(base_us or float('nan')):9.1f}u | {(base_impl or '?'):>4} | "
+                  f"{'(wall)':>10} | xctrace unavailable — using wall")
+            im["mojo"]["kernel_us"] = None
+            continue
+        any_ok = True
+        im["mojo"]["kernel_us"] = kern
+        if base_us:
+            ratio = kern / base_us
+            row["kernel_ratio_over_baseline"] = ratio
+            gap = abs(ratio - 1) * 100
+            if gap <= 3:
+                verdict = "parity"
+            elif ratio < 1:
+                verdict = f"{_GRN}FASTER{_RST}"
+            else:
+                verdict = f"{_RED}slower{_RST}"
+            ratio_s = f"{ratio:9.2f}x"
+        else:
+            ratio_s, verdict = "  n/a", "no ref"
+        print(f"  {shape_lbl:>13} | {kern:9.1f}u | {wall_us:9.1f}u | "
+              f"{(base_us or float('nan')):9.1f}u | {(base_impl or '?'):>4} | "
+              f"{ratio_s:>10} | {verdict}")
+    print("  " + "-" * (len(hdr) - 2))
+    if any_ok:
+        worst = max((r.get("kernel_ratio_over_baseline", 0.0) for r in rows),
+                    default=0.0)
+        print(f"  worst mojo-kernel/best-ref ratio: {worst:.2f}x  "
+              f"(true GPU time, both sides kernel-only)")
+
+
 def mt_profiler(impl, template, heads) -> None:
     if not impl:
         skip("(d) xctrace profile", "pass --profile <impl> to record one")
@@ -1026,11 +1149,13 @@ def _mt_agent_row(r: dict) -> dict:
         "fn": r["fn"], "seq": r["seq"], "heads": r["heads"], "head_dim": r["head_dim"],
         "dtype": r["dtype"],
         "mojo_us": _mt_num(im.get("mojo", {}).get("min_us")),
+        "mojo_kernel_us": _mt_num(im.get("mojo", {}).get("kernel_us")),
         "mfa_us": _mt_num(im.get("mfa", {}).get("min_us")),
         "ccv_us": _mt_num(im.get("ccv", {}).get("min_us")),
         "baseline_impl": r.get("baseline_impl"),
         "baseline_us": _mt_num(r.get("baseline_us")),
         "ratio_over_baseline": _mt_num(r.get("ratio_over_baseline")),
+        "kernel_ratio_over_baseline": _mt_num(r.get("kernel_ratio_over_baseline")),
         "ratio_over_mfa": _mt_num(r.get("ratio_over_mfa")),
         "ratio_over_ccv": _mt_num(r.get("ratio_over_ccv")),
         "mojo_tflops": _mt_num(im.get("mojo", {}).get("tflops")),
@@ -1087,6 +1212,10 @@ def run_metal(args) -> int:
     rows = mt_bench(bm, impls, shapes, args.heads or 16, dtype, rounds, iters,
                     args.dispatches, clock, gate=args.gate,
                     ratchet_refresh=args.refresh_baseline, jsonl=args.jsonl)
+
+    if "mojo" in impls:
+        mt_kernel_time(rows, args.heads or 16, template,
+                       enabled=not args.no_kernel_time)
 
     mt_profiler(args.profile, template, args.heads or 16)
     mt_introspect(shapes, refs, enabled=not args.no_asm)
@@ -1433,6 +1562,9 @@ def main() -> int:
     g.add_argument("--no-clean", action="store_true", help="[cuda] keep the JIT cache")
     g.add_argument("--no-build", action="store_true", help="[metal/rocm] skip binary rebuild")
     g.add_argument("--no-walltime", action="store_true", help="[cuda] skip wall-clock phase")
+    g.add_argument("--no-kernel-time", action="store_true",
+                   help="[metal] skip the xctrace mojo-kernel-time phase "
+                        "(default on; the mojo column stays wall-clock)")
 
     g = p.add_argument_group("gating")
     g.add_argument("--no-gate", action="store_true", help="[cuda] report a SLOWER shape, don't fail")
