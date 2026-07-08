@@ -5,18 +5,21 @@
 #   1. recompile the mojo v0 forward kernel from source
 #      (bench/bench_mojo_rocm.mojo -> bench/build/bench_mojo_rocm);
 #   2. run the mojo v0 (fp32 CPU correctness check + wall-clock time)
-#      and the torch reference (kernel-only device time via roctracer,
-#      the CUPTI analog) interleaved on one shape, print both + ratio;
+#      and the CK reference (kernel-only device time via roctracer,
+#      the CUPTI analog) on one shape, print both + ratio;
 #   3. copy the mojo kernel's AMDGCN ISA dump (the PTX analog, written
 #      by dump_asm on every run) into asm/;
 #   4. print the GCN instruction-mix + resource footprint of the mojo
 #      kernel (spills, LDS, matrix-op count — the canaries);
-#   5. (unless --no-prof) re-time BOTH kernels under rocprofv3 for an
-#      apples-to-apples kernel-only comparison (the ncu-stats analog).
+#   5. (unless --no-prof) re-time the mojo kernel under rocprofv3 for a
+#      kernel-only number + launch resources (the ncu-stats analog).
 #
-# There is no FlashAttention-4 / CuTe on AMD, so the reference is
-# PyTorch fused SDPA (ROCm routes fp16 SDPA through its AOTriton/CK
-# flash-attention backend), or `flash_attn` if installed (--impl flash).
+# There is no FlashAttention-4 / CuTe on AMD, so the reference baseline is
+# Tri Dao's `flash_attn` built with the Composable Kernel (CK) backend —
+# the fastest attention kernel on this MI300X (it beat both PyTorch SDPA
+# and the AMD Triton FA2 backend; see scripts/README.md for that
+# comparison). CK is the ONLY reference here: if `flash_attn` is not
+# installed the harness errors out (build it per scripts/README.md).
 # The mojo lane is v0 — a hand-vectorized SIMD kernel that does NOT use
 # the CDNA matrix cores yet, so expect it far behind the reference; this
 # harness is the M0 milestone (correctness + measurement plumbing), the
@@ -30,8 +33,7 @@
 #
 # Usage:
 #   scripts/master_bench_rocm.sh [--seq N] [--head-dim 64|128]
-#       [--heads N] [--batch N] [--iters N] [--impl sdpa|flash]
-#       [--quick] [--no-prof]
+#       [--heads N] [--batch N] [--iters N] [--quick] [--no-prof]
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,7 +44,6 @@ HDIM=128
 HEADS=16
 BATCH=1
 ITERS=20
-IMPL=sdpa
 PROF=1
 QUICK=0
 
@@ -53,7 +54,6 @@ while [[ $# -gt 0 ]]; do
         --heads) HEADS="$2"; shift 2 ;;
         --batch) BATCH="$2"; shift 2 ;;
         --iters) ITERS="$2"; shift 2 ;;
-        --impl) IMPL="$2"; shift 2 ;;
         --quick) QUICK=1; shift ;;
         --no-prof) PROF=0; shift ;;
         -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -78,10 +78,17 @@ step "2. mojo v0 ($SEQ x $HEADS x $HDIM): run + fp32 correctness"
 MOJO_JSON="$("$MOJO_BIN" --seq "$SEQ" --head-dim "$HDIM" --heads "$HEADS" \
     --iters "$ITERS" --check | tee /dev/stderr | grep '^{')"
 
-step "2b. torch reference ($IMPL): kernel-only bench + correctness"
-REF_RESULT="$("$UV_PY" scripts/bench_rocm.py --impl "$IMPL" \
+step "2b. CK reference (kernel-only): bench + correctness"
+# CK-flash is the only reference baseline. Require it — error out (do not
+# fall back) if flash_attn is not installed.
+if ! "$UV_PY" -c "import flash_attn" 2>/dev/null; then
+    echo "[master_bench_rocm] ERROR: flash_attn (Composable Kernel backend) is not installed." >&2
+    echo "  CK is the required reference baseline — build it per scripts/README.md." >&2
+    exit 1
+fi
+REF_RESULT="$("$UV_PY" scripts/bench_rocm.py \
     --batch "$BATCH" --seq "$SEQ" --heads "$HEADS" --head-dim "$HDIM" \
-    --iters "$ITERS" --check 2>/dev/null | tee /dev/stderr | grep '^RESULT')"
+    --iters "$ITERS" --check | tee /dev/stderr | grep '^RESULT')"
 
 # ---------------------------------------------------------------- 3
 step "3. AMDGCN ISA dump -> asm/"
@@ -151,7 +158,7 @@ if mojo_csv:
     except Exception:
         pass
 
-print(f"reference (kernel-only):   {ref_us:8.1f} us")
+print(f"reference CK (kernel-only): {ref_us:8.1f} us")
 if err is not None:
     print(f"mojo v0   (wall-clock):    {mojo_wall:8.1f} us   "
           f"(fp32 max_err={err:.2e})")
