@@ -12,6 +12,7 @@ import os
 from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 
 from flash_attn_mojo._jit_common import compile_and_load, detect_gpu_backend
 
@@ -23,18 +24,29 @@ _DTYPE_NAME = {0: "fp16", 2: "fp32"}
 _DTYPE_DEFINE = {0: "float16", 2: "float32"}
 
 
-def call_fwd_metal(args: tuple) -> None:
+def call_fwd_metal(
+    args: tuple, pre_dispatch: Optional[Callable[[], None]] = None
+) -> None:
     """JIT-compile (if needed) and dispatch a single fwd call.
 
-    ``args`` layout (see ``fwd_metal/__init__.py::native_fwd_metal``):
-        0..4   q_host, k_host, v_host, o_host, lse_host  (CPU ptrs)
+    ``args`` layout (see ``fwd_metal/__init__.py::fa_metal_fwd``):
+        0..4   q, k, v, o, lse  (Metal GPU VAs of torch MPS tensors)
         5..7   batch, seqlen, nheads
         8      softmax_scale
         9      dtype_code  (comptime)
         10     head_dim    (comptime)
     ``ctx_handle`` is appended as index 11 by this dispatcher.
+
+    ``pre_dispatch`` runs after the (possibly seconds-long, first-call)
+    JIT compile and immediately before the kernel launch — the MPS path
+    uses it to revive the argument tensors' MTLHeaps inside the driver's
+    ~1 s residency window and flush torch's staging writes (see
+    ``_mps.revive_heaps``); doing it any earlier would let a slow compile
+    re-idle the heaps.
     """
     variant_fn, ctx_handle = _get_variant_fn(_config_from_args(args))
+    if pre_dispatch is not None:
+        pre_dispatch()
     variant_fn(*args, ctx_handle)
 
 

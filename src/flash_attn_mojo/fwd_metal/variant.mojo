@@ -28,11 +28,14 @@ def flash_attn_fwd_metal_variant(
     mut py_self: PythonObject,
     mut args: PythonObject,
 ) raises -> PythonObject:
-    var q_host: Int = Int(py=args[0])
-    var k_host: Int = Int(py=args[1])
-    var v_host: Int = Int(py=args[2])
-    var o_host: Int = Int(py=args[3])
-    var lse_host: Int = Int(py=args[4])
+    # The five pointer args are Metal GPU virtual addresses of torch's
+    # own MPS tensors (extracted host-side — see `_mps.py`), bound
+    # zero-copy; not CPU pointers.
+    var q_addr: Int = Int(py=args[0])
+    var k_addr: Int = Int(py=args[1])
+    var v_addr: Int = Int(py=args[2])
+    var o_addr: Int = Int(py=args[3])
+    var lse_addr: Int = Int(py=args[4])
     var batch: Int = Int(py=args[5])
     var seqlen: Int = Int(py=args[6])
     var nheads: Int = Int(py=args[7])
@@ -48,11 +51,11 @@ def flash_attn_fwd_metal_variant(
         seqlen,
         nheads,
         softmax_scale,
-        q_host,
-        k_host,
-        v_host,
-        o_host,
-        lse_host,
+        q_addr,
+        k_addr,
+        v_addr,
+        o_addr,
+        lse_addr,
         ctx_handle_addr,
     )
     return PythonObject(None)

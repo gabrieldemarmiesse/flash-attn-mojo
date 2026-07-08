@@ -269,24 +269,40 @@ routes MPS tensors to it (non-causal, no window/softcap,
 seqlen % 128 == 0, hd 64/128, MHA/GQA); everything else falls to the
 reference. Backward is the reference VJP (no Metal bwd kernel yet).
 Tests: `tests/test_metal.py` (13, all green), correctness ~3e-5 vs
-the fp32 reference. KEY BRIDGING FACT (verified two ways — raw
-UnsafePointer AND DeviceBuffer(owning=False) wrap): mojo's Metal
-runtime CANNOT bind torch's MPS buffers — separate allocators, no
-shared registry, so the CUDA-style zero-copy-over-data_ptr trick
-does NOT work on Metal (the kernel writes land nowhere). The wrapper
-therefore stages through mojo-owned Metal buffers (CPU round-trip).
-Consequence: the wrapper's end-to-end wall time carries ~40–65%
-staging overhead (per-call buffer alloc/free + torch↔mojo copies) —
-the KERNEL is at ccv parity (identical AIR / MMA count to the bench),
-the overhead is the torch/mojo Metal boundary. Copy-optimal
-integration (pooled buffers or a real zero-copy bridge) is the next
-integration task.
+the fp32 reference.
 
-**Next (v2 candidates)**: pooled/zero-copy PyTorch buffers (kill the
-staging overhead above); the S1024 dispatch-overhead bias (batch
-more dispatches per command buffer, or a persistent-grid variant);
-causal; bwd; bf16 (currently cast to fp16 in the wrapper); the
-(S,H,D) interleaved layout torch uses natively.
+**ZERO-COPY bridge (2026-07-08, SUPERSEDES the old "impossible"
+note)**: the wrapper now binds torch's OWN MPS buffers, no host
+round-trip. THE EARLIER CLAIM WAS WRONG — it said mojo "CANNOT bind
+torch's MPS buffers (verified two ways: raw UnsafePointer AND
+DeviceBuffer(owning=False))", but both tests bound `tensor.data_ptr()`,
+which on MPS is the `id<MTLBuffer>` Obj-C OBJECT pointer, not the GPU
+VA (Mojo dereferenced garbage), and neither made the foreign heap
+resident (Mojo skips `useResource:` for buffers it didn't allocate, so
+macOS-evicted heaps read zeros / drop writes — the "writes land
+nowhere" symptom). Two missing pieces, both ported from the sibling
+`causal-conv1d-mojo` repo (which runs this in CI): (1) `_mps.py`
+extracts the real VA via the `gpuAddress` Obj-C selector
+(`[MTLBuffer gpuAddress] + storage_offset`); (2) `_mps.revive_heaps`
+touches each tensor with a tiny torch GPU op right before dispatch
+(post-JIT-compile, via a `pre_dispatch` hook in `_jit.py`) +
+`torch.mps.synchronize()`. The launcher (`launch.mojo`) wraps the five
+VAs as plain device pointers and `enqueue_function`s them directly —
+the mojo-owned staging buffers and the `enqueue_copy_from/to` are gone.
+The ONE residual copy is an on-DEVICE cast+transpose to head-major fp16
+(the kernel's fixed `head*seq*D` indexing) — bandwidth-bound on unified
+memory, not a host round-trip. Measured end-to-end wall (B1 H16, per-call
+sync, median): S1024/D128 9.82 ms → 4.46 ms (2.2x); S4096/D128 60.7 ms
+→ 41.9 ms (1.45x; overhead over the ~36.9 ms kernel dropped from ~63%
+to ~13%); S1024/D64 5.01 → 4.02 ms. Kernel AIR is byte-identical
+(untouched), so ccv kernel parity is unaffected. Debug env:
+`FLASH_ATTN_MOJO_MPS_REVIVE=always|off`.
+
+**Next (v2 candidates)**: fold torch's native (B,S,H,D) strided layout
+INTO the kernel (kills the residual on-device transpose above — the
+last non-kernel cost); the S1024 dispatch-overhead bias (batch more
+dispatches per command buffer, or a persistent-grid variant); causal;
+bwd; bf16 (currently cast to fp16 in the wrapper).
 
 ## Milestone M0 checklist (this ping) — ALL DONE
 

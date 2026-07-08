@@ -3,23 +3,25 @@
 The kernel (``kernel.mojo``) is at ccv/metal-flash-attention kernel
 parity on M1–M4 (see METAL_PLAN.md). This wrapper bridges torch to it.
 
-Bridging note: mojo's Metal runtime cannot bind torch's MPS buffers
-(separate allocators; no shared registry — verified), so unlike the
-CUDA path this does NOT run zero-copy over torch's device pointers.
-Inputs are staged on CPU (contiguous fp16, head-major) and the mojo
-launcher copies them through its own Metal buffers. The KERNEL is at
-ccv/MFA parity (see METAL_PLAN.md), but this wrapper's end-to-end
-wall time currently carries substantial staging overhead (~40–65% on
-top of the kernel at S=1k–8k): per-call Metal buffer alloc/free plus
-the torch↔mojo copy round-trips. Reaching the bench's kernel-only
-speed from PyTorch needs a zero-copy buffer bridge (or at least
-pooled, reused Metal buffers) — tracked as a follow-up. Correctness
-and the fast kernel are done; the wrapper is functional, not yet
-copy-optimal.
+Bridging: ZERO-COPY over torch's own MPS buffers (the CUDA path's
+model). The inputs are laid out head-major fp16 *on the MPS device*
+(cast + GQA-expand + transpose + contiguous — all torch MPS ops), the
+outputs are allocated as MPS tensors, and the mojo launcher binds every
+buffer's Metal GPU virtual address directly (extracted via the
+``gpuAddress`` selector — see ``_mps.py``). No host round-trip, no
+mojo-owned staging buffers. Before dispatch we revive the tensors'
+MTLHeaps and ``torch.mps.synchronize()`` (see ``_mps.revive_heaps``:
+mojo doesn't declare foreign buffers to its encoder, and macOS evicts
+idle heaps). The only residual copy is the on-device layout transform
+the kernel's fixed head-major indexing requires — bandwidth-bound on
+unified memory, ~1000x cheaper than the old CPU round-trip. (An earlier
+note here claimed zero-copy was impossible; it wasn't — the missing
+pieces were the VA extraction and heap revival. The sibling
+``causal-conv1d-mojo`` repo runs the same bridge in CI.)
 
 Envelope: fp16/bf16 q/k/v (computed in fp16), head_dim in {64, 128},
 seqlen % 128 == 0, MHA or GQA (Hq % Hkv == 0; GQA is expanded to MHA
-host-side). fp32 O out; fp32 natural-log LSE.
+on-device). fp32 O out; fp32 natural-log LSE.
 """
 
 from __future__ import annotations
@@ -63,15 +65,18 @@ def fa_metal_fwd(
     assert v.shape == k.shape
     assert nheads % nheads_kv == 0, "Hq must be a multiple of Hkv"
 
-    # Stage on CPU, fp16, head-major (B, H, S, D) contiguous — the
-    # layout the kernel indexes (head = b*Hq + h, per-head (S, D) slab).
-    # GQA is expanded to MHA here (cheap; the kernel stays MHA-only).
+    # Stage ON THE MPS DEVICE (no CPU round-trip): fp16, head-major
+    # (B, H, S, D) contiguous — the layout the kernel indexes
+    # (head = b*Hq + h, per-head (S, D) slab). GQA is expanded to MHA
+    # here (cheap; the kernel stays MHA-only). These are torch MPS ops,
+    # so the results live in torch's MPS allocator and we hand the
+    # kernel their Metal GPU VAs (zero-copy).
     def _stage(t: torch.Tensor, heads: int) -> torch.Tensor:
         if heads != nheads:
             t = t.repeat_interleave(nheads // heads, dim=2)
         return (
             t.detach()
-            .to(device="cpu", dtype=torch.float16)
+            .to(dtype=torch.float16)  # stays on q.device (mps)
             .transpose(1, 2)
             .contiguous()
         )
@@ -80,37 +85,52 @@ def fa_metal_fwd(
     k_h = _stage(k, nheads_kv)
     v_h = _stage(v, nheads_kv)
     o_h = torch.empty(
-        (batch, nheads, seqlen, head_dim), dtype=torch.float32
+        (batch, nheads, seqlen, head_dim),
+        dtype=torch.float32,
+        device=q.device,
     )
     lse_h = torch.empty(
-        (batch, nheads, seqlen), dtype=torch.float32
+        (batch, nheads, seqlen), dtype=torch.float32, device=q.device
     )
 
+    from flash_attn_mojo._mps import gpu_address, revive_heaps
     from flash_attn_mojo.fwd_metal._jit import call_fwd_metal
+
+    def _pre_dispatch() -> None:
+        # Runs post-JIT-compile, right before the launch: make every
+        # argument tensor's MTLHeap resident (macOS evicts idle GPU
+        # memory after ~1 s, and mojo doesn't declare foreign buffers
+        # to its encoder — see _mps.revive_heaps), then flush torch's
+        # queue so the staging writes above land before the kernel reads
+        # them (and O/LSE are resident for the kernel's writes).
+        revive_heaps(q_h, k_h, v_h, o_h, lse_h)
+        torch.mps.synchronize()
 
     call_fwd_metal(
         (
-            q_h.data_ptr(),
-            k_h.data_ptr(),
-            v_h.data_ptr(),
-            o_h.data_ptr(),
-            lse_h.data_ptr(),
+            gpu_address(q_h),
+            gpu_address(k_h),
+            gpu_address(v_h),
+            gpu_address(o_h),
+            gpu_address(lse_h),
             batch,
             seqlen,
             nheads,
             float(softmax_scale),
             _DTYPE_CODE_FP16,
             head_dim,
-        )
+        ),
+        pre_dispatch=_pre_dispatch,
     )
-    # Keep the staged host tensors alive until the kernel + copybacks
-    # finish (call_fwd_metal synchronizes internally).
-    _ = (q_h, k_h, v_h)
+    # Keep the staged tensors alive until the kernel finishes (their
+    # MTLBuffers back the VAs the kernel is using; call_fwd_metal
+    # synchronizes the mojo queue internally before returning).
+    _ = (q_h, k_h, v_h, o_h, lse_h)
 
     out = (
         o_h.transpose(1, 2)  # (B, S, H, D)
         .contiguous()
-        .to(device=q.device, dtype=q.dtype)
+        .to(dtype=q.dtype)  # stays on mps
     )
-    lse = lse_h.to(device=q.device)
+    lse = lse_h  # (B, H, S) fp32, on mps
     return out, lse
