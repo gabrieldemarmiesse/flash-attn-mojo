@@ -88,12 +88,14 @@ references (expected — see "The v1 fight" below).
 
 ## The harness (all committed, all working)
 
-- `scripts/master_bench_metal.sh [--quick|--full] [--impls ...]
-  [--profile IMPL] [--no-diff]` — builds the three lanes, runs the
-  correctness gate (S=1024, H=16, D=64+128, strided-row fp32/f64 CPU
-  references in each CLI), the interleaved bench matrix, refreshes
-  `air/` from the mojo dump, prints AIR op-mix diffs vs
-  `reference_air/`, and optionally wraps a run in xctrace.
+- `scripts/master_bench.py [--full] [--impls ...] [--profile IMPL]
+  [--no-asm]` — auto-detects the Metal backend on darwin (quick tier
+  by default; `--full` for the full shape sweep), builds the three
+  lanes, runs the correctness gate (S=1024, H=16, D=64+128,
+  strided-row fp32/f64 CPU references in each CLI), the interleaved
+  bench matrix, refreshes `air/` from the mojo dump, prints AIR
+  op-mix diffs vs `reference_air/`, and optionally wraps a run in
+  xctrace.
 - `scripts/bench_metal.py` — the process-interleaved orchestrator
   (per-round round-robin; pooled trials; min/median/spread/GFLOPS;
   `vs mfa` / `vs ccv` ratio columns, <1 = mojo faster, FA4-race
@@ -174,7 +176,7 @@ broadcasts), ~3000 scalar-vector ops. The path:
    staging if/when exposed (or plain loads — M4 has no real async
    copy in mojo anyway; MFA still hits 3.5 TFLOPS with it, so the
    copies are not the moat — the MMAs are).
-3. Iterate with `master_bench_metal.sh` + AIR op-mix diff per edit,
+3. Iterate with `master_bench.py` + AIR op-mix diff per edit,
    exactly like the PTX workflow. Watch `alloca` in the mojo AIR as
    the spill-canary stand-in.
 
@@ -189,7 +191,7 @@ risky (that intrinsic path is what SIGSEGVs), so toy-probe first.
 3. ☑ `reference_air/` populated (MSL + AIR + README + targets)
 4. ☑ both reference CLIs build & run with JSON timing output
 5. ☑ mojo v0 fwd kernel correct (3e-8) at all canonical shapes
-6. ☑ `master_bench_metal.sh` end-to-end: gate + interleaved 3-way
+6. ☑ `master_bench.py` end-to-end: gate + interleaved 3-way
    table + AIR dump + op-mix diff + `--profile` xctrace hook
 7. ☑ profiling-tools writeup (analogy-map table above)
 

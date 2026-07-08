@@ -11,7 +11,7 @@ The Mojo lane is the standalone bench/bench_mojo_rocm.mojo binary
 (wall-clock timed, its own JSON) — this script measures ONLY the CK
 reference, kernel-only via torch.profiler (roctracer on ROCm, the CUPTI
 analog), and prints a machine-parseable RESULT line matching
-bench_fa4.py's format so master_bench_rocm.sh can diff the two.
+bench_fa4.py's format so master_bench.py can diff the two.
 
 Usage:
     uv run python scripts/bench_rocm.py --seq 4096 --heads 16 \

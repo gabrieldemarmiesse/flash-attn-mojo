@@ -3,7 +3,7 @@
 Committed AIR (Apple IR — LLVM bitcode, the deepest public artifact;
 there is no SASS analog on Apple GPUs) + generated MSL sources for the
 two reference forward-attention implementations, plus the bench CLI
-wrappers `scripts/master_bench_metal.sh` shells out to.
+binaries that `scripts/master_bench.py` builds and runs.
 
 Everything below was generated/measured on the canonical machine:
 Apple M4 Mac mini (10-core GPU, 16 GB), macOS 26.3.2, Xcode 26 with

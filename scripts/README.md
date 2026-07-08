@@ -6,29 +6,45 @@ target — see `HANDOFF.md` for the per-shape gap vs upstream FA3.
 
 ## The one-command perf gate: `master_bench.py`
 
-`scripts/master_bench.py` is the high-information, autonomous perf gate —
-run it after any kernel edit and read the summary. One invocation locks
-the GPU clocks (hard gate), clears the JIT cache + runs correctness,
-benches mojo vs FA4 with a per-shape ratio table (ratio | run-to-run
-spread | verdict) and a compute (tensor-core) roofline (achieved TFLOP/s,
-% of peak, regime + hint), captures an ncu metrics summary for both
-kernels side by side, dumps the mojo PTX, diffs its instruction mix vs
-the committed FA4 reference, runs the ptxas spill canary (hard gate), and
-does an independent wall-clock run. It ends with a machine-readable
-`===AGENT-SUMMARY===` JSON block and a non-zero exit on any gate failure.
+`scripts/master_bench.py` is **the single, high-information, autonomous perf
+gate — the one script an agent runs to see how to improve performance.** It
+**auto-detects the GPU backend** and runs that backend's phases, ending with a
+machine-readable `===AGENT-SUMMARY===` JSON block and a non-zero exit on any
+gate failure. (It fuses the former per-backend coordinators — the CUDA
+`master_bench.py`, the Apple `master_bench_metal.py`, and the ROCm
+`master_bench_rocm.sh` — into one entry point.)
+
+Backend selection (`--device {auto,cuda,rocm,metal,cpu}`, default `auto`):
+
+| detected | how                                   | races                          |
+|----------|---------------------------------------|--------------------------------|
+| `cuda`   | `nvidia-smi` returns a device         | mojo vs FlashAttention-4       |
+| `metal`  | `sys.platform == "darwin"`            | mojo vs best-of {MFA, ccv}     |
+| `rocm`   | torch probe reports a HIP device      | mojo v0 vs CK-flash            |
+| `cpu`    | `--device cpu` (or no GPU found)      | *no race* — reference smoke    |
+
+Each backend's phases are detailed in the per-backend sections below. The
+**CUDA** path is the richest (the full FA4 parity race + envelope: bwd, causal,
+GQA, varlen, window, softcap, fp16, hdim64); **metal** and **rocm** are the v0
+forward-only MMA fights; **cpu** has no kernel (the public op falls through to
+the pure-PyTorch reference) so it is a correctness smoke-check plus a naive
+reference wall-clock, *not* a perf race.
 
 ```bash
-scripts/master_bench.py                   # canonical dense fwd (flash_attn_func)
-scripts/master_bench.py --kind bwd        # backward kernels
-scripts/master_bench.py --causal --hkv 4  # causal GQA; also --varlen/--window/--softcap
-scripts/master_bench.py --full            # multi-shape sweep
-scripts/master_bench.py --no-ncu --no-asm # timing-only fast loop
-scripts/master_bench.py --no-lock --no-clean  # dev loop (keep JIT cache)
+scripts/master_bench.py                    # auto-detect; canonical dense fwd
+scripts/master_bench.py --device cpu       # CPU reference correctness + latency
+scripts/master_bench.py --kind bwd         # [cuda] backward kernels
+scripts/master_bench.py --causal --hkv 4   # [cuda] causal GQA; also --varlen/--window/--softcap
+scripts/master_bench.py --full             # multi-shape sweep (all backends)
+scripts/master_bench.py --seq 4096 --head-dim 128  # [metal/rocm] one shape
+scripts/master_bench.py --no-prof --no-asm # timing-only fast loop
+scripts/master_bench.py --no-lock --no-clean       # [cuda] dev loop (keep JIT cache)
 ```
 
-The older `master_bench.sh` is the original bash coordinator (fwd/bwd PTX
-diff + ncu side-by-side); `master_bench.py` supersedes it with the richer
-tables, roofline, spread verdicts, and agent summary.
+The older `master_bench.sh` is retained only as the FA4 **reference-PTX
+regeneration** utility (`--refresh-fa4-ptx`, see `reference_ptx/README.md`); it
+is not a bench coordinator an agent needs — `master_bench.py` supersedes it for
+all timing/correctness/profiling.
 
 ## Quick start
 
@@ -118,9 +134,77 @@ scripts/profile_summary.sh /tmp/bwd_main_prof.ncu-rep
 For source-level drill-down, copy the report off-box and open in
 `ncu-ui` locally — the CLI can't render the source view.
 
-## ROCm / AMD (MI300X) lane — `master_bench_rocm.sh`
+## Apple / Metal backend (`--device metal`, auto-detected on darwin)
 
-The AMD analog of `master_bench.sh`, for the CDNA (gfx942) race. There is
+The Metal forward-attention race. Unlike NVIDIA (one mojo kernel vs Tri Dao's
+CUDA baseline) and unlike ccv's Apple path (mojo-only — "upstream is CUDA-only,
+nothing to diff"), this machine has **two** hand-tuned references —
+`philipturner/metal-flash-attention` (MFA) and ccv's C++ MFA port — so the
+harness runs the full **3-way** comparison and takes the **per-shape best of
+{MFA, ccv} as the baseline** (the empirical ceiling). ccv is the faster
+reference at the shapes measured (~3.65-3.73 TFLOP/s vs MFA's ~2.6-2.9), so the
+baseline is usually ccv.
+
+`master_bench.py` runs these ccv-style phases on Metal and ends with a
+machine-readable `===AGENT-SUMMARY===` JSON block:
+
+- **(a) clock lock** — macOS has no clock-lock CLI, so this binary-patches a
+  copy of Instruments' *Metal System Trace* template to force *Induced GPU
+  Performance State = Maximum* (`_apple_gpu_clock_lock.py`). It applies to the
+  (d) xctrace recording (verified: the profiler records at `Maximum` clock);
+  the (c) bench self-times outside xctrace, so it is auxiliary there — drift is
+  cancelled by interleaving instead. `--no-lock` opts out.
+- **(b) correctness** — each lane's built-in fp32-reference `--check` at small
+  shapes (hard gate; a broken softmax/mask shows at ≥1e-2).
+- **(c) kernel bench** — interleaved 3-way; per-shape table of mojo / mfa / ccv
+  µs, baseline = best(mfa,ccv), ratio, spread, achieved TFLOP/s, % of the
+  ceiling, verdict + a compute-roofline hint. Attention is matmul-bound, so the
+  best reference is the empirical ceiling. **The ratio is reported, not gated**
+  (mojo is not expected to beat the MMA references during the v1 fight); the
+  regression gate is a **ratchet** on mojo's own best per-shape time (under
+  `--gate`, persisted in `scripts/baselines/` — gitignored, per-machine).
+- **(d) profiler** (`--profile IMPL`) — one xctrace *Metal System Trace*
+  recording at induced-max clock → per-encoder GPU intervals + Active/Idle
+  **duty cycle** (a duty <40% flags launch/sync-bound; the v0 mojo kernel reads
+  ~92% active = genuinely compute-bound). xctrace SIGSEGVs on finalize ~1 in 3;
+  the harness retries and accepts the first parseable trace. HW counters
+  (ALU%, occupancy, bandwidth) are GUI-only on Apple.
+- **(e) introspection** — refreshes the mojo kernel's **AIR** dump and diffs its
+  op-mix vs the committed MFA/ccv reference AIR (`air_opmix.py`; the Apple analog
+  of the PTX histogram — `call air.simdgroup_matrix_8x8_*` = the HGMMA count;
+  v0 has **zero** matrix ops, 128 `simd_shuffle` + 128 `convert` instead).
+
+```bash
+scripts/master_bench.py                       # quick tier (S∈{1024,4096}, D=128)
+scripts/master_bench.py --full                # full sweep (adds S=8192 and D=64)
+scripts/master_bench.py --seq 4096 --head-dim 128   # one shape
+scripts/master_bench.py --gate                # fail on a mojo ratchet regression
+scripts/master_bench.py --profile mojo        # + xctrace GPU intervals / duty
+scripts/master_bench.py --no-build --no-asm   # fast dev loop
+```
+
+(On darwin these run automatically; pass `--device metal` to force it.)
+
+Supporting scripts:
+
+- `bench_metal.py` — the process-interleaved 3-way runner (mojo/MFA/ccv CLIs
+  round-robin, pooled trials, min/median/spread/GFLOPS). Usable standalone for
+  a single shape; `master_bench.py` calls its `bench_shape()` for the
+  structured tables. See METAL_PLAN.md for the CLI contract and the timing fine
+  print (mojo lane is wall-clock around enqueue+sync; refs are command-buffer
+  GPU time — a conservative bias against mojo, <1% at canonical shapes).
+- `_apple_gpu_clock_lock.py` — the induced-max template patcher (raw
+  NSKeyedArchiver bplist patch; content-addressed cache under
+  `~/.cache/flash_attn_mojo/`). Run standalone to print the template path.
+- `xctrace_gpu_intervals.py` — robust `metal-gpu-intervals` parser (id/ref
+  value-dictionary resolver, first-duration = GPU time, process filter, clock
+  tagging, duty cycle). The scriptable subset of a Metal System Trace.
+- `air_opmix.py` — AIR instruction-mix histogram / diff (the SASS/PTX op-mix
+  analog); `xcrun metal-objdump -d` for .air, textual .ll passthrough.
+
+## ROCm / AMD backend (`--device rocm`, auto-detected via a torch HIP probe)
+
+The CDNA (gfx942) race. There is
 no FlashAttention-4 / CuTe on AMD, so the reference baseline is
 **CK-flash** — Tri Dao's `flash_attn` built with the **Composable Kernel**
 backend (the default ROCm backend of the flash-attention repo). It is the
@@ -151,7 +235,7 @@ The mojo lane is **v0** —
 (MFMA) yet, so it is far behind the reference. This is the M0 milestone
 (correctness + measurement plumbing), the analog of the Metal race's M0.
 
-One invocation mirrors the five master-bench steps:
+`master_bench.py` mirrors the five master-bench steps on ROCm:
 
 1. recompile the mojo v0 kernel from source;
 2. run mojo v0 (fp32 CPU correctness + wall-clock time) and the CK
@@ -165,11 +249,13 @@ One invocation mirrors the five master-bench steps:
    launch resources (`rocprof_summary.py`, the ncu-stats analog).
 
 ```bash
-scripts/master_bench_rocm.sh                 # default 4096 x 16 x D128
-scripts/master_bench_rocm.sh --quick         # small shape, fast
-scripts/master_bench_rocm.sh --head-dim 64   # D=64 variant
-scripts/master_bench_rocm.sh --no-prof       # skip the rocprofv3 step
+scripts/master_bench.py                      # auto-detects rocm; default 4096 x 16 x D128
+scripts/master_bench.py --quick              # small shape, fast
+scripts/master_bench.py --head-dim 64        # D=64 variant
+scripts/master_bench.py --no-prof            # skip the rocprofv3 step
 ```
+
+(Pass `--device rocm` to force it if the torch probe is ambiguous.)
 
 Supporting scripts:
 

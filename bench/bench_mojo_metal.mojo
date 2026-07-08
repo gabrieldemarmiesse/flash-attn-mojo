@@ -23,7 +23,7 @@
 # canonical multi-head shapes (>= 2 ms/iteration).
 #
 # AIR dump: every run rewrites /tmp/mojo_fwd_metal_d{64,128}.air.ll
-# (textual AIR LLVM IR, the Metal PTX analog); master_bench_metal.sh
+# (textual AIR LLVM IR, the Metal PTX analog); master_bench.py (metal)
 # copies it into air/ and runs the op-mix diff vs reference_air/.
 
 from std.gpu import barrier, block_idx, lane_id, thread_idx
