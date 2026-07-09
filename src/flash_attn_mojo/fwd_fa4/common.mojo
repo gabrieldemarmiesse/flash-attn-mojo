@@ -12,26 +12,26 @@ keep the original kernels' PTX byte-identical.
 """
 
 
-fn kFa4BlockM(head_dim: Int) -> Int:
+def kFa4BlockM(head_dim: Int) -> Int:
     return 192 if head_dim == 64 else 128
 
 
 comptime kFa4BlockN: Int = 128
 
 
-fn kFa4NMmaWarpgroups(head_dim: Int) -> Int:
+def kFa4NMmaWarpgroups(head_dim: Int) -> Int:
     return 3 if head_dim == 64 else 2
 
 
-fn kFa4NThreads(head_dim: Int) -> Int:
+def kFa4NThreads(head_dim: Int) -> Int:
     return (kFa4NMmaWarpgroups(head_dim) + 1) * 128
 
 
-fn kFa4ProducerRegs(head_dim: Int) -> Int:
+def kFa4ProducerRegs(head_dim: Int) -> Int:
     return 32 if head_dim == 64 else 24
 
 
-fn kFa4ConsumerRegs(head_dim: Int) -> Int:
+def kFa4ConsumerRegs(head_dim: Int) -> Int:
     return 160 if head_dim == 64 else 240
 
 
