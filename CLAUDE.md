@@ -353,10 +353,19 @@ attempting any perf change**.
   the `nvidia-cuda-nvcc-cu12` wheel if installed). FA4's cute DSL
   embeds ptxas 12.9.83; the two produce byte-identical SASS on our
   PTX — toolchain version is NOT a perf variable here.
-- `uv run --extra nvidia` is currently broken in this venv (the
-  upstream flash-attn 2 wheel is cp312, venv is cp313). FA4 itself
-  (`flash_attn.cute`) imports fine in the plain venv via the local
-  clone + `nvidia-cutlass-dsl`.
+- torch is accelerator-specific and lives in mutually-exclusive uv
+  extras — `cpu` / `nvidia` / `rocm` (declared conflicting; each sources
+  torch from its own PyTorch index), NOT in the base deps. Pick one per
+  machine: `uv sync --extra {cpu,nvidia,rocm}` (darwin torch is a base
+  dep — macOS has no accelerator split). `scripts/master_bench.py` is
+  uv-agnostic (child procs use `sys.executable`), so the caller selects
+  the env: `uv run --extra nvidia scripts/master_bench.py …` (H100),
+  `uv run --extra rocm --no-sync …` (MI300X — `--no-sync` preserves the
+  manually-built CK flash_attn, which is not an index dependency).
+- The `nvidia` extra's prebuilt upstream flash-attn 2 wheel is cp312-only,
+  so `--extra nvidia` needs a cp312 interpreter (no cp313 build of that
+  wheel). FA4 itself (`flash_attn.cute`) imports fine via
+  `nvidia-cutlass-dsl`.
 
 ## Profiling
 

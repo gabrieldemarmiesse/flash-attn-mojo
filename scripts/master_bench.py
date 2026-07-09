@@ -73,9 +73,16 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "scripts"
 BENCH_FA4 = str(SCRIPTS / "bench_fa4.py")
 BENCH_ROCM = str(SCRIPTS / "bench_rocm.py")
-# Absolute path: profiler phases re-invoke the bench under `sudo -E`, whose
-# reset PATH would not otherwise find a bare `uv`.
-UV = shutil.which("uv") or "uv"
+
+# This script is invoked *inside* an already-activated environment — the
+# caller selects the accelerator, e.g. `uv run --extra rocm
+# scripts/master_bench.py ...` (torch is accelerator-specific and lives in
+# mutually-exclusive uv extras; see pyproject.toml). master_bench itself is
+# therefore uv-agnostic: every child Python is `sys.executable` (this same
+# interpreter), never a nested `uv run` that could re-sync/clobber the env.
+# `sys.executable` is absolute, so it also survives the profiler phases'
+# `sudo -E` re-invocation (whose reset PATH would not find a bare `uv`).
+PY = sys.executable
 
 _BOLD, _RST, _YEL, _RED, _GRN = (
     "\033[1m", "\033[0m", "\033[33m", "\033[31m", "\033[32m",
@@ -172,7 +179,7 @@ def detect_backend(requested: str) -> str:
     if shutil.which("nvidia-smi") and nvidia_smi("name"):
         return "cuda"
     # Probe torch in the venv to distinguish rocm (HIP) from a CPU-only box.
-    probe = run([UV, "run", "python", "-c", _TORCH_PROBE], capture=True)
+    probe = run([PY, "-c", _TORCH_PROBE], capture=True)
     got = (probe.stdout or "").strip().splitlines()
     if probe.returncode == 0 and got:
         return got[-1].strip()
@@ -295,7 +302,7 @@ def cu_variant(args) -> dict:
 
 def cu_bench_cmd(args, var, impl, shape, *, extra=()):
     return [
-        UV, "run", "python", BENCH_FA4,
+        PY, BENCH_FA4,
         "--impl", impl, "--kind", args.kind, "--shape", shape,
         "--iters", str(args.iters), *var["cflag"], *extra,
     ]
@@ -398,7 +405,7 @@ def cu_bench(args, var, shapes, peak, gate: bool) -> list[dict]:
         tail = "(<=1.03x everywhere)" if worst <= 1.03 else "(a shape exceeds 1.03x)"
         print(f"  worst mojo/fa4 ratio: {worst:.3f}x  {tail}")
 
-    print(f"\n  compute roofline"
+    print("\n  compute roofline"
           + (f" (peak = {peak:.0f} TFLOP/s bf16 tensor)" if peak else " (peak unknown)"))
     rhdr = f"  {'shape':>16} | {'TFLOP/s':>9} | {'%peak':>6} | regime"
     print(rhdr)
@@ -466,7 +473,7 @@ def _cu_ncu_capture(ncu, sudo, args, var, impl, filt) -> dict[str, dict]:
         "--launch-skip", str(_CU_NCU_LAUNCH_SKIP),
         "--launch-count", str(_CU_NCU_LAUNCH_COUNT),
         "--metrics", ",".join(_CU_NCU_METRICS), "--csv",
-        UV, "run", "python", BENCH_FA4,
+        PY, BENCH_FA4,
         "--impl", impl, "--kind", args.kind, "--shape", args.shape,
         "--profile", "--iters", str(_CU_NCU_LAUNCH_SKIP + _CU_NCU_LAUNCH_COUNT + 2),
         "--warmup", "3", *var["cflag"],
@@ -570,9 +577,9 @@ def cu_assembly(args, var, enabled: bool, refresh_fa4: bool) -> None:
     stats = str(SCRIPTS / "ptx_stats.py")
     if not fa4_ptx.exists():
         warn(f"no FA4 reference PTX at {fa4_ptx.relative_to(REPO)} — showing mojo op-mix only")
-        run([UV, "run", "python", stats, str(mojo_ptx)])
+        run([PY, stats, str(mojo_ptx)])
     else:
-        run([UV, "run", "python", stats, str(fa4_ptx), str(mojo_ptx)])
+        run([PY, stats, str(fa4_ptx), str(mojo_ptx)])
 
 
 def cu_walltime(args, var) -> None:
@@ -1248,7 +1255,7 @@ _RC_CHECK_TOL = 5e-2
 
 
 def _rc_have_flash_attn() -> bool:
-    return run([UV, "run", "python", "-c", "import flash_attn"], capture=True).returncode == 0
+    return run([PY, "-c", "import flash_attn"], capture=True).returncode == 0
 
 
 def _rc_kernel_only_us(csv_path: Path) -> float | None:
@@ -1328,7 +1335,7 @@ def run_rocm(args) -> int:
 
     # (2b) CK reference: bench (kernel-only via roctracer) + correctness.
     section("(2b) CK reference (kernel-only): bench + correctness")
-    cr = run([UV, "run", "python", BENCH_ROCM, "--batch", str(batch), "--seq", str(seq),
+    cr = run([PY, BENCH_ROCM, "--batch", str(batch), "--seq", str(seq),
               "--heads", str(heads), "--head-dim", str(hdim), "--iters", str(iters),
               "--dtype", dtype, "--check"], capture=True)
     if cr.stdout:
@@ -1362,7 +1369,7 @@ def run_rocm(args) -> int:
     else:
         section("(4) GCN instruction mix + resources (mojo v0 kernel)")
         if isa_dst.exists():
-            run([UV, "run", "python", str(SCRIPTS / "gcn_opmix.py"), str(isa_dst), "--top", "20"])
+            run([PY, str(SCRIPTS / "gcn_opmix.py"), str(isa_dst), "--top", "20"])
         else:
             warn("no ISA dump to analyze")
 
@@ -1383,7 +1390,7 @@ def run_rocm(args) -> int:
                  "--heads", str(heads), "--iters", "3", "--dispatches", "3"], capture=True)
             hits = list(outdir.rglob("*kernel_trace.csv"))
             if hits:
-                run([UV, "run", "python", str(SCRIPTS / "rocprof_summary.py"), str(hits[0])])
+                run([PY, str(SCRIPTS / "rocprof_summary.py"), str(hits[0])])
                 mojo_kern = _rc_kernel_only_us(hits[0])
             else:
                 warn("rocprof CSV missing — skipping summary")
@@ -1473,7 +1480,7 @@ def run_cpu(args) -> int:
         skip("(a) CPU reference correctness", "--no-check")
     else:
         section("(a) CPU reference correctness (tests/test_api.py)")
-        r = run([UV, "run", "python", "-m", "pytest", str(REPO / "tests" / "test_api.py"), "-q"])
+        r = run([PY, "-m", "pytest", str(REPO / "tests" / "test_api.py"), "-q"])
         if r.returncode != 0:
             Gate.fail("CPU reference correctness failed (see pytest output above)")
         else:
@@ -1482,7 +1489,7 @@ def run_cpu(args) -> int:
     # (b) naive reference latency (informational — no baseline to compare to).
     section("(b) naive reference wall-clock (informational)")
     iters = args.iters if args.iters is not None else 5
-    tr = run([UV, "run", "python", "-c", _CP_TIME_SRC,
+    tr = run([PY, "-c", _CP_TIME_SRC,
               str(B), str(S), str(H), str(D), str(iters), dtype], capture=True)
     us = tflops = None
     if tr.returncode == 0:
