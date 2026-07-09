@@ -339,8 +339,8 @@ attempting any perf change**.
 - `flash-attention/`: gitignored clone of Tri Dao's repo (the
   `flash_attn/cute/` CuTe DSL source is the algorithm reference:
   `flash_fwd_sm90.py`, `flash_bwd_sm90.py`).
-- `./modular`: the modular repo pinned at `d86df2b645`
-  (`mojo/v1.0.0b1` == `max/v26.3.0` tags) — matches the pinned
+- `./modular`: the modular repo pinned at `cb643611fa`
+  (`mojo/v1.0.0b2` == `max/v26.4.0` tags) — matches the pinned
   wheels, so stdlib/kernel sources there are exactly what we compile
   against. Key paths: `mojo/stdlib/std/gpu/`,
   `max/kernels/src/layout/{tma_async,tensor_core_async}.mojo`.

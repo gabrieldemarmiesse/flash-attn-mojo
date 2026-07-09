@@ -43,17 +43,17 @@ comptime MOJO_DUMP_PTX: StaticString = get_defined_string[
 ]()
 
 
-fn _dump_ptx_path() -> _DumpPath:
+def _dump_ptx_path() -> _DumpPath:
     comptime if MOJO_DUMP_PTX == StaticString(""):
         return _DumpPath(False)
     else:
         return _DumpPath(MOJO_DUMP_PTX)
 
 
-fn _ctx_and_stream(
+def _ctx_and_stream(
     ctx_handle_addr: Int,
 ) -> DeviceContext:
-    var raw_ctx_ptr = UnsafePointer[_DeviceContextCpp, MutExternalOrigin](
+    var raw_ctx_ptr = UnsafePointer[_DeviceContextCpp, MutUntrackedOrigin](
         unsafe_from_address=ctx_handle_addr
     )
     return DeviceContext(_DeviceContextPtr[mut=True](raw_ctx_ptr))
@@ -129,7 +129,7 @@ def launch_bwd_preprocess[
     comptime kernel_inst = bwd_preprocess_kernel[
         dtype, head_dim, causal, gqa_ratio, varlen
     ]
-    var compiled = ctx.compile_function[kernel_inst, kernel_inst]()
+    var compiled = ctx.compile_function[kernel_inst]()
     # Grid covers Spad rows (side buffers padded to the main-kernel
     # m-block size; pad rows get lse=+inf / dpsum=0). Varlen: one CTA
     # per main-kernel m-block (q-tile table row).
@@ -346,7 +346,6 @@ def launch_bwd_main[
 
     var compiled = ctx.compile_function[
         kernel_inst,
-        kernel_inst,
         dump_asm = _dump_ptx_path(),
     ](
         func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
@@ -461,7 +460,7 @@ def launch_bwd_convert[
         dtype, head_dim, causal, varlen
     ]
     _ = gqa_ratio  # dq convert is ratio-independent
-    var compiled = ctx.compile_function[kernel_inst, kernel_inst](
+    var compiled = ctx.compile_function[kernel_inst](
         func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
             UInt32(cvt_smem_bytes)
         )

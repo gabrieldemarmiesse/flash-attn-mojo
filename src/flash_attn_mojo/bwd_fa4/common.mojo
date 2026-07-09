@@ -14,7 +14,7 @@ comptime kBwdBlockM: Int = 80  # Q rows per inner tile (FA4 tile_m)
 comptime kBwdBlockN: Int = 128  # KV rows per block
 
 
-fn kBwdTileM(head_dim: Int, causal: Bool) -> Int:
+def kBwdTileM(head_dim: Int, causal: Bool) -> Int:
     """FA4's bwd tile_m: hdim64 = 128 (both causal and non-causal,
     BwdConfig in interface.py:177-184); hdim128 = 64 causal / 80
     non-causal."""

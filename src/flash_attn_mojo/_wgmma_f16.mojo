@@ -24,7 +24,7 @@ from std.sys._assembly import inlined_assembly
 from std.memory import bitcast
 
 
-fn _iota_ties[count: Int]() -> String:
+def _iota_ties[count: Int]() -> String:
     """"0,1,2,...,count-1" — the input-to-output tie list."""
     var s = String()
     for i in range(count):
@@ -34,7 +34,7 @@ fn _iota_ties[count: Int]() -> String:
     return s
 
 
-fn _reg_spec[count: Int]() -> String:
+def _reg_spec[count: Int]() -> String:
     """"$0, $1, ..., $count-1" — the output register list."""
     var s = String()
     for i in range(count):
