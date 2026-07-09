@@ -8,12 +8,12 @@ readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
     "torch>=2,<3",
-    "mojo-compiler==1.0.0b1",
-    "mojo-compiler-mojo-libs==1.0.0b1",
+    "mojo-compiler==1.0.0b2",
+    "mojo-compiler-mojo-libs==1.0.0b2",
     # Modular MAX kernel libraries — ships `layout.mojopkg` etc.; the
     # FA4 kernels import `layout.tensor_core_async` / `layout.tma_async`
     # from these.
-    "max-mojo-libs==26.3.0",
+    "max-mojo-libs==26.4.0",
 ]
 
 [project.optional-dependencies]

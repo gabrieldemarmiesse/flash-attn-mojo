@@ -35,7 +35,7 @@ comptime MOJO_DUMP_PTX: StaticString = get_defined_string[
 ]()
 
 
-fn _dump_ptx_path() -> _DumpPath:
+def _dump_ptx_path() -> _DumpPath:
     comptime if MOJO_DUMP_PTX == StaticString(""):
         return _DumpPath(False)
     else:
@@ -73,7 +73,7 @@ def launch_fwd_fa4[
     varlen_num_tiles: Int = 0,
     window_left: Int = 0,
 ) raises:
-    var raw_ctx_ptr = UnsafePointer[_DeviceContextCpp, MutExternalOrigin](
+    var raw_ctx_ptr = UnsafePointer[_DeviceContextCpp, MutUntrackedOrigin](
         unsafe_from_address=ctx_handle_addr
     )
     var ctx = DeviceContext(_DeviceContextPtr[mut=True](raw_ctx_ptr))
@@ -183,7 +183,6 @@ def launch_fwd_fa4[
         )
         var compiled = ctx.compile_function[
             kernel_inst,
-            kernel_inst,
             dump_asm = _dump_ptx_path(),
         ](
             func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
@@ -274,7 +273,6 @@ def launch_fwd_fa4[
     ]
 
     var compiled = ctx.compile_function[
-        kernel_inst,
         kernel_inst,
         dump_asm = _dump_ptx_path(),
     ](
