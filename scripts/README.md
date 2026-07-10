@@ -30,16 +30,31 @@ forward-only MMA fights; **cpu** has no kernel (the public op falls through to
 the pure-PyTorch reference) so it is a correctness smoke-check plus a naive
 reference wall-clock, *not* a perf race.
 
+`master_bench.py` is uv-agnostic: it runs every child process with its own
+interpreter (`sys.executable`), so you select the accelerator once, in the
+**caller**, with a uv extra (torch is accelerator-specific and lives in the
+mutually-exclusive `cpu`/`nvidia`/`rocm` extras — see `pyproject.toml`):
+
 ```bash
-scripts/master_bench.py                    # auto-detect; canonical dense fwd
-scripts/master_bench.py --device cpu       # CPU reference correctness + latency
-scripts/master_bench.py --kind bwd         # [cuda] backward kernels
-scripts/master_bench.py --causal --hkv 4   # [cuda] causal GQA; also --varlen/--window/--softcap
-scripts/master_bench.py --full             # multi-shape sweep (all backends)
-scripts/master_bench.py --seq 4096 --head-dim 128  # [metal/rocm] one shape
-scripts/master_bench.py --no-prof --no-asm # timing-only fast loop
-scripts/master_bench.py --no-lock --no-clean       # [cuda] dev loop (keep JIT cache)
+# H100 (CUDA): mojo vs FlashAttention-4
+uv run --extra nvidia scripts/master_bench.py
+uv run --extra nvidia scripts/master_bench.py --kind bwd          # backward kernels
+uv run --extra nvidia scripts/master_bench.py --causal --hkv 4    # causal GQA; also --varlen/--window/--softcap
+uv run --extra nvidia scripts/master_bench.py --full              # multi-shape sweep
+uv run --extra nvidia scripts/master_bench.py --no-lock --no-clean  # dev loop (keep JIT cache)
+
+# MI300X (ROCm): mojo v0 vs CK-flash. Use --no-sync so uv does not wipe the
+# manually-built CK flash_attn (it is not an index-installable dependency).
+uv run --extra rocm --no-sync scripts/master_bench.py --seq 4096 --head-dim 128
+
+# CPU reference correctness + latency (no kernel race)
+uv run --extra cpu scripts/master_bench.py --device cpu
+
+# common flags: --no-prof / --no-asm (timing-only), --seq/--head-dim/--heads
 ```
+
+(On macOS the metal backend needs no extra — darwin torch is a base
+dependency. `uv run scripts/master_bench.py` just works there.)
 
 The older `master_bench.sh` is retained only as the FA4 **reference-PTX
 regeneration** utility (`--refresh-fa4-ptx`, see `reference_ptx/README.md`); it
@@ -271,21 +286,23 @@ Supporting scripts:
 
 ### Environment setup (once, on the AMD box)
 
-The default `uv sync` installs the CUDA toolchain (the `dev` group's
-`flash-attn-4[cu13]`). For the ROCm lane install a ROCm PyTorch into the
-venv instead — verified working on ROCm 7.2.4 / MI300X:
+torch is accelerator-specific, so it lives in mutually-exclusive uv extras
+(`cpu`/`nvidia`/`rocm`, declared conflicting in `pyproject.toml`) — one
+venv per accelerator. On the AMD box, sync the `rocm` extra (ROCm PyTorch
+2.8.0 + `pytorch-triton-rocm`, from the rocm6.4 index):
 
 ```bash
-uv pip install "torch==2.8.0" --index-url \
-    https://download.pytorch.org/whl/rocm6.4 --reinstall-package torch
+uv sync --extra rocm      # torch==2.8.0+rocm6.4, pytorch-triton-rocm
 ```
 
 Mojo itself targets gfx942 out of the box on this toolchain
 (`DeviceContext().api()` reports `hip`).
 
 Then build the **CK-flash** reference (the default ROCm backend of the
-flash-attention repo — verified on ROCm 7.2.4 / MI300X, ~17 min). The
-clone lives at `flash-attention/` (gitignored). `GPU_ARCHS`/`OPT_DIM`
+flash-attention repo — verified on ROCm 7.2.4 / MI300X, ~17 min). It is NOT
+an index-installable dependency (it needs the composable_kernel submodule +
+a hipcc build), so it is a manual step, not part of the `rocm` extra. The
+clone lives at `flash-attention/` (gitignored); `GPU_ARCHS`/`OPT_DIM`
 restrict the (large) instantiation set to what the bench uses:
 
 ```bash
@@ -301,6 +318,13 @@ GPU_ARCHS=gfx942 OPT_DIM=64,128 MAX_JOBS=20 ROCM_HOME=/opt/rocm \
 Leave `FLASH_ATTENTION_TRITON_AMD_ENABLE` unset to get the CK backend
 (setting it `TRUE` selects the Triton/aiter backend instead). This CK
 `flash_attn` is required — the harness errors out without it.
+
+Because the CK build is manual (not tracked by uv), invoke the bench on
+ROCm with **`--no-sync`** so uv does not wipe it while activating the extra:
+
+```bash
+uv run --extra rocm --no-sync scripts/master_bench.py --seq 4096 --head-dim 128
+```
 
 <details>
 <summary>Reproducing the SDPA/Triton comparison (not needed by the harness)</summary>

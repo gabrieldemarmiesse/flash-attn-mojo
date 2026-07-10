@@ -6,35 +6,54 @@ readme = "README.md"
 # Pinned to 3.13: torch 2.8.0 ships prebuilt cp313 wheels but not cp314.
 # Bump once those land.
 requires-python = ">=3.10,<3.14"
+# torch is intentionally NOT a base dependency: it must be pulled from an
+# accelerator-specific PyTorch index (CUDA vs ROCm vs CPU are the *same*
+# platform marker, so only a uv extra can disambiguate). It lives in the
+# mutually-exclusive cpu/nvidia/rocm extras below (see [tool.uv].conflicts)
+# — one venv per accelerator. Pick exactly one: `uv sync --extra {cpu,nvidia,rocm}`.
 dependencies = [
-    "torch>=2,<3",
-    # linux (H100 lane) stays on 1.0.0b1 — the CUDA kernels' codegen is
-    # validated against it. darwin needs >=1.0.0b2: the 8x8 Apple-GPU
-    # simdgroup-matrix MMA SIGSEGVs the 1.0.0b1 compiler (fixed on
-    # modular main 2026-06-11, first released in 1.0.0b2).
-    "mojo-compiler==1.0.0b1 ; sys_platform == 'linux'",
-    "mojo-compiler-mojo-libs==1.0.0b1 ; sys_platform == 'linux'",
-    "mojo-compiler==1.0.0b2 ; sys_platform == 'darwin'",
-    "mojo-compiler-mojo-libs==1.0.0b2 ; sys_platform == 'darwin'",
+    # 1.0.0b2 on both platforms: the H100 CUDA kernels were migrated to b2
+    # and re-validated (commit "Bump toolchain to Mojo 1.0.0b2 / MAX
+    # 26.4.0"), and darwin needs b2 anyway — the 8x8 Apple-GPU
+    # simdgroup-matrix MMA SIGSEGVs the 1.0.0b1 compiler (fixed on modular
+    # main 2026-06-11, first released in 1.0.0b2).
+    "mojo-compiler==1.0.0b2",
+    "mojo-compiler-mojo-libs==1.0.0b2",
     # Modular MAX kernel libraries — ships `layout.mojopkg` etc.; the
     # FA4 kernels import `layout.tensor_core_async` / `layout.tma_async`
     # from these.
-    "max-mojo-libs==26.3.0",
+    "max-mojo-libs==26.4.0",
+    # macOS has no CUDA/ROCm split, so darwin torch comes straight from
+    # PyPI here (base). Linux torch is accelerator-specific — it lives in
+    # the cpu/nvidia/rocm extras and is intentionally absent from base.
+    "torch==2.8.0 ; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
+# --- accelerator extras (mutually exclusive; see [tool.uv].conflicts) ---
+cpu = [
+    "torch==2.8.0",
+]
 nvidia = [
     "torch==2.8.0 ; sys_platform == 'linux'",
     "nvidia-cuda-nvcc-cu12==12.8.* ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    # Upstream flash-attn for cross-validation. Pin a specific prebuilt
-    # wheel to avoid the source-build that needs CUDA toolchain + a few
-    # minutes of nvcc time.
-    "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux'",
+    # Upstream flash-attn for cross-validation (prebuilt CUDA wheel — see
+    # [tool.uv.sources]).
+    "flash-attn ; sys_platform == 'linux'",
+    # Tri Dao FlashAttention-4 (CuTe DSL) — the CUDA perf target the Mojo
+    # kernel benchmarks against. CUDA-only (its nvidia-cutlass-dsl-libs-base
+    # dep ships manylinux CUDA wheels only), so it belongs here, not in the
+    # cross-platform dev group.
+    "flash-attn-4[cu13]==4.0.0b16 ; sys_platform == 'linux'",
 ]
 rocm = [
     "torch==2.8.0 ; sys_platform == 'linux'",
     "pytorch-triton-rocm ; sys_platform == 'linux'",
-    "flash-attn ; sys_platform == 'linux'",
+    # NB: the CK `flash_attn` reference kernel is NOT declared here. It has
+    # no index-installable wheel on ROCm — it needs the composable_kernel
+    # submodule + a ~17-min hipcc build — so it is a manual post-sync step
+    # (scripts/README.md). A bare `flash-attn` here would (wrongly) pull the
+    # CUDA sdist and clobber that build.
 ]
 
 [build-system]
@@ -43,12 +62,6 @@ build-backend = "setuptools.build_meta"
 
 [dependency-groups]
 dev = [
-    # Tri Dao FlashAttention-4 (CuTe DSL) — the perf target the Mojo
-    # kernel benchmarks against. Explicit pre-release pin (uv allows
-    # pre-releases when the specifier names one). Linux-only: its
-    # nvidia-cutlass-dsl-libs-base dep ships manylinux wheels only,
-    # and there is no FA4 implementation to race on macOS anyway.
-    "flash-attn-4[cu13]==4.0.0b16 ; sys_platform == 'linux'",
     "matplotlib>=3.10.9",
     "pytest>=9.0.3",
     "ruff",
@@ -65,11 +78,13 @@ dev = [
 [tool.uv]
 default-groups = ["dev"]
 
-# nvidia and rocm both want to source torch from a different PyTorch
-# index, so they cannot be resolved together — declare them as a
-# conflicting extras pair.
+# cpu/nvidia/rocm each source torch (and friends) from a different PyTorch
+# index, so they cannot be resolved together — declare them mutually
+# exclusive. uv keeps a separate resolution per extra: `uv sync --extra
+# rocm` yields the ROCm env, `--extra nvidia` the CUDA env, etc.
 conflicts = [
     [
+        { extra = "cpu" },
         { extra = "nvidia" },
         { extra = "rocm" },
     ],
@@ -80,12 +95,23 @@ no-build-isolation-package = ["flash-attn"]
 
 [tool.uv.sources]
 torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu128", extra = "nvidia" },
     { index = "pytorch-rocm", extra = "rocm" },
 ]
 pytorch-triton-rocm = [
     { index = "pytorch-rocm", extra = "rocm" },
 ]
+# Upstream flash-attn (CUDA cross-validation) — a specific prebuilt wheel,
+# to avoid the source-build that needs the CUDA toolchain + nvcc time.
+flash-attn = [
+    { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl", extra = "nvidia" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

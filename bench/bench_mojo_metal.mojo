@@ -297,7 +297,7 @@ def run_bench[
     dispatches: Int,
 ) raises -> List[Float64]:
     var compiled = ctx.compile_function[
-        fwd_kernel[D], fwd_kernel[D], dump_asm=dump_path
+        fwd_kernel[D], dump_asm=dump_path
     ]()
     var grid_x = ceildiv(seq, BR) * heads  # 1-D, q-tile-major (see kernel)
     for _ in range(warmup):

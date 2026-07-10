@@ -122,7 +122,7 @@ def flash_attn_bwd_fa4_convert(
 
 
 @export
-def PyInit_variant() -> PythonObject:
+def PyInit_variant() abi("C") -> PythonObject:
     try:
         var m = PythonModuleBuilder("variant")
         m.def_py_function[flash_attn_bwd_fa4_preprocess](

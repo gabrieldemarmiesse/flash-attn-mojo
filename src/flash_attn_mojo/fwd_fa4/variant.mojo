@@ -101,7 +101,7 @@ def flash_attn_fwd_fa4_variant(
 
 
 @export
-def PyInit_variant() -> PythonObject:
+def PyInit_variant() abi("C") -> PythonObject:
     try:
         var m = PythonModuleBuilder("variant")
         m.def_py_function[flash_attn_fwd_fa4_variant](
