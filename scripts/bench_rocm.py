@@ -1,20 +1,21 @@
 """Reference bench for the AMD (ROCm / MI300X) flash-attention race.
 
-The AMD analog of bench_fa4.py's `--impl fa4` lane. There is no CuTe /
-FlashAttention-4 on AMD, so the reference here is PyTorch's fused
-scaled-dot-product-attention (ROCm routes fp16 SDPA through its
-AOTriton / CK flash-attention backend) and, if installed, the
-`flash_attn` package (Tri Dao's CK/Triton build for ROCm).
+The AMD analog of bench_fa4.py's reference lane. There is no CuTe /
+FlashAttention-4 on AMD, so the reference baseline is Tri Dao's
+`flash_attn` built with the **Composable Kernel (CK)** backend — the
+fastest attention kernel on this MI300X (measured ranking CK > Triton >
+SDPA). It is the ONLY reference here; CK must be installed (build it per
+scripts/README.md) or this script exits with an error.
 
 The Mojo lane is the standalone bench/bench_mojo_rocm.mojo binary
-(wall-clock timed, its own JSON) — this script measures ONLY the
+(wall-clock timed, its own JSON) — this script measures ONLY the CK
 reference, kernel-only via torch.profiler (roctracer on ROCm, the CUPTI
 analog), and prints a machine-parseable RESULT line matching
-bench_fa4.py's format so master_bench_rocm.sh can diff the two.
+bench_fa4.py's format so master_bench.py can diff the two.
 
 Usage:
-    uv run python scripts/bench_rocm.py --impl sdpa --seq 4096 \
-        --heads 16 --head-dim 128 [--causal] [--check]
+    uv run python scripts/bench_rocm.py --seq 4096 --heads 16 \
+        --head-dim 128 [--causal] [--check]
 """
 
 from __future__ import annotations
@@ -26,45 +27,25 @@ import torch
 import torch.nn.functional as F
 
 
-def _sdpa_backends():
-    """Prefer the fused flash backend; fall back to whatever ROCm has."""
-    from torch.nn.attention import SDPBackend
-
-    return [
-        SDPBackend.FLASH_ATTENTION,
-        SDPBackend.EFFICIENT_ATTENTION,
-        SDPBackend.MATH,
-    ]
-
-
-def _get_step(impl: str, q, k, v, causal: bool):
-    """Returns (step_fn, out_fn). q/k/v are [B, H, S, D]."""
-    holder = {}
-    if impl == "sdpa":
-        from torch.nn.attention import sdpa_kernel
-
-        backends = _sdpa_backends()
-
-        def step():
-            with sdpa_kernel(backends):
-                holder["o"] = F.scaled_dot_product_attention(
-                    q, k, v, is_causal=causal
-                )
-
-        return step, lambda: holder["o"]
-
-    if impl == "flash":
-        # flash_attn wants [B, S, H, D].
+def _get_step(q, k, v, causal: bool):
+    """Returns (step_fn, out_fn) for the CK-flash reference. q/k/v are
+    [B, H, S, D]. Exits if the CK backend is not installed."""
+    try:
         from flash_attn import flash_attn_func
+    except ImportError:
+        sys.exit(
+            "flash_attn (Composable Kernel backend) is not installed — it is "
+            "the required reference baseline. Build it per scripts/README.md."
+        )
 
-        qt, kt, vt = (x.transpose(1, 2).contiguous() for x in (q, k, v))
+    # flash_attn wants [B, S, H, D].
+    qt, kt, vt = (x.transpose(1, 2).contiguous() for x in (q, k, v))
+    holder = {}
 
-        def step():
-            holder["o"] = flash_attn_func(qt, kt, vt, causal=causal)
+    def step():
+        holder["o"] = flash_attn_func(qt, kt, vt, causal=causal)
 
-        return step, lambda: holder["o"].transpose(1, 2)
-
-    raise SystemExit(f"unknown --impl {impl}")
+    return step, lambda: holder["o"].transpose(1, 2)
 
 
 def _check(q, k, v, out, causal: bool) -> float:
@@ -80,7 +61,6 @@ def _check(q, k, v, out, causal: bool) -> float:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--impl", choices=["sdpa", "flash"], default="sdpa")
     p.add_argument("--batch", type=int, default=1)
     p.add_argument("--seq", type=int, default=4096)
     p.add_argument("--heads", type=int, default=16)
@@ -110,7 +90,7 @@ def main() -> None:
     k = torch.randn_like(q)
     v = torch.randn_like(q)
 
-    step, out_fn = _get_step(args.impl, q, k, v, args.causal)
+    step, out_fn = _get_step(q, k, v, args.causal)
 
     # JIT / autotune warmup.
     step()
@@ -118,7 +98,7 @@ def main() -> None:
 
     if args.check:
         err = _check(q, k, v, out_fn(), args.causal)
-        print(f"CHECK impl={args.impl} max_abs_err={err:.3e}")
+        print(f"CHECK impl=ck max_abs_err={err:.3e}")
         if err > 5e-3:
             print("CHECK FAILED", file=sys.stderr)
             sys.exit(1)
@@ -134,7 +114,7 @@ def main() -> None:
     def emit(us: float, measure: str) -> None:
         tflops = fwd_flops / (us * 1e-6) / 1e12
         print(
-            f"RESULT impl={args.impl} kind=fwd "
+            f"RESULT impl=ck kind=fwd "
             f"shape={B},{S},{H},{D} causal={int(args.causal)} "
             f"dtype={args.dtype} measure={measure} "
             f"us={us:.1f} tflops={tflops:.1f}"
@@ -177,7 +157,7 @@ def main() -> None:
         if e.device_time_total > 0 and "memcpy" not in name and "memset" not in name:
             short = e.key.split("(")[0][:60]
             print(
-                f"KERNEL impl={args.impl} name={short} "
+                f"KERNEL impl=ck name={short} "
                 f"us={e.device_time_total / args.iters:.1f}"
             )
 

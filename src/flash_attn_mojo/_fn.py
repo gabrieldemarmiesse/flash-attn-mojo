@@ -79,6 +79,10 @@ def _check_envelope(
         raise ValueError("q, k, v must share one dtype")
 
 
+def _is_apple_gpu(t: torch.Tensor) -> bool:
+    return t.device.type == "mps"
+
+
 class _FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -111,6 +115,48 @@ class _FlashAttnFunc(torch.autograd.Function):
             softcap=ctx.softcap,
         )
         return dq, dk, dv, None, None, None, None
+
+
+class _FlashAttnMetalFunc(torch.autograd.Function):
+    """Apple-GPU forward. Forward runs the fast Metal MMA kernel; the
+    backward is not yet ported, so it falls back to a reference-based
+    VJP (autograd through `flash_attn_ref`) — correct, not fast. Train
+    on Apple only for small models / debugging."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, softmax_scale, causal):
+        from flash_attn_mojo.fwd_metal import fa_metal_fwd
+
+        if causal:
+            # No causal Metal kernel yet — reference forward keeps
+            # the API usable (the whole call is then reference-based).
+            out, lse = flash_attn_ref(
+                q, k, v, softmax_scale=softmax_scale, causal=True,
+                return_lse=True,
+            )
+        else:
+            out, lse = fa_metal_fwd(q, k, v, softmax_scale)
+        ctx.save_for_backward(q, k, v)
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.mark_non_differentiable(lse)
+        return out, lse
+
+    @staticmethod
+    def backward(ctx, dout, _dlse):
+        # Recompute the VJP through the differentiable reference (no
+        # Metal backward kernel yet).
+        q, k, v = ctx.saved_tensors
+        with torch.enable_grad():
+            qd = q.detach().requires_grad_(True)
+            kd = k.detach().requires_grad_(True)
+            vd = v.detach().requires_grad_(True)
+            out = flash_attn_ref(
+                qd, kd, vd, softmax_scale=ctx.softmax_scale,
+                causal=ctx.causal,
+            )
+            dq, dk, dv = torch.autograd.grad(out, (qd, kd, vd), dout)
+        return dq, dk, dv, None, None
 
 
 def flash_attn_func(
@@ -177,6 +223,33 @@ def flash_attn_func(
             raise ValueError("softcap must be >= 0")
         if q.shape[-1] != 128:
             raise ValueError("softcap v1 envelope: head_dim=128")
+
+    # Apple GPU: run the fast Metal forward kernel when the tensor is
+    # in its envelope (non-causal, no window/softcap, seqlen % 128 == 0,
+    # head_dim 64/128); otherwise fall through to the reference.
+    if _is_apple_gpu(q):
+        batch, seqlen, nheads, head_dim = q.shape
+        metal_ok = (
+            not window_left
+            and not softcap
+            and seqlen % _SEQLEN_MULTIPLE == 0
+            and head_dim in (64, 128)
+        )
+        if metal_ok:
+            out, lse = _FlashAttnMetalFunc.apply(
+                q, k, v, softmax_scale, causal
+            )
+            if return_lse:
+                return out, lse
+            return out
+        return flash_attn_ref(
+            q, k, v, softmax_scale=softmax_scale, causal=causal,
+            window_size=(
+                (window_left, 0) if window_left else (-1, -1)
+            ),
+            softcap=softcap,
+            return_lse=return_lse,
+        )
 
     if not q.is_cuda:
         # flash_attn_ref handles GQA (repeat-interleave) and the

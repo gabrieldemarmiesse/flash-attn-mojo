@@ -23,12 +23,12 @@
 # divided out. This INCLUDES mojo's per-enqueue dispatch overhead, which
 # the torch reference's kernel-only (roctracer) time excludes — a
 # deliberate, conservative penalty against mojo; negligible at the
-# canonical multi-head shapes. master_bench_rocm.sh also re-times this
+# canonical multi-head shapes. master_bench.py (rocm) also re-times this
 # kernel under rocprofv3 for an apples-to-apples kernel-only number.
 #
 # AMDGCN ISA dump: every run rewrites /tmp/mojo_fwd_rocm_d{64,128}.s
 # (real gfx942 assembly — the direct PTX analog, courtesy of dump_asm);
-# master_bench_rocm.sh copies it into asm/ and runs the op-mix diff.
+# master_bench.py (rocm) copies it into asm/ and runs the op-mix diff.
 
 from std.gpu import barrier, block_idx, lane_id, thread_idx
 from std.gpu.host import DeviceContext
@@ -179,7 +179,7 @@ def run_bench[
     dispatches: Int,
 ) raises -> List[Float64]:
     var compiled = ctx.compile_function[
-        fwd_kernel[D], fwd_kernel[D], dump_asm=dump_path
+        fwd_kernel[D], dump_asm=dump_path
     ]()
     var grid_x = ceildiv(seq, BQ)
     for _ in range(warmup):

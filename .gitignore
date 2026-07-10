@@ -33,6 +33,10 @@ reference_air/ccv/bench_ccv/bench_ccv_attn
 *.gputrace/
 
 # ROCm/MI300X race: the mojo v0 kernel's AMDGCN ISA dumps are build
-# products regenerated on every master_bench_rocm.sh run (the /air/
+# products regenerated on every `master_bench.py` (rocm) run (the /air/
 # analog for the Metal lane).
 /asm/
+
+# Per-machine ratcheting perf baselines (`master_bench.py`'s Metal regression
+# gate records this machine's own best per-shape time; not portable).
+/scripts/baselines/

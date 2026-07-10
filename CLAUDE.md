@@ -254,20 +254,25 @@ attempting any perf change**.
    mode is off — relock every session). Unlocked, this H100 drifts
    ±4–5% and fakes wins/losses below ~3%.
 2. Even locked, both kernels wobble ~2–4% run-to-run: always bench
-   A/B interleaved (`master_bench.sh` does) and quote 3-run spreads.
+   A/B interleaved (`master_bench.py` does) and quote 3-run spreads.
 3. After every kernel edit:
    `ptxas -arch=sm_90a -v ptx/mojo_*.ptx` — the spill-bytes line is
    the canary (both kernels must stay at 0).
 
 ## Iteration tooling
 
-- **Master script: `scripts/master_bench.sh [--kind bwd] [--causal]
-  [--hkv N] [--varlen] [--quick] [--no-ncu]`**
-  — clears the flash_attn_mojo JIT cache (not the mojo compiler
-  cache), recompiles, runs correctness checks, benches mojo vs FA4
-  interleaved (CUPTI kernel-only time), dumps the mojo kernel's PTX
-  to `ptx/`, prints a PTX op-mix diff vs the committed FA4 reference
-  and (unless `--no-ncu`) side-by-side ncu stats.
+- **Master script: `scripts/master_bench.py [--kind bwd] [--causal]
+  [--hkv N] [--varlen] [--full] [--no-prof] [--no-asm]`** — the ONE
+  perf gate an agent runs; it auto-detects the backend (CUDA / Metal /
+  ROCm, or `--device cpu`). On this H100 it clears the flash_attn_mojo
+  JIT cache (not the mojo compiler cache), recompiles, runs correctness
+  checks, benches mojo vs FA4 interleaved (CUPTI kernel-only time) with
+  a per-shape ratio table + tensor-core roofline, captures side-by-side
+  ncu stats (unless `--no-prof`), dumps the mojo kernel's PTX to `ptx/`,
+  prints a PTX op-mix diff vs the committed FA4 reference, runs the
+  ptxas spill canary (hard gate), and ends with an `===AGENT-SUMMARY===`
+  JSON block. It fuses the former per-backend coordinators; the legacy
+  `master_bench.sh` is kept only for `--refresh-fa4-ptx`.
 - **Fast correctness loop**:
   `uv run python scripts/bench_fa4.py --impl mojo --kind {fwd,bwd}
   --check-only [--causal] [--hkv N] [--varlen]` — delegates to
@@ -348,10 +353,19 @@ attempting any perf change**.
   the `nvidia-cuda-nvcc-cu12` wheel if installed). FA4's cute DSL
   embeds ptxas 12.9.83; the two produce byte-identical SASS on our
   PTX — toolchain version is NOT a perf variable here.
-- `uv run --extra nvidia` is currently broken in this venv (the
-  upstream flash-attn 2 wheel is cp312, venv is cp313). FA4 itself
-  (`flash_attn.cute`) imports fine in the plain venv via the local
-  clone + `nvidia-cutlass-dsl`.
+- torch is accelerator-specific and lives in mutually-exclusive uv
+  extras — `cpu` / `nvidia` / `rocm` (declared conflicting; each sources
+  torch from its own PyTorch index), NOT in the base deps. Pick one per
+  machine: `uv sync --extra {cpu,nvidia,rocm}` (darwin torch is a base
+  dep — macOS has no accelerator split). `scripts/master_bench.py` is
+  uv-agnostic (child procs use `sys.executable`), so the caller selects
+  the env: `uv run --extra nvidia scripts/master_bench.py …` (H100),
+  `uv run --extra rocm --no-sync …` (MI300X — `--no-sync` preserves the
+  manually-built CK flash_attn, which is not an index dependency).
+- The `nvidia` extra's prebuilt upstream flash-attn 2 wheel is cp312-only,
+  so `--extra nvidia` needs a cp312 interpreter (no cp313 build of that
+  wheel). FA4 itself (`flash_attn.cute`) imports fine via
+  `nvidia-cutlass-dsl`.
 
 ## Profiling
 

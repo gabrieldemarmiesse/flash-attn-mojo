@@ -17,6 +17,12 @@ requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a CUDA device"
 )
 
+_mps = getattr(torch.backends, "mps", None)
+requires_mps = pytest.mark.skipif(
+    _mps is None or not _mps.is_available(),
+    reason="needs an Apple GPU (MPS)",
+)
+
 
 @pytest.fixture(autouse=True)
 def _seed_rng():
